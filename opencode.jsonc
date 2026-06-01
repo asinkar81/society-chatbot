@@ -1,0 +1,40 @@
+{
+  "$schema": "https://opencode.ai/schemas/opencode.json",
+  "name": "society-chatbot",
+  "version": "1.0.0",
+  "description": "Society Management Agentic Chatbot built with Streamlit, LangChain, and Claude",
+  "tools": {
+    "required": ["python", "pip"],
+    "recommended": ["streamlit"]
+  },
+  "customCommands": [
+    {
+      "name": "run",
+      "command": "streamlit run main.py",
+      "description": "Run the Streamlit chatbot app"
+    },
+    {
+      "name": "test",
+      "command": "python -m pytest tests/ -v",
+      "description": "Run all tests with verbose output"
+    },
+    {
+      "name": "init-data",
+      "command": "python init_sample_data.py",
+      "description": "Initialize sample data for development"
+    },
+    {
+      "name": "verify-openrouter",
+      "command": "python verify_openrouter.py",
+      "description": "Verify OpenRouter API configuration"
+    }
+  ],
+  "context": {
+      "omit": [
+        "venv/",
+        "__pycache__/",
+        ".git/",
+        ".DS_Store"
+      ]
+  }
+}

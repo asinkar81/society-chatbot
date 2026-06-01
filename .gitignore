@@ -1,0 +1,46 @@
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Data files (don't commit large files)
+data/invoices/
+data/receipts/
+data/ledgers/
+*.xlsx
+*.csv
+
+# Cache
+.streamlit/
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
