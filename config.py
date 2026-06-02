@@ -81,8 +81,8 @@ USE_FREE_MODELS = os.getenv("USE_FREE_MODELS", "true").lower() in ("true", "1", 
 ANTHROPIC_MODEL_MAIN = "claude-3-5-haiku-20241022"
 ANTHROPIC_MODEL_VISION = "claude-3-5-sonnet-20241022"
 # OpenRouter slug names — free tier
-#OPENROUTER_MODEL_MAIN_FREE = "openrouter/free"
-OPENROUTER_MODEL_MAIN_FREE = "qwen/qwen3-coder:free"
+OPENROUTER_MODEL_MAIN_FREE = "openrouter/auto"
+#OPENROUTER_MODEL_MAIN_FREE = "qwen/qwen3-coder:free"
 OPENROUTER_MODEL_VISION_FREE = "google/gemini-2.0-flash:free"
 # OpenRouter slug names — paid tier
 OPENROUTER_MODEL_MAIN_PAID = "anthropic/claude-3.5-haiku"

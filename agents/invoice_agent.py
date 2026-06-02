@@ -110,7 +110,9 @@ class InvoiceAgent(BaseAgent):
             # Generate PDF
             invoice_dir = config.INVOICES_DIR / fy
             invoice_dir.mkdir(parents=True, exist_ok=True)
-            invoice_filename = f"Invoice_{member.get('Plot_No', 'Unknown')}_{invoice_no}.pdf"
+            plot_str = str(member.get("Plot_No", "") or "")
+            plot_part = f"Plot_No_{plot_str.zfill(2)}" if plot_str else "Unknown"
+            invoice_filename = f"Invoice_{plot_part}_{invoice_no}.pdf"
             invoice_path = invoice_dir / invoice_filename
 
             success = create_simple_invoice_pdf(invoice_path, invoice_data)

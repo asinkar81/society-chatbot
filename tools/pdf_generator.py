@@ -171,13 +171,85 @@ def create_simple_invoice_pdf(pdf_path: Path, invoice_data: Dict[str, Any]) -> b
         # Amount in words
         amount_words = invoice_data.get("amount_in_words", f"₹{total:,.2f}")
         elements.append(Paragraph(f"Amount: {amount_words}", normal_style))
-        elements.append(Spacer(1, 0.2 * inch))
+        elements.append(Spacer(1, 0.15 * inch))
 
-        # Payment Received Till Date
-        payment_received = invoice_data.get("payment_received_till_date", 0)
-        elements.append(Paragraph(f"Payment Received Till Date: ₹ {payment_received:,.2f}", normal_style))
+        # Payment summary
+        outstanding = invoice_data.get("outstanding_balance", total)
+        elements.append(Paragraph(f"Outstanding Balance: ₹ {outstanding:,.2f}", normal_style))
 
-        elements.append(Spacer(1, 0.4 * inch))
+        # Payment History table
+        payment_history = invoice_data.get("payment_history", [])
+        if payment_history:
+            elements.append(Spacer(1, 0.2 * inch))
+            section_style = ParagraphStyle(
+                "SectionTitle", parent=styles["Normal"], fontSize=10, leading=14,
+                textColor=colors.black, spaceAfter=6, fontName="Helvetica-Bold",
+            )
+            elements.append(Paragraph("Payment History", section_style))
+            ph_data = [["Date", "Particulars", "Amount (₹)"]]
+            ph_total = 0
+            for ph in payment_history:
+                ph_data.append([
+                    str(ph.get("date", "")),
+                    str(ph.get("particulars", ""))[:30],
+                    f"{ph.get('amount', 0):,.2f}",
+                ])
+                ph_total += ph.get("amount", 0)
+            ph_data.append(["", "Total", f"{ph_total:,.2f}"])
+            ph_table = Table(ph_data, colWidths=[1.2 * inch, 3.3 * inch, 1.5 * inch])
+            ph_table.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.grey),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("ALIGN", (1, 0), (1, -1), "LEFT"),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 8),
+                ("BACKGROUND", (0, -1), (-1, -1), colors.lightgrey),
+                ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ]))
+            elements.append(ph_table)
+
+        # Previous Invoices table
+        previous_invoices = invoice_data.get("previous_invoices", [])
+        if previous_invoices:
+            elements.append(Spacer(1, 0.2 * inch))
+            section_style = ParagraphStyle(
+                "SectionTitle", parent=styles["Normal"], fontSize=10, leading=14,
+                textColor=colors.black, spaceAfter=6, fontName="Helvetica-Bold",
+            )
+            elements.append(Paragraph("Previous Invoices", section_style))
+            inv_data = [["Date", "Invoice No", "Amount (₹)"]]
+            inv_total = 0
+            for inv in previous_invoices:
+                inv_data.append([
+                    str(inv.get("date", "")),
+                    str(inv.get("description", ""))[:30],
+                    f"{inv.get('amount', 0):,.2f}",
+                ])
+                inv_total += inv.get("amount", 0)
+            inv_data.append(["", "Total Demanded", f"{inv_total:,.2f}"])
+            inv_table = Table(inv_data, colWidths=[1.2 * inch, 3.3 * inch, 1.5 * inch])
+            inv_table.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.grey),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("ALIGN", (1, 0), (1, -1), "LEFT"),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 8),
+                ("BACKGROUND", (0, -1), (-1, -1), colors.lightgrey),
+                ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ]))
+            elements.append(inv_table)
+
+        elements.append(Spacer(1, 0.3 * inch))
         elements.append(Paragraph("_" * 90, hr_style))
         elements.append(Spacer(1, 0.15 * inch))
 
@@ -271,7 +343,36 @@ def create_simple_receipt_pdf(pdf_path: Path, receipt_data: Dict[str, Any]) -> b
         elements = []
         styles = getSampleStyleSheet()
 
-        # Header
+        # Society header (same as invoice)
+        header_bold = ParagraphStyle(
+            "HeaderBold",
+            parent=styles["Normal"],
+            fontSize=14,
+            leading=18,
+            textColor=colors.black,
+            alignment=1,
+            spaceAfter=4,
+        )
+        header_normal = ParagraphStyle(
+            "HeaderNormal",
+            parent=styles["Normal"],
+            fontSize=10,
+            leading=14,
+            textColor=colors.black,
+            alignment=1,
+            spaceAfter=2,
+        )
+        elements.append(Paragraph("Weekend Ville Maintenance Co-Op. Society Ltd 24-25", header_bold))
+        elements.append(Paragraph("Sr. No. 241/274/287/288/289, Mauje Jatede", header_normal))
+        elements.append(Paragraph("Tal.- Mulshi, Dist.-Pune", header_normal))
+        elements.append(Paragraph("Society Reg No : PNA/MSI/GNL/(O)/4350/FY 2021-2022 DATE : 24/08/2021", header_normal))
+        elements.append(Spacer(1, 0.15 * inch))
+
+        # Horizontal line
+        hr_style = ParagraphStyle("HR", parent=styles["Normal"], fontSize=2, spaceAfter=6, alignment=1)
+        elements.append(Paragraph("_" * 90, hr_style))
+
+        # Title
         title_style = ParagraphStyle(
             "Title",
             parent=styles["Heading1"],
@@ -297,9 +398,13 @@ def create_simple_receipt_pdf(pdf_path: Path, receipt_data: Dict[str, Any]) -> b
         # Payment details
         amount = receipt_data.get("amount", 0)
         elements.append(Paragraph(f"Amount Received: ₹ {amount:,.2f}", normal_style))
-        elements.append(
-            Paragraph(f"Transaction ID: {receipt_data.get('transaction_id', 'N/A')}", normal_style)
-        )
+        elements.append(Paragraph(f"Transaction ID: {receipt_data.get('transaction_id', 'N/A')}", normal_style))
+        txn_type = receipt_data.get("transaction_type", "")
+        if txn_type:
+            elements.append(Paragraph(f"Transaction Type: {txn_type}", normal_style))
+        payment_details = receipt_data.get("payment_details", "")
+        if payment_details:
+            elements.append(Paragraph(f"Payment Details: {payment_details}", normal_style))
         elements.append(Spacer(1, 0.3 * inch))
 
         # Outstanding balance
@@ -307,7 +412,21 @@ def create_simple_receipt_pdf(pdf_path: Path, receipt_data: Dict[str, Any]) -> b
         elements.append(Paragraph(f"Outstanding Balance: ₹ {outstanding:,.2f}", normal_style))
 
         elements.append(Spacer(1, 0.5 * inch))
-        elements.append(Paragraph("Payment processed successfully", normal_style))
+
+        # Footer note
+        note_style = ParagraphStyle(
+            "Note",
+            parent=styles["Normal"],
+            fontSize=8,
+            textColor=colors.gray,
+            alignment=1,
+            spaceBefore=12,
+        )
+        elements.append(Paragraph(
+            "Please note: This is auto generated by system and subject to "
+            "actual realization of payment in the account.",
+            note_style,
+        ))
 
         # Build PDF
         doc.build(elements)

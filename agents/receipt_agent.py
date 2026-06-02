@@ -73,7 +73,7 @@ class ReceiptAgent(BaseAgent):
             return str(payment_details)
 
         def confirm_payment_details(input_str: str = None):
-            """Confirm and record payment details. Input JSON keys: member_id or plot_no, amount, date. Example: {"member_id": 2, "amount": 3000, "date": "05-05-2026"}"""
+            """Confirm and record payment details. Input JSON keys: member_id or plot_no, amount, date, transaction_type (optional). Example: {"member_id": 2, "amount": 3000, "date": "05-05-2026", "transaction_type": "UPI"}"""
             data = _parse_action_input(input_str or "")
             member_id = data.get("member_id")
             amount = data.get("amount")
@@ -123,12 +123,13 @@ class ReceiptAgent(BaseAgent):
             }
 
         def generate_receipt(input_str: str = None):
-            """Generate receipt for payment. Input JSON keys: member_id (or plot_no), amount, date, transaction_id (optional). Example: {"member_id": 2, "amount": 3000, "date": "05-05-2026"}"""
+            """Generate receipt for payment. Input JSON keys: member_id (or plot_no), amount, date, transaction_id (optional), transaction_type (optional - NEFT/UPI/CHQ/IMPS/CASH). Example: {"member_id": 2, "amount": 3000, "date": "05-05-2026", "transaction_type": "UPI"}"""
             data = _parse_action_input(input_str or "")
             member_id = data.get("member_id")
             amount = data.get("amount")
             date = data.get("date")
             transaction_id = data.get("transaction_id")
+            transaction_type = data.get("transaction_type") or data.get("txn_type") or ""
 
             if not member_id:
                 plot_no = (data.get("plot_no") or data.get("plot") or
@@ -170,6 +171,7 @@ class ReceiptAgent(BaseAgent):
             new_outstanding = max(0, current_outstanding - amount)
 
             # Prepare receipt data
+            txn_type = transaction_type.upper() if transaction_type else ""
             receipt_data = {
                 "receipt_id": receipt_id,
                 "date": date or get_current_date(),
@@ -177,13 +179,17 @@ class ReceiptAgent(BaseAgent):
                 "plot_no": member.get("Plot_No", "N/A"),
                 "amount": amount,
                 "transaction_id": transaction_id or "N/A",
+                "transaction_type": txn_type,
                 "outstanding_balance": new_outstanding,
+                "payment_details": "",
             }
 
             # Generate PDF
             receipt_dir = config.RECEIPTS_DIR / fy
             receipt_dir.mkdir(parents=True, exist_ok=True)
-            receipt_filename = f"Receipt_{receipt_id}.pdf"
+            plot_str = str(member.get("Plot_No", "") or "")
+            plot_part = f"Plot_No_{plot_str.zfill(2)}" if plot_str else "Unknown"
+            receipt_filename = f"Receipt_{plot_part}_{receipt_id}.pdf"
             receipt_path = receipt_dir / receipt_filename
 
             success = create_simple_receipt_pdf(receipt_path, receipt_data)
@@ -191,7 +197,7 @@ class ReceiptAgent(BaseAgent):
             if success:
                 # Update ledger
                 vch_no = self.data_provider.get_next_voucher_number()
-                ledger_entry = {
+                self.data_provider.add_ledger_entry(member_id, {
                     "Date": date or get_current_date(),
                     "Particulars": "By Payment Received",
                     "Vch_Type": "Journal",
@@ -200,8 +206,8 @@ class ReceiptAgent(BaseAgent):
                     "Credit": amount,
                     "Description": f"Receipt {receipt_id}",
                     "Transaction_ID": transaction_id or None,
-                }
-                self.data_provider.add_ledger_entry(member_id, ledger_entry)
+                    "Transaction_Type": txn_type,
+                })
 
                 # Update member outstanding
                 self.data_provider.update_member(member_id, {"Current_Outstanding": new_outstanding})

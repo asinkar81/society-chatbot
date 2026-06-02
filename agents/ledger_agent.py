@@ -75,8 +75,8 @@ class LedgerAgent(BaseAgent):
 
             return result
 
-        def add_manual_payment(member_identifier: str, amount: float, date: str = None, description: str = None, transaction_id: str = None):
-            """Add manual payment entry to ledger with optional transaction_id"""
+        def add_manual_payment(member_identifier: str, amount: float, date: str = None, description: str = None, transaction_id: str = None, transaction_type: str = None):
+            """Add manual payment entry to ledger with optional transaction_id and transaction_type (NEFT/UPI/CHQ/IMPS/CASH)"""
             # Find member
             try:
                 member = self.data_provider.get_member(int(member_identifier))
@@ -90,7 +90,7 @@ class LedgerAgent(BaseAgent):
 
             # Create ledger entry
             vch_no = self.data_provider.get_next_voucher_number()
-            ledger_entry = {
+            success = self.data_provider.add_ledger_entry(member_id, {
                 "Date": date or get_current_date(),
                 "Particulars": "By Manual Payment",
                 "Vch_Type": "Journal",
@@ -99,9 +99,8 @@ class LedgerAgent(BaseAgent):
                 "Credit": amount,
                 "Description": description or "Manual payment entry",
                 "Transaction_ID": transaction_id or None,
-            }
-
-            success = self.data_provider.add_ledger_entry(member_id, ledger_entry)
+                "Transaction_Type": (transaction_type or "").upper(),
+            })
 
             if success:
                 # Update member outstanding

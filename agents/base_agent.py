@@ -79,9 +79,8 @@ def create_llm(model: str, use_vision: bool = False):
     For OpenRouter: uses ChatOpenAI (OpenAI-compatible endpoint /v1/chat/completions),
     which all models support. For direct Anthropic: uses ChatAnthropic.
     """
-    from langchain_openai import ChatOpenAI
-    
     if config.LLM_PROVIDER == "openrouter":
+        from langchain.chat_models import ChatOpenAI
         if not config.OPENROUTER_API_KEY:
             raise ValueError("OPENROUTER_API_KEY environment variable not set")
         return ChatOpenAI(
@@ -115,11 +114,13 @@ class BaseAgent(ABC):
         description: str,
         data_provider: DataProvider,
         file_storage: FileStorage,
+        system_prompt: str = None,
     ):
         self.name = name
         self.description = description
         self.data_provider = data_provider
         self.file_storage = file_storage
+        self.system_prompt = system_prompt
 
         # Initialize LLM
         self.llm = create_llm(config.LLM_MODEL_MAIN)
@@ -160,13 +161,16 @@ class BaseAgent(ABC):
         self.tools.append(lang_tool)
 
     def setup_executor(self):
-        """Setup agent executor"""
+        """Setup agent executor with optional custom prefix for system prompt."""
         if not self.tools:
             raise ValueError(f"No tools registered for {self.name}")
+
+        prefix = self.system_prompt or ZeroShotAgent.prefix
 
         # Create agent using ZeroShotAgent (works with old langchain API)
         agent_prompt = ZeroShotAgent.create_prompt(
             tools=self.tools,
+            prefix=prefix,
             input_variables=["input", "agent_scratchpad"],
         )
         
