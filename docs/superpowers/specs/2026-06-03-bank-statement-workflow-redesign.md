@@ -78,7 +78,7 @@ data/bank_statements/
 **Workflow:**
 1. **First time:** Upload PDF via Streamlit file uploader → saved to `data/bank_statements/` → parsed → recorded in `Processed_Statements`
 2. **New statement:** Same upload flow
-3. **Re-parse:** "🔄 Rebuild from All Statements" button — optionally clears ledger and re-imports all PDFs
+3. **Re-parse:** "🔄 Rebuild from All Statements" button — clears only bank-statement-originated entries (those without `"MANUAL"` in `Transaction_Type` and without `"MANUAL-"` prefix in `Transaction_ID`) and re-imports all PDFs. Manually entered entries and invoice entries are preserved
 4. **Parse unprocessed only:** "📄 Parse Unprocessed" button — processes only PDFs not in `Processed_Statements`
 5. **Password:** Configurable in `config.py` (default) + overridable text field on UI
 
@@ -124,6 +124,62 @@ A "Reconcile" button in the Reports tab that validates:
 
 Results displayed as a pass/fail table with details on any discrepancies.
 
+### 8. Split Entries
+
+Split entries are synthetic entries created when a payment for member A is automatically divided across members B and C (per split rules). They have `Transaction_ID = "SPLIT-{receipt_id}"` and particulars like `"By Split from Owner (NEFT X12345)"`.
+
+**With single master ledger:**
+- Split entries are stored identically to real entries — same `Ledger` sheet, same columns, just with `Plot_No` set to the split target member
+- The existing "Split from" exclusion in duplicate checks (Added June 3: case-insensitive + skip `SPLIT FROM` in particulars) prevents them from matching real bank transactions during reprocessing
+- `Transaction_Type = "SPLIT"` identifies them as synthetic
+
+**During auto-split (bank statement processing):**
+- Each split entry gets its own `Vch_No`, `Transaction_ID = "SPLIT-{source_receipt_id}"`, and `Plot_No` pointing to the split target
+- The source member's full payment entry is stored with the real bank transaction details
+- This continues to work unchanged — only the storage target changes (master sheet only, no per-plot)
+
+**During "Rebuild from All Statements":**
+- Re-parsing all PDFs recreates the original entries, and auto-split rules fire again (because split rules still exist in the `Split_Rules` sheet)
+- Split entries are correctly recreated — no manual intervention needed
+- Entries that were manually split (via the Ledgers tab Split UI) are NOT tied to any bank statement and must be excluded from rebuild. The rebuild operation clears only entries whose `Transaction_Type` is NOT `"MANUAL"` and whose `Transaction_ID` does not start with `"MANUAL-"`. Manually created entries are preserved.
+
+**During reconciliation:**
+- The reconciliation report should show split entry counts separately (e.g., "X bank entries + Y split entries = Z total")
+- Outstanding calculations naturally include split entries as credits for the target members, which is correct
+
+### 9. Orchestrator Agent Tools Impact
+
+The following tools registered with the LLM (`agents/orchestrator_agent.py`) are affected:
+
+| Tool | Impact |
+|------|--------|
+| `get_member_details` | No change — reads from `Members` sheet, filtered views don't affect it |
+| `get_member_ledger` | No change — already returns a filtered list. Will now filter by `Plot_No` column instead of reading a per-plot sheet. Output format unchanged |
+| `get_outstanding_summary` | Simplified — reads from `Reports` sheet (which is auto-generated on app launch) instead of computing from `get_current_outstanding`. Faster, no per-member loop |
+| `process_bank_statement` | Removed (text-paste path). Replaced by `process_bank_statement_pdf` which accepts a filename from `data/bank_statements/` instead of raw text. The PDF is already uploaded and parsed by the UI; this tool handles the member matching + receipt generation logic that used to follow text parsing. Format profile is passed as a parameter |
+| `generate_receipt` | No change — creates PDF receipt, doesn't touch ledger |
+| `regenerate_receipt` | No change — same as above |
+| `generate_consolidated_receipt` | No change |
+| `update_ledger_entry` | No change — still operates on the ledger. The underlying provider method now writes to single sheet instead of dual sheets |
+| `delete_ledger_entry` | No change — same as above |
+| `add_demand_entry` | No change — still adds to ledger, writing to single sheet |
+| `batch_add_demand_entries` | No change — same as above |
+| `generate_invoice` | No change |
+| `regenerate_invoice` | No change |
+| `delete_invoice` | No change |
+| `batch_generate_invoices` | No change |
+| `trigger_april_entries` | No change |
+| `get_current_settings` | No change |
+| `add_new_member` | No change — adds to Members sheet, outstanding now auto-computed from ledger instead of being stored |
+| `update_rates` | No change |
+| `extract_payment` | No change — manual payment entry, writes to single ledger sheet |
+| `batch_process_historical_receipts` | No change |
+
+**System prompt updates:**
+- Update rule 3: "For bank statements: use the `process_bank_statement_pdf` tool with the filename from `data/bank_statements/`. The PDF has already been uploaded and parsed by the UI — your job is to match parsed entries to members and generate receipts"
+- Remove any references to copy-pasting bank statement text
+- Remove any references to `Current_Outstanding` or `refresh_all_outstandings`
+
 ## Migration Plan
 
 1. Take a manual backup of `data/society_data.xlsx` before any changes
@@ -151,7 +207,7 @@ Results displayed as a pass/fail table with details on any discrepancies.
 | `data_providers/local_excel_provider.py` | Drop per-plot writes, remove `Current_Outstanding` write paths, remove `refresh_all_outstandings`, add `Reports` sheet management, add `Processed_Statements` sheet management |
 | `data_providers/base_provider.py` | Update interface if needed |
 | `main.py` | Replace text-area input with file uploader + password field, add auto-backup, add restore UI, remove Refresh Balances button, add Reconcile button, update Dashboard KPI computations |
-| `agents/orchestrator_agent.py` | Add `process_bank_statement_pdf` tool, remove `Current_Outstanding` update calls |
+| `agents/orchestrator_agent.py` | Replace `process_bank_statement` with `process_bank_statement_pdf` (takes filename + format profile), remove `Current_Outstanding` update calls, update system prompt rules 3 and 4 |
 | `config.py` | Add `BANK_STATEMENTS_DIR`, `BACKUPS_DIR`, `BANK_STMT_PASSWORD` env var, `MAX_BACKUPS` |
 | `tools/pdf_parser.py` | NEW — PDF text extraction with `pdfplumber`, format profile detection, post-processing |
 | `requirements.txt` | Add `pdfplumber` |
