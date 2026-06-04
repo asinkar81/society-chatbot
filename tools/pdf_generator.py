@@ -191,7 +191,7 @@ def create_simple_invoice_pdf(pdf_path: Path, invoice_data: Dict[str, Any]) -> b
             for ph in payment_history:
                 ph_data.append([
                     str(ph.get("date", "")),
-                    str(ph.get("particulars", ""))[:30],
+                    str(ph.get("particulars", ""))[:60],
                     f"{ph.get('amount', 0):,.2f}",
                 ])
                 ph_total += ph.get("amount", 0)
@@ -460,7 +460,7 @@ def create_consolidated_receipt_pdf(pdf_path: Path, receipts: list[Dict[str, Any
         elements.append(Paragraph("_" * 90, hr))
 
         # Table header
-        data = [["#", "Date", "Receipt No", "Transaction ID", "Amount (₹)"]]
+        data = [["#", "Date", "Receipt No", "Particulars", "Amount (₹)"]]
         total = 0.0
         for i, r in enumerate(receipts, 1):
             amt = float(r.get("amount", 0))
@@ -468,13 +468,13 @@ def create_consolidated_receipt_pdf(pdf_path: Path, receipts: list[Dict[str, Any
                 str(i),
                 str(r.get("date", "")),
                 str(r.get("receipt_id", "")),
-                str(r.get("transaction_id", "")),
+                str(r.get("particulars", ""))[:50],
                 f"{amt:,.2f}",
             ])
             total += amt
         data.append(["", "", "", "TOTAL", f"{total:,.2f}"])
 
-        table = Table(data, colWidths=[0.4*inch, 1.2*inch, 1.5*inch, 2.2*inch, 1.2*inch])
+        table = Table(data, colWidths=[0.4*inch, 1.0*inch, 1.2*inch, 2.7*inch, 1.2*inch])
         table.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.grey),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),

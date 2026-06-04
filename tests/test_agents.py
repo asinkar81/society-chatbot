@@ -207,7 +207,7 @@ class TestBankStatementParser(unittest.TestCase):
             "2 02-03-2026 CLG:VAISHALI DADAPATIL WALUN 12034759 5,940.00 5,03,667.62 Cr\n"
         )
         summary = self._parse(stmt)
-        self.assertIn("Expenses recorded: 2", summary)
+        self.assertIn("Expenses recorded: 1", summary)
 
     def test_standard_format_still_works(self):
         """Verify existing date-first format is not broken"""

@@ -622,7 +622,7 @@ def _generate_receipt_for_entry(dp, entry, member_id) -> Optional[str]:
         "amount": _s(entry.get("Credit")),
         "transaction_id": str(entry.get("Transaction_ID", "") or "N/A"),
         "transaction_type": str(entry.get("Transaction_Type", "") or ""),
-        "payment_details": clean_payment_details(str(entry.get("Particulars", "")))[:120],
+        "payment_details": str(entry.get("Particulars", ""))[:120],
     }
     success = create_simple_receipt_pdf(rpath, receipt_data)
     return ref_id if success else None
@@ -825,6 +825,24 @@ def show_dashboard_page():
                         )
                         data_provider.refresh_reports_sheet()
                         st.rerun()
+
+            st.divider()
+            st.markdown("**Or paste bank statement text directly:**")
+            pasted_text = st.text_area("", placeholder="Copy-paste the bank statement text here...", key="bank_stmt_pasted_text", label_visibility="collapsed")
+            if pasted_text and pasted_text.strip():
+                if st.button("🚀 Process Pasted Text → Ledger", key="process_pasted_stmt"):
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    shutil.copy2(config.SOCIETY_DATA_FILE, config.BACKUPS_DIR / f"society_data_{ts}_auto_pre_stmt.xlsx")
+                    tool_input = json.dumps({
+                        "statement": pasted_text.strip(),
+                        "generate_receipts": gen_receipts_checkbox,
+                        "format": "",
+                        "filename": "pasted_text",
+                    })
+                    result = _run_tool("process_bank_statement_pdf", tool_input)
+                    st.session_state.bank_stmt_result = result
+                    data_provider.refresh_reports_sheet()
+                    st.rerun()
 
         result = st.session_state.bank_stmt_result
         matched = []
@@ -2029,13 +2047,142 @@ def show_dashboard_page():
                     total_cr = _s(sum(_s(e.get("Credit")) for e in led_entries))
                     st.caption(f"Debits: ₹{total_dr:,.2f}  |  Credits: ₹{total_cr:,.2f}  |  Net: ₹{total_cr - total_dr:,.2f}")
 
-                    # ── Batch action toolbar ──
-                    bcols = st.columns([0.6, 2.5, 2, 2, 2, 2])
-                    with bcols[0]:
-                        st.checkbox("☑", key="led_sel_all", label_visibility="collapsed",
-                                     on_change=_led_select_all_changed)
-                    with bcols[2]:
-                        if st.button("🗑️ Delete Selected", type="secondary", use_container_width=True, key="led_batch_del"):
+                    # ── Batch action toolbar + entries (wrapped in form for silent checkbox toggle) ──
+                    with st.form(key="led_batch_form"):
+                        bcols = st.columns([0.6, 2.5, 2, 2, 2, 2])
+                        with bcols[0]:
+                            st.checkbox("☑", key="led_sel_all", label_visibility="collapsed",
+                                         on_change=_led_select_all_changed)
+                        with bcols[2]:
+                            del_clicked = st.form_submit_button("🗑️ Delete Selected", type="secondary", use_container_width=True, key="led_batch_del")
+                        with bcols[3]:
+                            regen_clicked = st.form_submit_button("🔄 Regenerate Selected", type="primary", use_container_width=True, key="led_batch_regen")
+                        with bcols[4]:
+                            move_clicked = st.form_submit_button("➡️ Move Selected", type="secondary", use_container_width=True, key="led_batch_move")
+                        with bcols[5]:
+                            split_clicked = st.form_submit_button("✂️ Split Selected", type="secondary", use_container_width=True, key="led_batch_split")
+
+                        st.divider()
+                        split_group = data_provider.get_split_group_for_member(led_member_id) if led_member_id else None
+                        for idx, entry in enumerate(led_entries):
+                            ed = str(entry.get("Date", "") or "")
+                            ev = entry.get("Vch_No", "")
+                            edesc = str(entry.get("Description", "") or "")
+                            epart = str(entry.get("Particulars", "") or "")
+                            edeb = _s(entry.get("Debit"))
+                            ecr = _s(entry.get("Credit"))
+                            etype = str(entry.get("Transaction_Type", "") or "")
+                            amt = ecr if ecr > 0 else edeb
+                            is_credit = ecr > 0
+                            lbl = f"₹{amt:,.2f} CR" if is_credit else f"₹{amt:,.2f} DR"
+                            can_split = is_credit and split_group is not None
+                            c1, c2, c3, c4, c5, c6 = st.columns([0.3, 1.5, 1.5, 3, 1.5, 1.5])
+                            with c1:
+                                st.checkbox("", key=f"led_sel_{idx}", label_visibility="collapsed")
+                            with c2:
+                                st.caption(f"#{ev}")
+                                st.text(ed)
+                            with c3:
+                                st.caption(etype)
+                                st.text(edesc[:40] if edesc else "")
+                            with c4:
+                                st.caption("Particulars")
+                                st.text(epart[:80])
+                            with c5:
+                                st.text(lbl)
+                            with c6:
+                                # ── Undo Split ──
+                                unsplit_clicked = False
+                                unmove_clicked = False
+                                if etype.upper() == "SPLIT" or "split from #" in edesc.lower():
+                                    orig_match = re.search(r"Split from #(\d+)\s*\(src:(\d+)\)", edesc, re.IGNORECASE)
+                                    if orig_match:
+                                        unsplit_clicked = st.form_submit_button("↩️ Undo", key=f"led_unsplit_{idx}", help="Undo split, recreate original entry")
+                                        if unsplit_clicked:
+                                            orig_vch = int(orig_match.group(1))
+                                            orig_mid = int(orig_match.group(2))
+                                            all_ledger = data_provider.get_member_ledger_all()
+                                            siblings = [se for se in all_ledger
+                                                         if f"Split from #{orig_vch}" in str(se.get("Description", ""))]
+                                            total_amt = sum(float(se.get("Credit", 0) or 0) for se in siblings)
+                                            for se in siblings:
+                                                smid = se.get("Member_ID") or se.get("Plot_No")
+                                                svch = int(se.get("Vch_No", 0))
+                                                if smid and svch:
+                                                    data_provider.delete_ledger_entry(int(float(smid)), svch)
+                                            data_provider.add_ledger_entry(orig_mid, {
+                                                "Date": ed, "Particulars": epart[:60],
+                                                "Vch_Type": "Journal", "Vch_No": orig_vch,
+                                                "Debit": None, "Credit": total_amt,
+                                                "Description": f"Undid split #{orig_vch} — restored entry",
+                                                "Transaction_Type": etype, "Transaction_ID": entry.get("Transaction_ID", ""),
+                                            })
+                                            st.success(f"↩️ Undid split #{orig_vch} — ₹{total_amt:,.2f} restored to member #{orig_mid}")
+                                            st.rerun()
+                                # ── Undo Move ──
+                                if not unsplit_clicked:
+                                    move_match = re.search(r"\(moved from #(\d+)\)", edesc)
+                                    if move_match:
+                                        src_mid = int(move_match.group(1))
+                                        unmove_clicked = st.form_submit_button("↩️ Undo", key=f"led_unmove_{idx}", help="Move back to original member")
+                                        if unmove_clicked:
+                                            vch_no = int(ev) if ev else 0
+                                            if vch_no and data_provider.delete_ledger_entry(led_member_id, vch_no):
+                                                data_provider.add_ledger_entry(src_mid, {
+                                                    "Date": ed, "Particulars": epart[:60],
+                                                    "Vch_Type": "Journal", "Vch_No": vch_no,
+                                                    "Debit": None, "Credit": ecr,
+                                                    "Description": edesc, "Transaction_Type": etype,
+                                                    "Transaction_ID": entry.get("Transaction_ID", ""),
+                                                })
+                                            st.success(f"↩️ Moved ₹{ecr:,.2f} back to member #{src_mid}")
+                                            st.rerun()
+                                if is_credit and not unsplit_clicked and not unmove_clicked:
+                                    if st.form_submit_button("➡️ Move", key=f"led_move_{idx}", help="Move to another member"):
+                                        src = {
+                                            "member_id": led_member_id,
+                                            "vch_no": int(ev) if ev else 0,
+                                            "amount": ecr, "date": ed,
+                                            "particulars": epart, "description": edesc,
+                                            "txn_type": etype,
+                                            "txn_id": entry.get("Transaction_ID", ""),
+                                        }
+                                        st.session_state.move_src = src
+                                        st.session_state.move_src_list = [src]
+                                        st.rerun()
+                                    if st.form_submit_button("✂️ Split", key=f"led_split_{idx}", help="Split across members"):
+                                        src = {
+                                            "member_id": led_member_id,
+                                            "vch_no": int(ev) if ev else 0,
+                                            "amount": ecr, "date": ed,
+                                            "particulars": epart,
+                                            "txn_type": etype,
+                                            "txn_id": entry.get("Transaction_ID", ""),
+                                        }
+                                        st.session_state.split_src = src
+                                        st.session_state.split_src_list = [src]
+                                        st.rerun()
+                                    if can_split:
+                                        if st.form_submit_button("➡️ Source", key=f"led_route_{idx}", help="Route to source member"):
+                                            src_rule = next((r for r in data_provider.get_split_rules()
+                                                            if int(r.get("Source_Member_ID", 0)) == led_member_id
+                                                            or led_member_id in [int(x) for x in str(r.get("Members", "")).split(",") if x.strip().isdigit()]), None)
+                                            if src_rule:
+                                                src_mid = int(src_rule["Source_Member_ID"])
+                                                vch_no = int(ev) if ev else 0
+                                                if vch_no and data_provider.delete_ledger_entry(led_member_id, vch_no):
+                                                    data_provider.add_ledger_entry(src_mid, {
+                                                        "Date": ed, "Particulars": epart[:60],
+                                                        "Vch_Type": "Journal", "Vch_No": vch_no,
+                                                        "Debit": None, "Credit": ecr,
+                                                        "Description": edesc, "Transaction_Type": etype,
+                                                        "Transaction_ID": entry.get("Transaction_ID", ""),
+                                                    })
+                                                st.success(f"✅ Routed ₹{ecr:,.2f} to source member #{src_mid}")
+                                                st.rerun()
+
+                        # ── Process batch actions (only one fires per submit) ──
+                        if del_clicked:
                             sel_idx = [idx for idx, e in enumerate(led_entries) if st.session_state.get(f"led_sel_{idx}", False)]
                             if sel_idx:
                                 dc = 0
@@ -2049,8 +2196,7 @@ def show_dashboard_page():
                                 st.rerun()
                             else:
                                 st.warning("No entries selected")
-                    with bcols[3]:
-                        if st.button("🔄 Regenerate Selected", type="primary", use_container_width=True, key="led_batch_regen"):
+                        elif regen_clicked:
                             sel_idx = [idx for idx, e in enumerate(led_entries) if st.session_state.get(f"led_sel_{idx}", False)]
                             if sel_idx:
                                 for idx in sel_idx:
@@ -2061,8 +2207,7 @@ def show_dashboard_page():
                                 st.rerun()
                             else:
                                 st.warning("No entries selected")
-                    with bcols[4]:
-                        if st.button("➡️ Move Selected", type="secondary", use_container_width=True, key="led_batch_move"):
+                        elif move_clicked:
                             sel_idx = [idx for idx, e in enumerate(led_entries) if st.session_state.get(f"led_sel_{idx}", False)]
                             credits = [led_entries[idx] for idx in sel_idx if _s(led_entries[idx].get("Credit")) > 0]
                             if credits:
@@ -2081,8 +2226,7 @@ def show_dashboard_page():
                                 st.rerun()
                             else:
                                 st.warning("Select at least one credit entry to move")
-                    with bcols[5]:
-                        if st.button("✂️ Split Selected", type="secondary", use_container_width=True, key="led_batch_split"):
+                        elif split_clicked:
                             sel_idx = [idx for idx, e in enumerate(led_entries) if st.session_state.get(f"led_sel_{idx}", False)]
                             credits = [led_entries[idx] for idx in sel_idx if _s(led_entries[idx].get("Credit")) > 0]
                             if credits:
@@ -2101,119 +2245,6 @@ def show_dashboard_page():
                             else:
                                 st.warning("Select at least one credit entry to split")
 
-                    st.divider()
-                    split_group = data_provider.get_split_group_for_member(led_member_id) if led_member_id else None
-                    for idx, entry in enumerate(led_entries):
-                        ed = str(entry.get("Date", "") or "")
-                        ev = entry.get("Vch_No", "")
-                        edesc = str(entry.get("Description", "") or "")
-                        epart = str(entry.get("Particulars", "") or "")
-                        edeb = _s(entry.get("Debit"))
-                        ecr = _s(entry.get("Credit"))
-                        etype = str(entry.get("Transaction_Type", "") or "")
-                        amt = ecr if ecr > 0 else edeb
-                        is_credit = ecr > 0
-                        lbl = f"₹{amt:,.2f} CR" if is_credit else f"₹{amt:,.2f} DR"
-                        can_split = is_credit and split_group is not None
-                        c1, c2, c3, c4, c5, c6 = st.columns([0.3, 1.5, 1.5, 3, 1.5, 1.5])
-                        with c1:
-                            st.checkbox("", key=f"led_sel_{idx}", label_visibility="collapsed")
-                        with c2:
-                            st.caption(f"#{ev}")
-                            st.text(ed)
-                        with c3:
-                            st.caption(etype)
-                            st.text(edesc[:40] if edesc else "")
-                        with c4:
-                            st.caption("Particulars")
-                            st.text(epart[:80])
-                        with c5:
-                            st.text(lbl)
-                        with c6:
-                            # ── Undo Split ──
-                            if etype.upper() == "SPLIT" or "split from #" in edesc.lower():
-                                orig_match = re.search(r"Split from #(\d+)\s*\(src:(\d+)\)", edesc, re.IGNORECASE)
-                                if orig_match:
-                                    orig_vch = int(orig_match.group(1))
-                                    orig_mid = int(orig_match.group(2))
-                                    if st.button("↩️ Undo", key=f"led_unsplit_{idx}", help="Undo split, recreate original entry"):
-                                        all_ledger = data_provider.get_member_ledger_all()
-                                        siblings = [se for se in all_ledger
-                                                     if f"Split from #{orig_vch}" in str(se.get("Description", ""))]
-                                        total_amt = sum(float(se.get("Credit", 0) or 0) for se in siblings)
-                                        for se in siblings:
-                                            smid = se.get("Member_ID") or se.get("Plot_No")
-                                            svch = int(se.get("Vch_No", 0))
-                                            if smid and svch:
-                                                data_provider.delete_ledger_entry(int(float(smid)), svch)
-                                        data_provider.add_ledger_entry(orig_mid, {
-                                            "Date": ed, "Particulars": epart[:60],
-                                            "Vch_Type": "Journal", "Vch_No": orig_vch,
-                                            "Debit": None, "Credit": total_amt,
-                                            "Description": f"Undid split #{orig_vch} — restored entry",
-                                            "Transaction_Type": etype, "Transaction_ID": entry.get("Transaction_ID", ""),
-                                        })
-                                        st.success(f"↩️ Undid split #{orig_vch} — ₹{total_amt:,.2f} restored to member #{orig_mid}")
-                                        st.rerun()
-                            # ── Undo Move ──
-                            move_match = re.search(r"\(moved from #(\d+)\)", edesc)
-                            if move_match:
-                                src_mid = int(move_match.group(1))
-                                if st.button("↩️ Undo", key=f"led_unmove_{idx}", help="Move back to original member"):
-                                    vch_no = int(ev) if ev else 0
-                                    if vch_no and data_provider.delete_ledger_entry(led_member_id, vch_no):
-                                        data_provider.add_ledger_entry(src_mid, {
-                                            "Date": ed, "Particulars": epart[:60],
-                                            "Vch_Type": "Journal", "Vch_No": vch_no,
-                                            "Debit": None, "Credit": ecr,
-                                            "Description": edesc, "Transaction_Type": etype,
-                                            "Transaction_ID": entry.get("Transaction_ID", ""),
-                                        })
-                                    st.success(f"↩️ Moved ₹{ecr:,.2f} back to member #{src_mid}")
-                                    st.rerun()
-                            if is_credit:
-                                if st.button("➡️ Move", key=f"led_move_{idx}", help="Move to another member"):
-                                    src = {
-                                        "member_id": led_member_id,
-                                        "vch_no": int(ev) if ev else 0,
-                                        "amount": ecr, "date": ed,
-                                        "particulars": epart, "description": edesc,
-                                        "txn_type": etype,
-                                        "txn_id": entry.get("Transaction_ID", ""),
-                                    }
-                                    st.session_state.move_src = src
-                                    st.session_state.move_src_list = [src]
-                                    st.rerun()
-                                if st.button("✂️ Split", key=f"led_split_{idx}", help="Split across members"):
-                                    src = {
-                                        "member_id": led_member_id,
-                                        "vch_no": int(ev) if ev else 0,
-                                        "amount": ecr, "date": ed,
-                                        "particulars": epart,
-                                        "txn_type": etype,
-                                        "txn_id": entry.get("Transaction_ID", ""),
-                                    }
-                                    st.session_state.split_src = src
-                                    st.session_state.split_src_list = [src]
-                                    st.rerun()
-                                if can_split:
-                                    if st.button("➡️ Source", key=f"led_route_{idx}", help="Route to source member"):
-                                        src_rule = next((r for r in data_provider.get_split_rules()
-                                                        if int(r.get("Source_Member_ID", 0)) == led_member_id
-                                                        or led_member_id in [int(x) for x in str(r.get("Members", "")).split(",") if x.strip().isdigit()]), None)
-                                        if src_rule:
-                                            src_mid = int(src_rule["Source_Member_ID"])
-                                            vch_no = int(ev) if ev else 0
-                                            if vch_no and data_provider.delete_ledger_entry(led_member_id, vch_no):
-                                                data_provider.add_ledger_entry(src_mid, {
-                                                    "Date": ed, "Particulars": epart[:60],
-                                                    "Vch_Type": "Journal", "Vch_No": vch_no,
-                                                    "Debit": None, "Credit": ecr,
-                                                    "Description": edesc, "Transaction_Type": etype,
-                                                    "Transaction_ID": entry.get("Transaction_ID", ""),
-                                                })
-                                            st.success(f"✅ Routed ₹{ecr:,.2f} to source member #{src_mid}")
-                                            st.rerun()
                     st.divider()
 
                     # ── Split UI ───────────────────────────────────
@@ -2433,8 +2464,6 @@ def show_dashboard_page():
                 st.session_state.dup_result = []
             if st.button("Run Duplicate Scan", key="dup_scan_btn"):
                 all_ledger = data_provider.get_member_ledger_all()
-                entries_by_key = {}  # (date, amount_rounded) → list of entries with member info
-                txn_id_map = {}  # Transaction_ID → list
                 part_map = {}  # normalized particulars → list
 
                 for e in all_ledger:
@@ -2445,40 +2474,18 @@ def show_dashboard_page():
                         mid = int(float(mid))
                     except (ValueError, TypeError):
                         continue
-                    date = str(e.get("Date", "") or "")
-                    amount = round(_s(e.get("Credit")) or _s(e.get("Debit")), 0)
-                    key = (date, amount)
-                    entries_by_key.setdefault(key, []).append({**e, "_dup_mid": mid})
-                    txn_id = str(e.get("Transaction_ID", "") or "").strip()
-                    if txn_id and txn_id != "N/A":
-                        txn_id_map.setdefault(txn_id, []).append({**e, "_dup_mid": mid})
                     pn = _normalize_particulars(e.get("Particulars", ""))
                     if pn:
                         part_map.setdefault(pn, []).append({**e, "_dup_mid": mid})
 
                 dup_groups = []
                 seen = set()
-                # Check normalized Particulars groups first (most reliable)
                 for pn, items in part_map.items():
                     if len(items) >= 2 and len(pn) >= 5:
                         ids = tuple(sorted((e.get("Vch_No"), e["_dup_mid"]) for e in items))
                         if ids not in seen:
                             seen.add(ids)
                             dup_groups.append((f"Particulars: {pn}", items))
-                # Check date+amount groups
-                for key, items in entries_by_key.items():
-                    if len(items) >= 2:
-                        ids = tuple(sorted((e.get("Vch_No"), e["_dup_mid"]) for e in items))
-                        if ids not in seen:
-                            seen.add(ids)
-                            dup_groups.append(("Date + Amount", items))
-                # Check Transaction_ID groups
-                for txn_id, items in txn_id_map.items():
-                    if len(items) >= 2:
-                        ids = tuple(sorted((e.get("Vch_No"), e["_dup_mid"]) for e in items))
-                        if ids not in seen:
-                            seen.add(ids)
-                            dup_groups.append((f"Transaction ID: {txn_id}", items))
 
                 st.session_state.dup_result = dup_groups
 
@@ -2487,48 +2494,57 @@ def show_dashboard_page():
                 st.info("Click 'Run Duplicate Scan' to check for potential duplicates across all members.")
             else:
                 st.warning(f"⚠️ Found {len(dup_groups)} potential duplicate group(s)")
-                for reason, items in dup_groups:
+                for gi, (reason, items) in enumerate(dup_groups):
                     with st.container(border=True):
                         st.caption(f"**{reason}**")
-                        all_vch = set()
-                        for e in items:
-                            member_info = _find_member(e["_dup_mid"])
-                            mlabel = f"P{member_info.get('Plot_No','?')} {member_info.get('Plot_Owner_Name','?')}" if member_info else f"ID {e['_dup_mid']}"
-                            cr = _s(e.get("Credit"))
-                            amt_lbl = f"CR ₹{cr:>,.2f}" if cr > 0 else f"DR ₹{_s(e.get('Debit')):>,.2f}"
-                            is_split = str(e.get("Transaction_Type", "") or "").upper() == "SPLIT"
-                            cols = st.columns([2, 2, 1.5, 1.5, 0.7, 0.7])
-                            cols[0].write(f"{e.get('Date','')} {amt_lbl}")
-                            cols[1].write(mlabel)
-                            cols[2].write(f"Vch #{int(e.get('Vch_No',0))}")
-                            cols[3].write(f"{'SPLIT' if is_split else '—'}")
-                            with cols[4]:
-                                if st.button("🗑️", key=f"dup_del_{id(e)}", help="Delete this entry"):
-                                    if data_provider.delete_ledger_entry(e["_dup_mid"], int(e.get("Vch_No", 0))):
-                                        _delete_pdf_files(_extract_ref_id(str(e.get("Description", ""))))
-                                        st.session_state.dup_result = []
-                                        st.success(f"Deleted Vch #{int(e.get('Vch_No',0))}")
-                                        st.rerun()
-                            with cols[5]:
-                                if is_split:
-                                    if st.button("↩️", key=f"dup_unsp_{id(e)}", help="Undo split (delete all split entries)"):
-                                        vch_no = int(e.get("Vch_No", 0))
-                                        all_split_entries = [
-                                            oe for oe in data_provider.get_member_ledger_all()
-                                            if str(oe.get("Transaction_Type", "") or "").upper() == "SPLIT"
-                                            and f"Split from #{vch_no}" in str(oe.get("Description", ""))
-                                        ]
-                                        total_amt = 0
-                                        for se in all_split_entries:
-                                            se_mid = se.get("Member_ID") or se.get("Plot_No")
-                                            se_vch = int(se.get("Vch_No", 0))
-                                            if se_mid and se_vch:
-                                                total_amt += _s(se.get("Credit"))
-                                                data_provider.delete_ledger_entry(int(float(se_mid)), se_vch)
-                                        data_provider.delete_ledger_entry(e["_dup_mid"], vch_no)
-                                        st.session_state.dup_result = []
-                                        st.success(f"✅ Undid split — ₹{total_amt:>,.2f} total across {len(all_split_entries)+1} entries deleted")
-                                        st.rerun()
+                        with st.form(key=f"dup_form_{gi}"):
+                            all_vch = set()
+                            for ei, e in enumerate(items):
+                                member_info = _find_member(e["_dup_mid"])
+                                mlabel = f"P{member_info.get('Plot_No','?')} {member_info.get('Plot_Owner_Name','?')}" if member_info else f"ID {e['_dup_mid']}"
+                                cr = _s(e.get("Credit"))
+                                amt_lbl = f"CR ₹{cr:>,.2f}" if cr > 0 else f"DR ₹{_s(e.get('Debit')):>,.2f}"
+                                is_split = str(e.get("Transaction_Type", "") or "").upper() == "SPLIT"
+                                cols = st.columns([0.3, 2, 2, 1.5, 1.2])
+                                with cols[0]:
+                                    st.checkbox("", key=f"dup_chk_{gi}_{ei}", label_visibility="collapsed")
+                                cols[1].write(f"{e.get('Date','')} {amt_lbl}")
+                                cols[2].write(mlabel)
+                                cols[3].write(f"Vch #{int(e.get('Vch_No',0))}")
+                                with cols[4]:
+                                    if is_split:
+                                        if st.form_submit_button("↩️", key=f"dup_unsp_{gi}_{ei}", help="Undo split (delete all split entries)"):
+                                            vch_no = int(e.get("Vch_No", 0))
+                                            all_split_entries = [
+                                                oe for oe in data_provider.get_member_ledger_all()
+                                                if str(oe.get("Transaction_Type", "") or "").upper() == "SPLIT"
+                                                and f"Split from #{vch_no}" in str(oe.get("Description", ""))
+                                            ]
+                                            total_amt = 0
+                                            for se in all_split_entries:
+                                                se_mid = se.get("Member_ID") or se.get("Plot_No")
+                                                se_vch = int(se.get("Vch_No", 0))
+                                                if se_mid and se_vch:
+                                                    total_amt += _s(se.get("Credit"))
+                                                    data_provider.delete_ledger_entry(int(float(se_mid)), se_vch)
+                                            data_provider.delete_ledger_entry(e["_dup_mid"], vch_no)
+                                            st.session_state.dup_result = []
+                                            st.success(f"✅ Undid split — ₹{total_amt:>,.2f} total across {len(all_split_entries)+1} entries deleted")
+                                            st.rerun()
+                            del_clicked = st.form_submit_button("🗑️ Delete Selected", type="primary", use_container_width=True)
+                            if del_clicked:
+                                dc = 0
+                                for ei, e in enumerate(items):
+                                    if st.session_state.get(f"dup_chk_{gi}_{ei}", False):
+                                        if data_provider.delete_ledger_entry(e["_dup_mid"], int(e.get("Vch_No", 0))):
+                                            _delete_pdf_files(_extract_ref_id(str(e.get("Description", ""))))
+                                            dc += 1
+                                st.session_state.dup_result = []
+                                if dc:
+                                    st.success(f"✅ Deleted {dc} duplicate entries")
+                                else:
+                                    st.info("No entries selected")
+                                st.rerun()
 
         st.divider()
 

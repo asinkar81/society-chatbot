@@ -150,7 +150,7 @@ def get_payment_history(ledger: list, up_to_date: str) -> list:
             if credit > 0:
                 payments.append({
                     "date": entry.get("Date", ""),
-                    "particulars": str(entry.get("Particulars", "") or "")[:40],
+                    "particulars": str(entry.get("Particulars", "") or "")[:80],
                     "amount": credit,
                 })
     payments.sort(key=lambda x: parse_dmy(str(x["date"])))

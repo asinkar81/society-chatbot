@@ -414,7 +414,7 @@ class OrchestratorAgent(BaseAgent):
                 "amount": amount,
                 "transaction_id": transaction_id or "N/A",
                 "transaction_type": transaction_type.upper() if transaction_type else "",
-                "payment_details": clean_payment_details(payment_details)[:120],
+                "payment_details": str(payment_details or "")[:120],
                 "outstanding_balance": new_outstanding,
             }
 
@@ -430,7 +430,7 @@ class OrchestratorAgent(BaseAgent):
 
             ledger_entry = {
                 "Date": date,
-                "Particulars": "By Payment Received",
+                "Particulars": f"By {str(payment_details or 'Payment Received')[:60]}",
                 "Vch_Type": "Journal",
                 "Vch_No": vch_no,
                 "Debit": None,
@@ -584,8 +584,7 @@ class OrchestratorAgent(BaseAgent):
                     "receipt_id": ref_id or f"{fy}-{str(e.get('Vch_No', '')).zfill(3)}",
                     "date": str(e.get("Date", "")),
                     "amount": _safe_float(e.get("Credit")),
-                    "transaction_id": str(e.get("Transaction_ID", "") or ""),
-                    "transaction_type": str(e.get("Transaction_Type", "") or ""),
+                    "particulars": str(e.get("Particulars", "") or ""),
                 })
 
             # Create the PDF
@@ -1049,6 +1048,10 @@ class OrchestratorAgent(BaseAgent):
                 except OSError:
                     pass
 
+            target_ledger = self.data_provider.get_member_ledger(member_id)
+            payment_history = get_payment_history(target_ledger, date)
+            previous_invoices = get_previous_invoices(target_ledger, date)
+
             invoice_data = {
                 "invoice_no": invoice_no or "REGEN",
                 "invoice_date": date,
@@ -1061,8 +1064,8 @@ class OrchestratorAgent(BaseAgent):
                 "number_of_months": months,
                 "payment_received_till_date": payment_received,
                 "outstanding_balance": total,
-                "payment_history": [],
-                "previous_invoices": [],
+                "payment_history": payment_history,
+                "previous_invoices": previous_invoices,
                 "line_items": {
                     f"Repair & Maintenance Fund @ ₹{repair_rate:,.2f}/month × {months} months": repair_amount,
                     f"Service Charges @ ₹{service_rate:,.2f}/month × {months} months": service_amount,
@@ -1210,6 +1213,7 @@ class OrchestratorAgent(BaseAgent):
                 }
                 if payment_received > 0:
                     line_items["Payment Received Till Date (this period)"] = -payment_received
+
                 invoice_data = {
                     "invoice_no": invoice_no,
                     "invoice_date": invoice_date_input,
@@ -1422,13 +1426,14 @@ class OrchestratorAgent(BaseAgent):
 
                 # No Cr/Dr suffix on transaction amount — check for cheque number
                 # Cheque numbers are all-digit tokens (6-9 digits) appearing between
-                # the textual description and the first decimal amount. UTR references
-                # have alphabetic prefixes (e.g. N08922..., CITIN222...) so they won't match.
+                # the textual description and the first decimal amount, but only when
+                # accompanied by a cheque-related keyword (CHQ/CHEQUE/CTS/INST).
+                # Pure-numeric UTR references (e.g. 425054098) should NOT match.
                 first_amt_pos = all_amounts[-2].start()
                 text_before_amt = combined[:first_amt_pos].rstrip()
                 # Match an all-digit token right before the amount
                 cheque_match = re.search(r'\b(\d{6,9})\s*$', text_before_amt)
-                if cheque_match:
+                if cheque_match and re.search(r'(?:CHQ|CHEQUE|CTS|INST)', text_before_amt, re.IGNORECASE):
                     # This is a cheque withdrawal
                     return {
                         "type": "debit",
@@ -1857,7 +1862,7 @@ class OrchestratorAgent(BaseAgent):
                                     "amount": amount,
                                     "transaction_id": pentry.get("txn_id") or "N/A",
                                     "transaction_type": txn_type,
-                                    "payment_details": clean_payment_details(particulars)[:120],
+                                    "payment_details": particulars[:120],
                                 }
                                 create_simple_receipt_pdf(rpath, receipt_data)
                             results.append({
@@ -1899,7 +1904,7 @@ class OrchestratorAgent(BaseAgent):
                                 "transaction_id": pentry.get("txn_id") or "N/A",
                                 "transaction_type": txn_type,
                                 "outstanding_balance": current_outstanding,
-                                "payment_details": clean_payment_details(particulars)[:120],
+                                "payment_details": particulars[:120],
                             }
                             if generate_receipts:
                                 receipt_dir = config.RECEIPTS_DIR / fy
@@ -1918,6 +1923,7 @@ class OrchestratorAgent(BaseAgent):
                                 "Credit": amount,
                                 "Description": f"Receipt {receipt_id} — Bank Statement ({txn_type})",
                                 "Transaction_Type": txn_type,
+                                "Transaction_ID": pentry.get("txn_id") or "",
                             }))
 
                             # ── Auto-split check ──
@@ -1955,6 +1961,7 @@ class OrchestratorAgent(BaseAgent):
                                         "Credit": split_amt,
                                         "Description": f"Split Receipt {srid} (from {receipt_id})",
                                         "Transaction_Type": "SPLIT",
+                                        "Transaction_ID": f"SPLIT-{receipt_id}",
                                     }))
 
                             # Record known identifiers for future matching
