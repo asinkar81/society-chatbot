@@ -2307,6 +2307,395 @@ class OrchestratorAgent(BaseAgent):
                            "Returns dict with matched, unmatched, duplicates. "
                            "Wrapper around the existing entry processing logic.")
 
+        # ── New Accounts-based tools ──────────────────────────────────
+
+        from tools.pdf_parser import parse_entries_to_accounts as _do_parse
+
+        def parse_statement_to_accounts(input_str: str = None):
+            """Parse bank statement text into the Accounts sheet.
+            Each entry is recorded as-is with Withdrawal, Deposit, Balance columns
+            determined by the format profile. Balance is validated per-row.
+            Input: JSON with key=statement (raw entries text), key=filename (optional).
+            Returns validation summary: entries count, per-file balance check, gaps."""
+            raw = input_str or ""
+            if not raw:
+                return "Please provide the bank statement text."
+            if raw.strip().startswith("{"):
+                try:
+                    parsed = json.loads(raw)
+                    raw = parsed.get("statement", "")
+                    filename = parsed.get("filename", "pasted_text")
+                except (json.JSONDecodeError, TypeError):
+                    filename = "pasted_text"
+            else:
+                filename = "pasted_text"
+            if not raw:
+                return "Please provide the bank statement text."
+
+            lines = [l.rstrip("\r").strip() for l in raw.strip().split("\n") if l.strip()]
+            from tools.pdf_parser import detect_format, clean_entries
+            fmt = detect_format(lines)
+            cleaned = clean_entries(lines)
+            if not cleaned:
+                return "Could not parse any entries. Expected DATE in DD-MM-YYYY format."
+
+            result = _do_parse(cleaned, fmt)
+            entries = result["entries"]
+            if not entries:
+                return "Could not extract any entries with valid amounts."
+
+            for e in entries:
+                e["Source_File"] = filename
+
+            dup_check = self.data_provider.get_accounts_entries()
+            existing_keys = set()
+            for d in dup_check:
+                key = (
+                    str(d.get("Date", "")),
+                    str(d.get("Transaction_Type", "") or ""),
+                    str(d.get("Transaction_ID", "") or ""),
+                    round(float(d.get("Deposit") or d.get("Withdrawal") or 0), 2),
+                    "W" if d.get("Withdrawal") else "D",
+                )
+                existing_keys.add(key)
+
+            added = 0
+            dup_flagged = 0
+            for e in entries:
+                key = (
+                    str(e["Date"]),
+                    str(e["Transaction_Type"] or ""),
+                    str(e["Transaction_ID"] or ""),
+                    round(float(e["Deposit"] or e["Withdrawal"] or 0), 2),
+                    "W" if e["Withdrawal"] else "D",
+                )
+                if key in existing_keys:
+                    e["Status"] = "Potential Duplicate"
+                    dup_flagged += 1
+                existing_keys.add(key)
+                added += 1
+
+            self.data_provider.add_accounts_entries(entries)
+            summary = self.data_provider.get_accounts_summary()
+
+            lines_out = []
+            lines_out.append(f"Parsed {fmt} → {result['entry_count']} entries found, {added} added to Accounts sheet.")
+            if dup_flagged:
+                lines_out.append(f"⚠️ {dup_flagged} entries flagged as Potential Duplicates (review in Accounts tab).")
+            lines_out.append("")
+            for stmt in summary.get("statements", []):
+                if stmt["source_file"] == filename:
+                    lines_out.append(f"  File: {filename}")
+                    lines_out.append(f"    Period:     {stmt['first_date']} → {stmt['last_date']}")
+                    lines_out.append(f"    Entries:    {stmt['entries']}")
+                    lines_out.append(f"    Deposits:   ₹{stmt['total_deposits']:,.2f}")
+                    lines_out.append(f"    Withdrawals: ₹{stmt['total_withdrawals']:,.2f}")
+                    lines_out.append(f"    Opening:    ₹{stmt['opening_balance']:,.2f}")
+                    lines_out.append(f"    Closing:    ₹{stmt['closing_balance']:,.2f}")
+                    if stmt["mismatches"]:
+                        lines_out.append(f"    ❌ Balance mismatches: {stmt['mismatches']} rows (fix before Ledger creation)")
+                    else:
+                        lines_out.append(f"    ✓ Balance validated — all rows match")
+            gaps = summary.get("gaps", [])
+            if gaps:
+                lines_out.append("")
+                lines_out.append("⚠️ Gap report (informational):")
+                for g in gaps:
+                    lines_out.append(f"  • {g['from_file']} closing ₹{g['from_closing']:,.2f} → "
+                                     f"{g['to_file']} opening ₹{g['to_opening']:,.2f} "
+                                     f"(diff: ₹{g['difference']:,.2f})")
+
+            return "\n".join(lines_out)
+
+        self.register_tool(parse_statement_to_accounts, "parse_statement_to_accounts",
+                           "Parse bank statement text into the Accounts sheet. "
+                           "Records all entries as-is with Withdrawal, Deposit, Balance columns. "
+                           "Validates balance per-row and reports mismatches. "
+                           "Flags potential duplicates. "
+                           "Input JSON: statement (raw text), filename (optional). "
+                           "Returns validation summary.")
+
+        def create_ledger_from_accounts(input_str: str = None):
+            """Create Ledger entries from Pending deposits in the Accounts sheet.
+            Matches each deposit to a member using Payment Reference Store lookup,
+            fuzzy name/token/phone/email matching, and WhatsApp_No matching.
+            Applies Split Rules for matched members.
+            Input JSON: fy (optional, e.g. '2026-27' — defaults to current FY),
+                        generate_receipts (bool, default false).
+            Returns summary of matched and unmatched entries."""
+            data = _parse_action_input(input_str or "{}")
+            fy = data.get("fy", "") or config.CURRENT_FY
+            generate_receipts = str(data.get("generate_receipts", "false")).lower() in ("true", "1", "yes")
+            fy_start, fy_end = fy[:4], "20" + fy[5:7]
+            from_date = f"01-04-{fy_start}"
+            to_date = f"31-03-{fy_end}"
+
+            all_entries = self.data_provider.get_accounts_entries(status="Pending")
+            if not all_entries:
+                return "No Pending entries in Accounts sheet."
+
+            fy_filtered = []
+            for e in all_entries:
+                ed = str(e.get("Date", "") or "")
+                if ed >= from_date and ed <= to_date:
+                    fy_filtered.append(e)
+
+            if not fy_filtered:
+                return f"No Pending entries within FY {fy} ({from_date} to {to_date})."
+
+            deposit_entries = [e for e in fy_filtered if e.get("Deposit") and float(e["Deposit"]) > 0]
+            if not deposit_entries:
+                return f"No deposit entries found in FY {fy}."
+
+            members = self.data_provider.get_all_members()
+            matched_results = []
+            unmatched_entries = []
+            pending_ledger = []
+
+            from tools.pdf_parser import _ngram_match, _extract_search_tokens
+
+            for acct_entry in deposit_entries:
+                date = str(acct_entry.get("Date", "") or "")
+                amount = float(acct_entry["Deposit"])
+                particulars = str(acct_entry.get("Particulars", "") or "")
+                txn_type = str(acct_entry.get("Transaction_Type", "") or "")
+                txn_id = str(acct_entry.get("Transaction_ID", "") or "")
+                entry_id = int(acct_entry.get("Entry_ID", 0))
+
+                search_tokens = _extract_search_tokens(particulars, txn_type)
+
+                # Phase 3a: Reference store match
+                ref_match = None
+                ref_reason = ""
+                for token in search_tokens:
+                    candidate = self.data_provider.find_member_by_identifier(token)
+                    if candidate:
+                        ref_match = candidate
+                        ref_reason = f"known identifier '{token}'"
+                        break
+
+                if ref_match:
+                    best_match = ref_match
+                    best_reason = ref_reason
+                    best_score = 100
+                else:
+                    best_match = None
+                    best_reason = ""
+                    best_score = 0
+
+                # Phase 3b: Fuzzy matching
+                if best_score < 100:
+                    for member in members:
+                        name = str(member.get("Plot_Owner_Name") or "").upper()
+                        email = str(member.get("Email") or "").upper()
+                        phone_raw = member.get("Phone")
+                        phone = ""
+                        if phone_raw is not None:
+                            try:
+                                phone = str(int(float(str(phone_raw))))
+                            except (ValueError, TypeError, OverflowError):
+                                s = str(phone_raw).strip()
+                                if s.lower() not in ("", "nan", "inf", "-inf", "infinity", "-infinity", "none"):
+                                    phone = s
+                        wa_raw = member.get("WhatsApp_No")
+                        wa_phone = ""
+                        if wa_raw is not None:
+                            try:
+                                wa_phone = str(int(float(str(wa_raw))))
+                            except (ValueError, TypeError, OverflowError):
+                                s = str(wa_raw).strip()
+                                if s.lower() not in ("", "nan", "inf", "-inf", "infinity", "-infinity", "none"):
+                                    wa_phone = s
+
+                        name_tokens = set(re.split(r'[\s.]+', name))
+
+                        score = 0
+                        reason_parts = []
+
+                        name_parts_list = re.split(r'[\s.]+', name)
+                        surname = name_parts_list[-1] if name_parts_list else ""
+                        if surname and surname in search_tokens:
+                            score += 10
+                            reason_parts.append("surname")
+                        elif surname:
+                            for token in search_tokens:
+                                if len(token) > 2 and len(surname) > 2 and _ngram_match(token, surname):
+                                    score += 7
+                                    reason_parts.append(f"surname_fuzzy:{token}")
+                                    break
+
+                        common = search_tokens & name_tokens
+                        if common:
+                            score += 5 * len(common)
+                            reason_parts.append(f"name:{','.join(common)}")
+                        fuzzy_common = set()
+                        for t in search_tokens:
+                            if len(t) <= 2:
+                                continue
+                            for nt in name_tokens:
+                                if len(nt) > 2 and t != nt and _ngram_match(t, nt):
+                                    fuzzy_common.add(t)
+                                    break
+                        deduped = fuzzy_common - common
+                        if deduped:
+                            score += 3 * len(deduped)
+                            reason_parts.append(f"name_fuzzy:{','.join(deduped)}")
+
+                        if email and "@" in email:
+                            email_local = email.split("@")[0]
+                            email_parts = set(re.split(r'[.\s]+', email_local))
+                            common_email = search_tokens & email_parts
+                            if common_email:
+                                score += 3 * len(common_email)
+                                reason_parts.append(f"email:{','.join(common_email)}")
+
+                        if phone and phone in search_tokens:
+                            score += 8
+                            reason_parts.append("phone")
+
+                        if wa_phone and wa_phone in search_tokens:
+                            score += 8
+                            reason_parts.append("whatsapp")
+
+                        if score > best_score:
+                            best_score = score
+                            best_match = member
+                            best_reason = ", ".join(reason_parts)
+
+                if best_match and best_score >= 5 and amount:
+                    mid = best_match["ID"]
+                    ledger = self.data_provider.get_member_ledger(mid)
+
+                    fy = get_fy_from_date(date)
+                    vch_no = self.data_provider.get_next_voucher_number()
+                    receipt_id = f"{fy}-{str(vch_no).zfill(3)}"
+
+                    self.data_provider.update_accounts_entry(entry_id, {"Status": "Matched"})
+
+                    pending_ledger.append((mid, {
+                        "Date": date,
+                        "Particulars": f"By {particulars[:60]}",
+                        "Vch_Type": "Journal",
+                        "Vch_No": vch_no,
+                        "Debit": None,
+                        "Credit": amount,
+                        "Description": f"Receipt {receipt_id} — Bank Statement ({txn_type})",
+                        "Transaction_Type": txn_type,
+                        "Transaction_ID": txn_id,
+                    }))
+
+                    if generate_receipts:
+                        from tools.pdf_generator import create_simple_receipt_pdf
+                        receipt_dir = config.RECEIPTS_DIR / fy
+                        receipt_dir.mkdir(parents=True, exist_ok=True)
+                        plot_str = str(best_match.get("Plot_No", "") or "")
+                        plot_part = f"Plot_No_{plot_str.zfill(2)}" if plot_str else "Unknown"
+                        rpath = receipt_dir / f"Receipt_{plot_part}_{receipt_id}.pdf"
+                        receipt_data = {
+                            "receipt_id": receipt_id,
+                            "date": date,
+                            "member_name": best_match.get("Plot_Owner_Name", ""),
+                            "plot_no": plot_str,
+                            "amount": amount,
+                            "transaction_id": txn_id or "N/A",
+                            "transaction_type": txn_type,
+                            "outstanding_balance": 0,
+                            "payment_details": particulars[:120],
+                        }
+                        create_simple_receipt_pdf(rpath, receipt_data)
+
+                    # Split Rules
+                    split_group = self.data_provider.get_split_group_for_member(mid)
+                    if split_group:
+                        split_amt = round(amount / len(split_group), 2)
+                        for smid in split_group:
+                            if smid == mid:
+                                continue
+                            svch = self.data_provider.get_next_voucher_number()
+                            sfy = get_fy_from_date(date)
+                            srid = f"{sfy}-{str(svch).zfill(3)}"
+                            pending_ledger.append((smid, {
+                                "Date": date,
+                                "Particulars": f"By Split from {best_match.get('Plot_Owner_Name', '')} ({particulars[:40]})",
+                                "Vch_Type": "Journal",
+                                "Vch_No": svch,
+                                "Debit": None,
+                                "Credit": split_amt,
+                                "Description": f"Split Receipt {srid} (from {receipt_id})",
+                                "Transaction_Type": "SPLIT",
+                                "Transaction_ID": f"SPLIT-{receipt_id}",
+                            }))
+                            if generate_receipts:
+                                sdir = config.RECEIPTS_DIR / sfy
+                                sdir.mkdir(parents=True, exist_ok=True)
+                                spath = sdir / f"Receipt_Plot_No_{str(smid).zfill(2)}_{srid}.pdf"
+                                sdata = {
+                                    "receipt_id": srid,
+                                    "date": date,
+                                    "member_name": "Split Receipt",
+                                    "plot_no": "",
+                                    "amount": split_amt,
+                                    "transaction_id": f"SPLIT-{receipt_id}",
+                                    "transaction_type": "SPLIT",
+                                    "outstanding_balance": 0,
+                                    "payment_details": f"Split from {receipt_id} — {particulars[:60]}",
+                                }
+                                create_simple_receipt_pdf(spath, sdata)
+
+                    # Record identifiers
+                    TITLE_WORDS = {"MR", "MRS", "MS", "SHRI", "SMT", "DR", "SRI",
+                                   "M/S", "CMN", "PAY", "AND", "THE", "FROM", "B"}
+                    for token in search_tokens:
+                        if "@" in str(token):
+                            self.data_provider.record_payment_reference(mid, "UPI_ID", token, date)
+                        elif token.isdigit() and len(token) == 10:
+                            self.data_provider.record_payment_reference(mid, "MOBILE", token, date)
+                        elif len(token) > 3 and not token.isdigit() and token not in TITLE_WORDS:
+                            self.data_provider.record_payment_reference(mid, "PAYEE_NAME", token, date)
+
+                    matched_results.append({
+                        "date": date,
+                        "amount": amount,
+                        "member_name": best_match.get("Plot_Owner_Name", ""),
+                        "plot_no": best_match.get("Plot_No", ""),
+                        "member_id": mid,
+                        "receipt_id": receipt_id,
+                        "reason": best_reason,
+                        "has_pdf": generate_receipts,
+                    })
+                else:
+                    self.data_provider.update_accounts_entry(entry_id, {"Status": "Unmatched"})
+                    unmatched_entries.append({
+                        "date": date,
+                        "amount": amount,
+                        "particulars": particulars[:80],
+                        "txn_type": txn_type,
+                        "txn_id": txn_id,
+                        "entry_id": entry_id,
+                    })
+
+            if pending_ledger:
+                self.data_provider.add_ledger_entries(pending_ledger)
+
+            lines = [f"Ledger creation for FY {fy} completed:"]
+            lines.append(f"  ✓ Matched: {len(matched_results)} entries")
+            if matched_results:
+                for r in matched_results:
+                    lines.append(f"    • ₹{r['amount']:>8,.2f} → {r['member_name']} (Plot {r['plot_no']}) "
+                                 f"— {r['reason']}")
+            lines.append(f"  ? Unmatched: {len(unmatched_entries)} entries")
+            if unmatched_entries:
+                for u in unmatched_entries:
+                    lines.append(f"    • {u['date']} | ₹{u['amount']:>8,.2f} | {u['particulars']}")
+            return "\n".join(lines)
+
+        self.register_tool(create_ledger_from_accounts, "create_ledger_from_accounts",
+                           "Create Ledger entries from Pending deposits in the Accounts sheet. "
+                           "Matches deposits to members using known identifiers, fuzzy name/phone/email matching. "
+                           "Applies Split Rules for matched members. "
+                           "Input JSON: fy (optional), generate_receipts (bool, default false). "
+                           "Returns summary of matched and unmatched entries.")
+
         # ── Register all tools ────────────────────────────────────────
 
         self.register_tool(get_member_details, "get_member_details",

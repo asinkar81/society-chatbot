@@ -2,7 +2,7 @@
 Abstract base class for data persistence providers
 """
 from abc import ABC, abstractmethod
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 
 
@@ -220,4 +220,44 @@ class DataProvider(ABC):
     def add_identifier(self, member_id: int, id_type: str, id_value: str,
                        date: str = None, confidence: int = 1) -> int:
         """Add a new identifier manually."""
+        pass
+
+    # ── Accounts Sheet ─────────────────────────────────────────────────
+
+    @abstractmethod
+    def add_accounts_entries(self, entries: List[Dict[str, Any]]) -> int:
+        """Add bank statement entries to the Accounts sheet. Returns count added."""
+        pass
+
+    @abstractmethod
+    def get_accounts_entries(
+        self, source_file: Optional[str] = None, status: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Fetch Accounts entries, optionally filtered by source file and/or status."""
+        pass
+
+    @abstractmethod
+    def update_accounts_entry(self, entry_id: int, updates: Dict[str, Any]) -> bool:
+        """Update a single Accounts entry by Entry_ID."""
+        pass
+
+    @abstractmethod
+    def delete_accounts_entries(self, entry_ids: List[int]) -> int:
+        """Delete Accounts entries by Entry_ID list. Returns count deleted."""
+        pass
+
+    @abstractmethod
+    def get_accounts_summary(self) -> Dict[str, Any]:
+        """Return per-statement balance validation summary and gap report."""
+        pass
+
+    @abstractmethod
+    def clear_accounts(self) -> int:
+        """Delete all Accounts entries. Returns count deleted."""
+        pass
+
+    @abstractmethod
+    def migrate_accounts_from_ledger(self) -> int:
+        """One-time: reconstruct Accounts sheet from existing Ledger + Expenses + Suspense data.
+        Returns count of entries created."""
         pass

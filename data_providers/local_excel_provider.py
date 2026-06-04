@@ -53,6 +53,13 @@ class LocalExcelDataProvider(DataProvider):
         "ID", "Source_Member_ID", "Members",
     ]
 
+    ACCOUNTS_HEADERS = [
+        "Entry_ID", "Date", "Particulars", "Withdrawal", "Deposit",
+        "Balance", "Calculated_Balance", "Balance_Check",
+        "Transaction_Type", "Transaction_ID", "Status",
+        "Source_File", "Statement_Seq",
+    ]
+
     def __init__(self, excel_file: Path = None):
         self.excel_file = excel_file or config.SOCIETY_DATA_FILE
         self.members_sheet = "Members"
@@ -63,12 +70,14 @@ class LocalExcelDataProvider(DataProvider):
         self.expenses_sheet = "Expenses"
         self.expense_categories_sheet = "Expense_Categories"
         self.split_rules_sheet = "Split_Rules"
+        self.accounts_sheet = "Accounts"
         self._ensure_workbook_exists()
         self._ensure_payment_refs_sheet_exists()
         self._ensure_suspense_sheet_exists()
         self._ensure_sheet(self.expenses_sheet, self.EXPENSES_HEADERS)
         self._ensure_sheet(self.expense_categories_sheet, self.EXPENSE_CATEGORIES_HEADERS)
         self._ensure_sheet(self.split_rules_sheet, self.SPLIT_RULES_HEADERS)
+        self._ensure_sheet(self.accounts_sheet, self.ACCOUNTS_HEADERS)
         self._seed_default_categories()
         self._migrate_members_schema()
         self._migrate_expenses_schema()
@@ -906,6 +915,200 @@ class LocalExcelDataProvider(DataProvider):
             if part_clean and e_part_clean and (part_clean in e_part_clean or e_part_clean in part_clean):
                 return e.to_dict()
         return None
+
+    # ── Accounts Sheet ─────────────────────────────────────────────────
+
+    def add_accounts_entries(self, entries: List[Dict[str, Any]]) -> int:
+        self._ensure_sheet(self.accounts_sheet, self.ACCOUNTS_HEADERS)
+        df = pd.read_excel(self.excel_file, sheet_name=self.accounts_sheet)
+        max_id = int(df["Entry_ID"].max()) + 1 if not df.empty and "Entry_ID" in df.columns else 1
+        new_rows = []
+        for i, entry in enumerate(entries):
+            entry["Entry_ID"] = max_id + i
+            entry.setdefault("Calculated_Balance", None)
+            entry.setdefault("Balance_Check", "")
+            entry.setdefault("Status", "Pending")
+            new_rows.append({h: entry.get(h) for h in self.ACCOUNTS_HEADERS})
+        new_df = pd.DataFrame(new_rows)
+        if df.empty:
+            df = new_df
+        else:
+            df = pd.concat([df, new_df], ignore_index=True)
+        self._write_sheet(df, self.accounts_sheet)
+        return len(entries)
+
+    def get_accounts_entries(
+        self, source_file: Optional[str] = None, status: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        self._ensure_sheet(self.accounts_sheet, self.ACCOUNTS_HEADERS)
+        try:
+            df = pd.read_excel(self.excel_file, sheet_name=self.accounts_sheet)
+        except Exception:
+            return []
+        if df.empty:
+            return []
+        if source_file:
+            df = df[df["Source_File"] == source_file]
+        if status:
+            df = df[df["Status"] == status]
+        return df.to_dict("records")
+
+    def update_accounts_entry(self, entry_id: int, updates: Dict[str, Any]) -> bool:
+        self._ensure_sheet(self.accounts_sheet, self.ACCOUNTS_HEADERS)
+        df = pd.read_excel(self.excel_file, sheet_name=self.accounts_sheet)
+        if df.empty or "Entry_ID" not in df.columns:
+            return False
+        idx = df[df["Entry_ID"] == entry_id].index
+        if idx.empty:
+            return False
+        for key, value in updates.items():
+            if key in df.columns:
+                df.loc[idx, key] = value
+        self._write_sheet(df, self.accounts_sheet)
+        return True
+
+    def delete_accounts_entries(self, entry_ids: List[int]) -> int:
+        self._ensure_sheet(self.accounts_sheet, self.ACCOUNTS_HEADERS)
+        df = pd.read_excel(self.excel_file, sheet_name=self.accounts_sheet)
+        if df.empty or "Entry_ID" not in df.columns:
+            return 0
+        before = len(df)
+        df = df[~df["Entry_ID"].isin(entry_ids)]
+        deleted = before - len(df)
+        if deleted:
+            self._write_sheet(df.reset_index(drop=True), self.accounts_sheet)
+        return deleted
+
+    def get_accounts_summary(self) -> Dict[str, Any]:
+        self._ensure_sheet(self.accounts_sheet, self.ACCOUNTS_HEADERS)
+        try:
+            df = pd.read_excel(self.excel_file, sheet_name=self.accounts_sheet)
+        except Exception:
+            return {"statements": [], "gaps": [], "total_entries": 0}
+        if df.empty:
+            return {"statements": [], "gaps": [], "total_entries": 0}
+        result = {
+            "total_entries": len(df),
+            "by_status": df["Status"].value_counts().to_dict() if "Status" in df.columns else {},
+            "balance_ok": int((df["Balance_Check"].astype(str).str.contains("✓")).sum()) if "Balance_Check" in df.columns else 0,
+            "balance_mismatch": int((df["Balance_Check"].astype(str).str.contains("✗")).sum()) if "Balance_Check" in df.columns else 0,
+            "statements": [],
+            "gaps": [],
+        }
+        if "Source_File" not in df.columns:
+            return result
+        file_dates = {}
+        for sf in df["Source_File"].dropna().unique():
+            sdf = df[df["Source_File"] == sf].sort_values("Statement_Seq")
+            if sdf.empty:
+                continue
+            first_date = str(sdf.iloc[0].get("Date", ""))
+            last_date = str(sdf.iloc[-1].get("Date", ""))
+            opening = sdf.iloc[0].get("Balance")
+            closing = sdf.iloc[-1].get("Balance")
+            total_deposits = float(sdf["Deposit"].fillna(0).sum())
+            total_withdrawals = float(sdf["Withdrawal"].fillna(0).sum())
+            mismatches = int((sdf["Balance_Check"].astype(str).str.contains("✗")).sum())
+            result["statements"].append({
+                "source_file": sf,
+                "first_date": first_date,
+                "last_date": last_date,
+                "entries": len(sdf),
+                "opening_balance": float(opening) if opening else 0,
+                "closing_balance": float(closing) if closing else 0,
+                "total_deposits": total_deposits,
+                "total_withdrawals": total_withdrawals,
+                "mismatches": mismatches,
+            })
+            file_dates[sf] = first_date
+        sorted_files = sorted(file_dates.keys(), key=lambda f: file_dates[f])
+        for i in range(len(sorted_files) - 1):
+            curr = sorted_files[i]
+            next_f = sorted_files[i + 1]
+            curr_df = df[df["Source_File"] == curr].sort_values("Statement_Seq")
+            next_df = df[df["Source_File"] == next_f].sort_values("Statement_Seq")
+            if curr_df.empty or next_df.empty:
+                continue
+            curr_closing = float(curr_df.iloc[-1].get("Balance", 0) or 0)
+            next_opening = float(next_df.iloc[0].get("Balance", 0) or 0)
+            if abs(curr_closing - next_opening) > 0.01:
+                result["gaps"].append({
+                    "from_file": curr,
+                    "to_file": next_f,
+                    "from_closing": curr_closing,
+                    "to_opening": next_opening,
+                    "difference": round(curr_closing - next_opening, 2),
+                })
+        return result
+
+    def clear_accounts(self) -> int:
+        df = pd.read_excel(self.excel_file, sheet_name=self.accounts_sheet)
+        count = len(df)
+        if count:
+            self._write_sheet(df.iloc[:0], self.accounts_sheet)
+        return count
+
+    def migrate_accounts_from_ledger(self) -> int:
+        if not self.accounts_sheet:
+            return 0
+        existing = self.get_accounts_entries()
+        if existing:
+            return 0
+        entries = []
+        ledger_all = self.get_member_ledger_all()
+        seq = 0
+        for e in ledger_all:
+            date = str(e.get("Date", "") or "")
+            credit = float(e.get("Credit", 0) or 0)
+            debit = float(e.get("Debit", 0) or 0)
+            if credit <= 0 and debit <= 0:
+                continue
+            seq += 1
+            entries.append({
+                "Date": date,
+                "Particulars": str(e.get("Particulars", "") or ""),
+                "Withdrawal": debit if debit > 0 else None,
+                "Deposit": credit if credit > 0 else None,
+                "Balance": None,
+                "Transaction_Type": str(e.get("Transaction_Type", "") or ""),
+                "Transaction_ID": str(e.get("Transaction_ID", "") or ""),
+                "Status": "Matched",
+                "Source_File": "Legacy",
+                "Statement_Seq": seq,
+            })
+        suspense = self.get_suspense_entries()
+        for s in suspense:
+            seq += 1
+            entries.append({
+                "Date": str(s.get("Date", "") or ""),
+                "Particulars": str(s.get("Particulars", "") or ""),
+                "Withdrawal": None,
+                "Deposit": float(s.get("Amount", 0) or 0),
+                "Balance": None,
+                "Transaction_Type": str(s.get("Transaction_Type", "") or ""),
+                "Transaction_ID": str(s.get("Transaction_ID", "") or ""),
+                "Status": "Unmatched",
+                "Source_File": "Legacy",
+                "Statement_Seq": seq,
+            })
+        expenses = self.get_expenses()
+        for exp in expenses:
+            seq += 1
+            entries.append({
+                "Date": str(exp.get("Date", "") or ""),
+                "Particulars": str(exp.get("Particulars", "") or ""),
+                "Withdrawal": float(exp.get("Amount", 0) or 0),
+                "Deposit": None,
+                "Balance": None,
+                "Transaction_Type": str(exp.get("Transaction_Type", "") or ""),
+                "Transaction_ID": str(exp.get("Transaction_ID", "") or ""),
+                "Status": "Expensed",
+                "Source_File": "Legacy",
+                "Statement_Seq": seq,
+            })
+        if entries:
+            self.add_accounts_entries(entries)
+        return len(entries)
 
     # ── I/O ────────────────────────────────────────────────────────────────
 
