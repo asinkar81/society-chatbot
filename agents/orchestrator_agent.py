@@ -7,15 +7,16 @@ import re
 import csv
 from pathlib import Path
 from datetime import datetime, timedelta
+from typing import Optional
 from agents.base_agent import BaseAgent
 from data_providers.base_provider import DataProvider
 from file_storage.base_storage import FileStorage
 from tools.ocr_processor import OCRProcessor
-from tools.pdf_generator import create_simple_receipt_pdf, create_simple_invoice_pdf
+from tools.pdf_generator import create_simple_receipt_pdf, create_simple_invoice_pdf, create_consolidated_receipt_pdf
 from utils.converters import (
     get_current_date, get_fy_string, get_fy_from_date, get_due_date, get_bill_period,
     compute_outstanding_as_of, get_payment_history, get_previous_invoices,
-    number_to_words_inr,
+    number_to_words_inr, clean_payment_details,
 )
 import config
 
@@ -76,6 +77,22 @@ def _check_duplicate_payment(ledger: list, transaction_id: str, date: str, amoun
     return None
 
 
+def _check_duplicate_expense(expenses: list, date: str, amount: float, particulars: str) -> dict:
+    """Check if an expense with same date + amount + particulars prefix already exists.
+    Returns the matching entry dict if found, or None if no duplicate."""
+    part_clean = str(particulars or "").strip().upper()[:40]
+    if not part_clean:
+        return None
+    for e in expenses:
+        e_date = str(e.get("Date", "") or "").strip()
+        e_amount = _safe_float(e.get("Amount"))
+        if e_date == str(date).strip() and abs(e_amount - amount) < 0.01:
+            e_part = str(e.get("Particulars", "") or "").strip().upper()[:40]
+            if part_clean in e_part or e_part in part_clean:
+                return e
+    return None
+
+
 def _safe_float(val) -> float:
     if val is None:
         return 0.0
@@ -86,23 +103,65 @@ def _safe_float(val) -> float:
         return 0.0
 
 
+def _extract_ref_id(desc: str) -> Optional[str]:
+    """Extract a reference/receipt ID from a description string like RCPT-2025-001."""
+    if not desc or not isinstance(desc, str):
+        return None
+    m = re.search(r'(?:RCPT|RC|RECEIPT)[-\s]*(\d{4}-\d+|\d+)', desc, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    m = re.search(r'(\d{4}-\d{3,})', desc)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _delete_pdf_files(ref_id: Optional[str]) -> None:
+    """Delete all PDF files matching a given ref_id in the receipts directory."""
+    if not ref_id:
+        return
+    for fy_dir in config.RECEIPTS_DIR.iterdir():
+        if fy_dir.is_dir():
+            for pdf in fy_dir.glob(f"*{ref_id}*.pdf"):
+                try:
+                    pdf.unlink()
+                except OSError:
+                    pass
+
+
+def _fy_date_range(fy: str) -> tuple[str, str]:
+    """Convert FY string like '2025-26' to (from_date, to_date)."""
+    import re
+    m = re.match(r'(\d{4})-(\d{2})', fy)
+    if not m:
+        return ("", "")
+    start = int(m.group(1))
+    return (f"01-04-{start}", f"31-03-{start + 1}")
+
+
 ORCHESTRATOR_SYSTEM_PROMPT = """You are the Society Management Orchestrator Agent. You handle ALL society tasks (member lookup, payments, receipts, ledgers, invoices, bank statement processing, admin).
 
 IMPORTANT RULES:
-1. Your tools automatically update the ledger — there is NO separate "update_ledger" tool.
-2. ALWAYS call get_member_details FIRST to resolve a plot number or name to a member_id.
-3. For invoices, ALWAYS ask the user for from_date and to_date if not provided. Calculate months from the date range.
-4. For bank statements: ALWAYS use the process_bank_statement tool. NEVER try to parse the statement yourself.
-   Just call process_bank_statement with the raw text as the user pasted it — the tool handles all parsing internally.
-   Do NOT ask the user to reformat their bank statement. The tool accepts multi-line entries, NEFT details,
-   UPI references, and any format with date lines. Just paste the raw text into the tool.
-5. When the user says "force" or "ignore duplicate" for a payment, pass force=true to generate_receipt.
+1. ALWAYS call get_member_details FIRST to resolve a plot number or name to a member_id.
+2. For invoices, ALWAYS ask the user for from_date and to_date if not provided. Calculate months from the date range.
+3. For bank statements: ALWAYS use the process_bank_statement_pdf tool.
+   The PDF has already been uploaded, parsed, and its entries cleaned by the UI.
+   Your job is to match the cleaned entries to members and generate receipts.
+   Do NOT ask the user to paste text or upload — the entries are passed to you directly.
+4. When the user says "force" or "ignore duplicate" for a payment, pass force=true to generate_receipt.
+5. To modify an existing ledger entry (change amount, particulars, etc.), use update_ledger_entry.
+   To delete ANY ledger entry (receipt, invoice, or demand), use delete_ledger_entry.
+6. For splitting an entry across two members who share ownership:
+   a) Use get_member_ledger to view entries with their Vch_No and Transaction_ID.
+   b) Match entries by Transaction_ID to identify existing splits.
+   c) For non-split entries: use update_ledger_entry to reduce the original credit/debit, then call generate_receipt or add_demand_entry to create the matching entry for the other member.
+   d) Outstanding balances are auto-updated at each step — no manual recalculation needed.
 
 MEMBER MATCHING:
-- The process_bank_statement tool handles member matching internally (surname, name tokens, email, phone, known identifiers).
+- The process_bank_statement_pdf tool handles member matching internally (surname, name tokens, email, phone, known identifiers).
 - The system maintains a Payment Reference Store that learns known UPI IDs, mobile numbers, emails,
   and payee names from each processed payment. This makes future matches more accurate.
-- When the process_bank_statement tool returns unmatched entries, ask the user to specify the plot number
+- When the process_bank_statement_pdf tool returns unmatched entries, ask the user to specify the plot number
   for each, then call generate_receipt with member_id, amount, date, and transaction_id.
 """
 
@@ -267,10 +326,18 @@ class OrchestratorAgent(BaseAgent):
                         "Transaction_ID": txn_id or None,
                         "Transaction_Type": txn_type,
                     })
-                    o = self.data_provider.get_current_outstanding(member_id)
-                    self.data_provider.update_member(member_id, {"Current_Outstanding": o})
-
                     # Record identifiers for future matching
+                    txn_id_tokens = re.split(r'[\s/]+', str(txn_id or ""))
+                    TITLE_WORDS = {"MR", "MRS", "MS", "SHRI", "SMT", "DR", "SRI",
+                                   "M/S", "CMN", "PAY", "AND", "THE", "FROM", "B"}
+                    for token in txn_id_tokens:
+                        t = token.strip()
+                        if "@" in t:
+                            self.data_provider.record_payment_reference(member_id, "UPI_ID", t, date)
+                        elif t.isdigit() and len(t) == 10:
+                            self.data_provider.record_payment_reference(member_id, "MOBILE", t, date)
+                        elif len(t) > 3 and not t.isdigit() and t not in TITLE_WORDS:
+                            self.data_provider.record_payment_reference(member_id, "PAYEE_NAME", t, date)
 
                 except Exception as e:
                     results.append(f"  ✗ {img_path.name}: Error — {str(e)}")
@@ -284,13 +351,14 @@ class OrchestratorAgent(BaseAgent):
             return summary
 
         def generate_receipt(input_str: str = None):
-            """Generate a receipt PDF and update the ledger. Input JSON keys: member_id (or plot_no), amount, date, transaction_id (optional), transaction_type (optional — NEFT/UPI/CHQ/IMPS/CASH), force (optional bool to bypass duplicate check). Example: {"member_id": 2, "amount": 3000, "date": "05-05-2026", "transaction_id": "UPI123", "transaction_type": "UPI"}"""
+            """Generate a receipt PDF and update the ledger. Input JSON keys: member_id (or plot_no), amount, date, transaction_id (optional), transaction_type (optional — NEFT/UPI/CHQ/IMPS/CASH), payment_details (optional — text for identifier recording), force (optional bool to bypass duplicate check). Example: {"member_id": 2, "amount": 3000, "date": "05-05-2026", "transaction_id": "UPI123", "transaction_type": "UPI"}"""
             data = _parse_action_input(input_str or "")
             member_id = data.get("member_id")
             amount = data.get("amount")
             date = data.get("date")
             transaction_id = data.get("transaction_id")
             transaction_type = data.get("transaction_type") or data.get("txn_type") or ""
+            payment_details = data.get("payment_details") or ""
             force = data.get("force", False)
 
             if not member_id:
@@ -346,6 +414,7 @@ class OrchestratorAgent(BaseAgent):
                 "amount": amount,
                 "transaction_id": transaction_id or "N/A",
                 "transaction_type": transaction_type.upper() if transaction_type else "",
+                "payment_details": clean_payment_details(payment_details)[:120],
                 "outstanding_balance": new_outstanding,
             }
 
@@ -371,9 +440,170 @@ class OrchestratorAgent(BaseAgent):
                 "Transaction_Type": transaction_type.upper() if transaction_type else "",
             }
             self.data_provider.add_ledger_entry(member_id, ledger_entry)
-            self.data_provider.update_member(member_id, {"Current_Outstanding": new_outstanding})
+
+            # Record identifiers from payment_details
+            if payment_details:
+                tokens = set()
+                for t in re.split(r'[\s/]+', str(payment_details)):
+                    t_clean = t.strip().upper()
+                    if len(t_clean) > 1:
+                        tokens.add(t_clean)
+                TITLE_WORDS = {"MR", "MRS", "MS", "SHRI", "SMT", "DR", "SRI",
+                               "M/S", "CMN", "PAY", "AND", "THE", "FROM", "B"}
+                for token in tokens:
+                    if "@" in str(token):
+                        self.data_provider.record_payment_reference(member_id, "UPI_ID", token, date)
+                    elif token.isdigit() and len(token) == 10:
+                        self.data_provider.record_payment_reference(member_id, "MOBILE", token, date)
+                    elif len(token) > 3 and not token.isdigit() and token not in TITLE_WORDS:
+                        self.data_provider.record_payment_reference(member_id, "PAYEE_NAME", token, date)
 
             return f"Receipt {receipt_id} generated for {member.get('Plot_Owner_Name')} (Plot {member.get('Plot_No')}) for ₹{amount:,.2f}. Ledger updated."
+
+        def regenerate_receipt(input_str: str = None):
+            """Regenerate a receipt PDF from an existing ledger entry. Input JSON keys: member_id, vch_no, new_member_id (optional for move). Example: {"member_id": 2, "vch_no": 15}"""
+            data = _parse_action_input(input_str or "")
+            member_id = data.get("member_id")
+            vch_no = data.get("vch_no")
+            new_member_id = data.get("new_member_id")
+
+            if not member_id or not vch_no:
+                return "member_id and vch_no are required"
+
+            try:
+                member_id = int(member_id)
+                vch_no = int(vch_no)
+                if new_member_id:
+                    new_member_id = int(new_member_id)
+            except (ValueError, TypeError):
+                return "member_id and vch_no must be integers"
+
+            ledger = self.data_provider.get_member_ledger(member_id)
+            entry = next((e for e in ledger if int(e.get("Vch_No", 0)) == vch_no), None)
+            if not entry:
+                return f"Entry with Vch_No {vch_no} not found for member {member_id}"
+
+            date = str(entry.get("Date", "") or "")
+            amount = _safe_float(entry.get("Credit")) or _safe_float(entry.get("Debit"))
+            particulars = str(entry.get("Particulars", "") or "")
+            description = str(entry.get("Description", "") or "")
+            txn_id = str(entry.get("Transaction_ID", "") or "")
+            txn_type = str(entry.get("Transaction_Type", "") or "")
+            receipt_id = _extract_ref_id(description)
+            if not receipt_id:
+                receipt_id = f"{get_fy_from_date(date)}-{str(vch_no).zfill(3)}"
+
+            # Handle Move: delete from old member, re-add to new member
+            if new_member_id and new_member_id != member_id:
+                if not self.data_provider.delete_ledger_entry(member_id, vch_no):
+                    return f"Failed to delete entry from member {member_id}"
+                self.data_provider.add_ledger_entry(new_member_id, {
+                    "Date": date,
+                    "Particulars": particulars,
+                    "Vch_Type": "Journal",
+                    "Vch_No": vch_no,
+                    "Debit": _safe_float(entry.get("Debit")) or None,
+                    "Credit": _safe_float(entry.get("Credit")) or None,
+                    "Description": description,
+                    "Transaction_ID": txn_id or None,
+                    "Transaction_Type": txn_type,
+                })
+                target_member = self.data_provider.get_member(new_member_id)
+                member_id = new_member_id
+            else:
+                target_member = self.data_provider.get_member(member_id)
+
+            if not target_member:
+                return "Target member not found"
+
+            fy = get_fy_from_date(date)
+            plot_str = str(target_member.get("Plot_No", "") or "")
+            plot_part = f"Plot_No_{plot_str.zfill(2)}" if plot_str else "Unknown"
+
+            # Delete old PDF
+            _delete_pdf_files(receipt_id)
+
+            # Generate new receipt
+            receipt_dir = config.RECEIPTS_DIR / fy
+            receipt_dir.mkdir(parents=True, exist_ok=True)
+            rpath = receipt_dir / f"Receipt_{plot_part}_{receipt_id}.pdf"
+            outstanding = self.data_provider.get_current_outstanding(member_id)
+            receipt_data = {
+                "receipt_id": receipt_id,
+                "date": date,
+                "member_name": target_member.get("Plot_Owner_Name", ""),
+                "plot_no": plot_str,
+                "amount": amount,
+                "transaction_id": txn_id or "N/A",
+                "transaction_type": txn_type,
+                "payment_details": clean_payment_details(particulars)[:120],
+            }
+            create_simple_receipt_pdf(rpath, receipt_data)
+
+            return f"✅ Receipt {receipt_id} regenerated for {target_member.get('Plot_Owner_Name')} (Plot {plot_str})"
+
+        def generate_consolidated_receipt(input_str: str = None):
+            """Generate a consolidated receipt PDF listing all receipts for a member in a given FY. Input JSON: member_id, fy (optional). Example: {"member_id": 2, "fy": "2025-26"}"""
+            data = _parse_action_input(input_str or "")
+            member_id = data.get("member_id")
+            fy = data.get("fy", "")
+
+            if not member_id:
+                return "member_id is required"
+
+            try:
+                member_id = int(member_id)
+            except (ValueError, TypeError):
+                return "member_id must be an integer"
+
+            member = self.data_provider.get_member(member_id)
+            if not member:
+                return f"Member {member_id} not found"
+
+            ledger = self.data_provider.get_member_ledger(member_id)
+            credit_entries = [e for e in ledger if _safe_float(e.get("Credit")) > 0]
+
+            if fy:
+                from_date, to_date = _fy_date_range(fy)
+                credit_entries = [e for e in credit_entries
+                                  if from_date <= str(e.get("Date", "")) <= to_date]
+
+            if not credit_entries:
+                return "No credit entries found for this member in the given period"
+
+            # Pick best FY from entries
+            if not fy and credit_entries:
+                fy = get_fy_from_date(str(credit_entries[0].get("Date", "")))
+
+            receipts = []
+            for e in credit_entries:
+                ref_id = _extract_ref_id(str(e.get("Description", "")))
+                if not ref_id:
+                    ref_id = _extract_ref_id(str(e.get("Particulars", "")))
+                receipts.append({
+                    "receipt_id": ref_id or f"{fy}-{str(e.get('Vch_No', '')).zfill(3)}",
+                    "date": str(e.get("Date", "")),
+                    "amount": _safe_float(e.get("Credit")),
+                    "transaction_id": str(e.get("Transaction_ID", "") or ""),
+                    "transaction_type": str(e.get("Transaction_Type", "") or ""),
+                })
+
+            # Create the PDF
+            plot_str = str(member.get("Plot_No", "") or "").zfill(2)
+            fy_part = fy or "all"
+            pdf_name = f"Consolidated_Receipt_Plot_{plot_str}_{fy_part}.pdf"
+            pdf_path = config.RECEIPTS_DIR / fy_part / pdf_name
+            pdf_path.parent.mkdir(parents=True, exist_ok=True)
+
+            success = create_consolidated_receipt_pdf(
+                pdf_path, receipts,
+                member_name=member.get("Plot_Owner_Name", ""),
+                plot_no=str(member.get("Plot_No", "") or ""),
+                fy=fy,
+            )
+            if success:
+                return f"✅ Consolidated receipt generated: {pdf_path.name} ({len(receipts)} receipts, total ₹{sum(r['amount'] for r in receipts):,.2f})"
+            return "❌ Failed to generate consolidated receipt"
 
         # ── Ledger tools ──────────────────────────────────────────────
 
@@ -401,18 +631,33 @@ class OrchestratorAgent(BaseAgent):
             if not entries:
                 return f"No ledger entries for {member.get('Plot_Owner_Name')}"
 
-            lines = [f"\n{'='*80}", f"LEDGER — {member.get('Plot_Owner_Name')} (Plot {member.get('Plot_No')})", f"{'='*80}"]
-            lines.append(f"{'Date':<12} {'Particulars':<30} {'Amount':>12}")
-            lines.append(f"{'-'*54}")
+            lines = [f"\n{'='*100}", f"LEDGER — {member.get('Plot_Owner_Name')} (Plot {member.get('Plot_No')})", f"{'='*100}"]
+            lines.append(f"{'Date':<12} {'Vch_No':>6} {'Type':<10} {'Particulars':<28} {'Txn_ID':<22} {'Amount':>13}")
+            lines.append(f"{'-'*93}")
             for e in entries:
-                amt = _safe_float(e.get("Credit")) - _safe_float(e.get("Debit"))
-                label = "Credit" if amt >= 0 else "Debit "
-                lines.append(f"{str(e.get('Date','')):<12} {str(e.get('Particulars',''))[:30]:<30} {abs(amt):>11,.2f} ({label})")
+                vch = str(e.get("Vch_No", "") or "")
+                vtype = (str(e.get("Vch_Type", "") or ""))[:10]
+                part = (str(e.get("Particulars", "") or ""))[:28]
+                txn = (str(e.get("Transaction_ID", "") or ""))[:22]
+                desc = str(e.get("Description", "") or "")
+                credit = _safe_float(e.get("Credit"))
+                debit = _safe_float(e.get("Debit"))
+                if credit > 0:
+                    amt_str = f"{credit:>11,.2f} Cr"
+                elif debit > 0:
+                    amt_str = f"{debit:>11,.2f} Dr"
+                else:
+                    amt_str = f"{0:>11,.2f}"
+                line = f"{str(e.get('Date','')):<12} {vch:>6} {vtype:<10} {part:<28} {txn:<22} {amt_str}"
+                # Append first 30 chars of Description in parens if it adds info beyond Particulars
+                if desc and desc != part and desc[:28] != part:
+                    line += f" ({desc[:28]})"
+                lines.append(line)
             o = self.data_provider.get_current_outstanding(member_id)
-            lines.append(f"{'-'*54}")
+            lines.append(f"{'-'*93}")
             label = "SURPLUS" if o >= 0 else "DEMAND"
-            lines.append(f"{'BALANCE':<42} ₹{abs(o):>10,.2f} ({label})")
-            lines.append(f"{'='*80}")
+            lines.append(f"{'BALANCE':<80} ₹{abs(o):>10,.2f} ({label})")
+            lines.append(f"{'='*100}")
             return "\n".join(lines)
 
         def get_outstanding_summary(_: str = None):
@@ -432,6 +677,82 @@ class OrchestratorAgent(BaseAgent):
             lines.append(f"{'TOTAL':<35} ₹{abs(total):>10,.2f} ({tag})")
             lines.append("=" * 60)
             return "\n".join(lines)
+
+        # ── Ledger Update / Delete tools ───────────────────────────────
+
+        def update_ledger_entry(input_str: str = None):
+            """Update fields of an existing ledger entry (amount, particulars, date, transaction_id, description). Use this to modify an entry — e.g., reduce credit amount when splitting a payment across members, or change particulars/date/transaction reference. Outstanding is auto-recalculated after update. Input JSON keys: member_id (required), vch_no (required), plus any of: credit, debit, particulars, date, transaction_id, description. Example: {"member_id": 5, "vch_no": 42, "credit": 5000, "particulars": "By Payment (split)"}"""
+            data = _parse_action_input(input_str or "")
+            member_id = data.get("member_id")
+            vch_no = data.get("vch_no")
+
+            if not member_id or not vch_no:
+                return "member_id and vch_no are required"
+
+            try:
+                member_id = int(member_id)
+                vch_no = int(vch_no)
+            except (ValueError, TypeError):
+                return "member_id and vch_no must be integers"
+
+            updates = {}
+            for key in ("credit", "debit", "particulars", "date", "transaction_id", "description",
+                        "Credit", "Debit", "Particulars", "Date", "Transaction_ID", "Description"):
+                if key in data:
+                    val = data[key]
+                    if key.lower() in ("credit", "debit"):
+                        try:
+                            val = float(val)
+                        except (ValueError, TypeError):
+                            return f"Invalid {key}: {val}"
+                    updates[key] = val
+
+            if not updates:
+                return "No update fields provided. Send at least one of: credit, debit, particulars, date, transaction_id, description."
+
+            # Normalize field names to match provider schema
+            field_map = {
+                "credit": "Credit", "debit": "Debit",
+                "particulars": "Particulars", "date": "Date",
+                "transaction_id": "Transaction_ID", "description": "Description",
+                "Credit": "Credit", "Debit": "Debit",
+                "Particulars": "Particulars", "Date": "Date",
+                "Transaction_ID": "Transaction_ID", "Description": "Description",
+            }
+            normalized = {}
+            for k, v in updates.items():
+                normalized[field_map.get(k, k)] = v
+
+            if not self.data_provider.update_ledger_entry(member_id, vch_no, normalized):
+                return f"Failed to update entry Vch_No {vch_no} for member {member_id} — entry not found."
+
+            member = self.data_provider.get_member(member_id)
+            name = member.get("Plot_Owner_Name", f"Member {member_id}") if member else f"Member {member_id}"
+            o = self.data_provider.get_current_outstanding(member_id)
+            return f"✅ Entry Vch_No {vch_no} updated for {name}. Updated fields: {', '.join(normalized.keys())}. Outstanding: ₹{abs(o):,.2f} ({'demand' if o < 0 else 'surplus' if o > 0 else 'zero'})."
+
+        def delete_ledger_entry(input_str: str = None):
+            """Delete ANY ledger entry by member_id and vch_no (works for receipts, invoices, demands — any Vch_Type). Outstanding is auto-recalculated after deletion. Use this to remove an entry before recreating it with adjusted amounts (e.g., when re-splitting). Input JSON keys: member_id, vch_no. Example: {"member_id": 5, "vch_no": 42}"""
+            data = _parse_action_input(input_str or "")
+            member_id = data.get("member_id")
+            vch_no = data.get("vch_no")
+
+            if not member_id or not vch_no:
+                return "member_id and vch_no are required"
+
+            try:
+                member_id = int(member_id)
+                vch_no = int(vch_no)
+            except (ValueError, TypeError):
+                return "member_id and vch_no must be integers"
+
+            if not self.data_provider.delete_ledger_entry(member_id, vch_no):
+                return f"Failed to delete entry Vch_No {vch_no} for member {member_id} — entry not found."
+
+            member = self.data_provider.get_member(member_id)
+            name = member.get("Plot_Owner_Name", f"Member {member_id}") if member else f"Member {member_id}"
+            o = self.data_provider.get_current_outstanding(member_id)
+            return f"✅ Entry Vch_No {vch_no} deleted for {name}. Outstanding: ₹{abs(o):,.2f} ({'demand' if o < 0 else 'surplus' if o > 0 else 'zero'})."
 
         # ── Invoice tools ─────────────────────────────────────────────
 
@@ -599,9 +920,205 @@ class OrchestratorAgent(BaseAgent):
                 "Transaction_Type": "INVOICE",
             })
             o = self.data_provider.get_current_outstanding(member_id)
-            self.data_provider.update_member(member_id, {"Current_Outstanding": o})
 
             return f"Invoice {invoice_filename} generated for {member.get('Plot_Owner_Name')} for ₹{total:,.2f} ({months} months: {bill_period}). Outstanding: ₹{abs(o):,.2f} ({'demand' if o < 0 else 'surplus' if o > 0 else 'zero'})"
+
+        def regenerate_invoice(input_str: str = None):
+            """Regenerate an invoice PDF from an existing ledger entry using current rates. Input JSON keys: member_id, vch_no, new_member_id (optional for move). Example: {"member_id": 2, "vch_no": 15}"""
+            data = _parse_action_input(input_str or "")
+            member_id = data.get("member_id")
+            vch_no = data.get("vch_no")
+            new_member_id = data.get("new_member_id")
+
+            if not member_id or not vch_no:
+                return "member_id and vch_no are required"
+
+            try:
+                member_id = int(member_id)
+                vch_no = int(vch_no)
+                if new_member_id:
+                    new_member_id = int(new_member_id)
+            except (ValueError, TypeError):
+                return "member_id and vch_no must be integers"
+
+            ledger = self.data_provider.get_member_ledger(member_id)
+            entry = next((e for e in ledger if int(e.get("Vch_No", 0)) == vch_no and str(e.get("Transaction_Type", "") or "").upper() == "INVOICE"), None)
+            if not entry:
+                return f"Invoice entry with Vch_No {vch_no} not found for member {member_id}"
+
+            date = str(entry.get("Date", "") or "")
+            description = str(entry.get("Description", "") or "")
+            particulars = str(entry.get("Particulars", "") or "")
+            invoice_no = ""
+            fy_str = ""
+            inv_match = re.search(r'Invoice\s+(\S+)', description)
+            if inv_match:
+                invoice_no = inv_match.group(1)
+            fy_match = re.search(r'FY\s+([\d-]+)', description)
+            if fy_match:
+                fy_str = fy_match.group(1)
+
+            # Extract original month count from particulars
+            months_match = re.search(r'(\d+)\s*months?', particulars)
+            months = int(months_match.group(1)) if months_match else 12
+
+            settings = self.data_provider.get_settings()
+            repair_rate = float(settings.get("Repair_Fund_Rate", 100.0))
+            service_rate = float(settings.get("Service_Charges_Rate", 885.0))
+            sinking_rate = float(settings.get("Sinking_Fund_Rate", 15.0))
+            repair_amount = repair_rate * months
+            service_amount = service_rate * months
+            sinking_amount = sinking_rate * months
+
+            member = self.data_provider.get_member(member_id)
+            pending_interest = float(member.get("Pending_Interest", 0) or 0) if member else 0
+            gross_total = repair_amount + service_amount + sinking_amount + pending_interest
+
+            # Payment received during the original invoice period
+            fd_match = re.search(r'(\d{2}-\d{2}-\d{4})\s+to\s+(\d{2}-\d{2}-\d{4})', particulars)
+            from_date = fd_match.group(1) if fd_match else "01-04-2024"
+            to_date = fd_match.group(2) if fd_match else "31-03-2025"
+            try:
+                fd_parts = from_date.split("-")
+                td_parts = to_date.split("-")
+                period_start = datetime(int(fd_parts[2]), int(fd_parts[1]), int(fd_parts[0]))
+                period_end = datetime(int(td_parts[2]), int(td_parts[1]), int(td_parts[0]))
+            except (ValueError, IndexError):
+                period_start = None
+                period_end = None
+
+            payment_received = 0
+            if period_start and period_end:
+                for e in ledger:
+                    e_date_str = str(e.get("Date", "") or "").strip()
+                    if e_date_str:
+                        try:
+                            e_dt = datetime.strptime(e_date_str, "%d-%m-%Y")
+                            if period_start <= e_dt <= period_end:
+                                payment_received += _safe_float(e.get("Credit"))
+                        except ValueError:
+                            pass
+
+            total = gross_total - payment_received
+
+            # Handle Move
+            if new_member_id and new_member_id != member_id:
+                old_pdf_paths = _get_invoice_pdf_paths(invoice_no)
+                for p in old_pdf_paths:
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
+                if not self.data_provider.delete_ledger_entry(member_id, vch_no):
+                    return f"Failed to delete entry from member {member_id}"
+                self.data_provider.add_ledger_entry(new_member_id, {
+                    "Date": date,
+                    "Particulars": particulars,
+                    "Vch_Type": "Journal",
+                    "Vch_No": vch_no,
+                    "Debit": gross_total,
+                    "Credit": None,
+                    "Description": description,
+                    "Transaction_Type": "INVOICE",
+                })
+                target_member = self.data_provider.get_member(new_member_id)
+                member_id = new_member_id
+            else:
+                target_member = self.data_provider.get_member(member_id)
+                if target_member:
+                    self.data_provider.update_ledger_entry(member_id, vch_no, {
+                        "Debit": gross_total,
+                    })
+
+            if not target_member:
+                return "Target member not found"
+
+            plot_str = str(target_member.get("Plot_No", "") or "")
+            plot_part = f"Plot_No_{plot_str.zfill(2)}" if plot_str else "Unknown"
+            fy_part = fy_str[:2] if fy_str else "20"
+
+            invoice_dir = config.INVOICES_DIR / fy_part
+            invoice_dir.mkdir(parents=True, exist_ok=True)
+            invoice_filename = f"Invoice_{plot_part}_{invoice_no}.pdf" if invoice_no else f"Invoice_{plot_part}_regen.pdf"
+            invoice_path = invoice_dir / invoice_filename
+
+            # Delete old PDFs for this invoice_no
+            for p in invoice_dir.glob(f"*{invoice_no}*.pdf"):
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+
+            invoice_data = {
+                "invoice_no": invoice_no or "REGEN",
+                "invoice_date": date,
+                "due_date": date,
+                "plot_owner_name": target_member.get("Plot_Owner_Name", "Unknown"),
+                "plot_no": plot_str,
+                "bill_period": f"{from_date} to {to_date}",
+                "from_date": from_date,
+                "to_date": to_date,
+                "number_of_months": months,
+                "payment_received_till_date": payment_received,
+                "outstanding_balance": total,
+                "payment_history": [],
+                "previous_invoices": [],
+                "line_items": {
+                    f"Repair & Maintenance Fund @ ₹{repair_rate:,.2f}/month × {months} months": repair_amount,
+                    f"Service Charges @ ₹{service_rate:,.2f}/month × {months} months": service_amount,
+                    f"Sinking Fund @ ₹{sinking_rate:,.2f}/month × {months} months": sinking_amount,
+                    "Interest Penalty Charges": pending_interest,
+                },
+                "total_amount": total,
+                "amount_in_words": number_to_words_inr(total),
+            }
+            if payment_received > 0:
+                invoice_data["line_items"]["Payment Received Till Date (this period)"] = -payment_received
+
+            success = create_simple_invoice_pdf(invoice_path, invoice_data)
+            if not success:
+                return f"Failed to regenerate invoice for member {member_id}"
+
+            return f"✅ Invoice {invoice_no or 'REGEN'} regenerated for {target_member.get('Plot_Owner_Name')} (Plot {plot_str}) — ₹{total:,.2f}"
+
+        def delete_invoice(input_str: str = None):
+            """Delete an invoice entry and its PDF from the ledger. Input JSON keys: member_id, vch_no. Example: {"member_id": 2, "vch_no": 15}"""
+            data = _parse_action_input(input_str or "")
+            member_id = data.get("member_id")
+            vch_no = data.get("vch_no")
+
+            if not member_id or not vch_no:
+                return "member_id and vch_no are required"
+
+            try:
+                member_id = int(member_id)
+                vch_no = int(vch_no)
+            except (ValueError, TypeError):
+                return "member_id and vch_no must be integers"
+
+            ledger = self.data_provider.get_member_ledger(member_id)
+            entry = next((e for e in ledger if int(e.get("Vch_No", 0)) == vch_no), None)
+            if not entry:
+                return f"Entry with Vch_No {vch_no} not found for member {member_id}"
+
+            description = str(entry.get("Description", "") or "")
+            inv_match = re.search(r'Invoice\s+(\S+)', description)
+            invoice_no = inv_match.group(1) if inv_match else ""
+
+            # Delete PDFs
+            if invoice_no:
+                for fy_dir in config.INVOICES_DIR.iterdir():
+                    if fy_dir.is_dir():
+                        for pdf in fy_dir.glob(f"*{invoice_no}*.pdf"):
+                            try:
+                                pdf.unlink()
+                            except OSError:
+                                pass
+
+            if not self.data_provider.delete_ledger_entry(member_id, vch_no):
+                return f"Failed to delete entry from member {member_id}"
+
+            return f"✅ Invoice {invoice_no or f'Vch {vch_no}'} deleted for member {member_id}"
 
         def batch_generate_invoices(input_str: str = None):
             """Generate invoice PDFs AND add debit entries to each member's ledger (automatically — no separate ledger tool call needed). Input JSON keys:
@@ -732,8 +1249,6 @@ class OrchestratorAgent(BaseAgent):
                     "Description": f"Invoice {invoice_no} FY {fy_str}",
                     "Transaction_Type": "INVOICE",
                 })
-                o = self.data_provider.get_current_outstanding(mid)
-                self.data_provider.update_member(mid, {"Current_Outstanding": o})
                 added += 1
                 results.append(f"  ✓ {member.get('Plot_Owner_Name')} (Plot {member.get('Plot_No')}): ₹{total:,.2f} ({months} months: {bill_period}) → {invoice_filename}")
 
@@ -743,23 +1258,42 @@ class OrchestratorAgent(BaseAgent):
 
         # ── Bank Statement Processing ─────────────────────────────────
 
-        def process_bank_statement(input_str: str = None):
-            """Process a bank statement to auto-match deposits to members and generate receipts.
+        def process_bank_statement_pdf(input_str: str = None):
+            """Process parsed bank statement entries (from PDF upload) to auto-match entries to members.
+            CREDIT entries → ledger entries (receipt PDFs optional).
+            DEBIT entries → expenses (auto-recorded with "Other" category).
+            Unmatched CREDIT entries → need user validation.
+            Unmatched DEBIT entries → auto-recorded as expenses.
+            Set generate_receipts=false to only add ledger entries without PDF generation.
+            Input is JSON with key=statement (cleaned entries text), key=generate_receipts (bool),
+            key=format (format profile name), key=filename (original PDF filename).
 
-            IMPORTANT: Just pass the raw text as the user pasted it. Do NOT reformat, clean, or ask the user to change format.
             The tool handles ALL of the following automatically:
               - Multi-line entries (NEFT details on continuation lines)
               - Date lines (DD-MM-YYYY) as entry separators
               - Column parsing (DATE | PARTICULARS | CHQ.NO. | WITHDRAWALS | DEPOSITS | BALANCE)
-              - Deposit-only filtering (withdrawals are ignored)
-              - Balance column (Cr suffix) detection and exclusion
+              - Credit and debit detection via Dr suffix, cheque numbers, or balance movement
+              - Balance column (Cr suffix) detection
               - NEFT/UPI/MOBFT/IMPS transaction type detection
-              - Amount extraction from the deposits column
+              - Amount extraction from deposits/withdrawals columns
               - Member matching by surname, name tokens, email local-part, phone, and known identifiers
+              - Auto-split receipts across group members when split rules exist
 
-            Input: the raw bank statement text exactly as copy-pasted from the bank. Multi-line, single-line, any format with dates."""
-            # Bypass _parse_action_input — it splits on commas which destroys amounts like "25,056.00"
+            Input: the raw bank statement text OR JSON: {"statement": "...", "generate_receipts": false}"""
             raw = input_str or ""
+
+            if not raw:
+                return "Please provide the bank statement text (copy-pasted from the statement)."
+
+            # Support JSON-wrapped input for passing options like generate_receipts
+            generate_receipts = True
+            if raw.strip().startswith("{"):
+                try:
+                    parsed = json.loads(raw)
+                    raw = parsed.get("statement", "")
+                    generate_receipts = parsed.get("generate_receipts", True)
+                except (json.JSONDecodeError, TypeError):
+                    pass
 
             if not raw:
                 return "Please provide the bank statement text (copy-pasted from the statement)."
@@ -771,13 +1305,28 @@ class OrchestratorAgent(BaseAgent):
             # Also skip separator/header/balance-summary lines.
             normalized_lines = []
             for line in lines:
-                # Skip dashed separators and column headers
-                if re.match(r'^[\s\-]+$', line) or re.match(r'^(Date|Id)\s', line, re.IGNORECASE):
+                # Skip dashed separators
+                if re.match(r'^[\s\-]+$', line):
+                    continue
+                # Skip cumulative totals / balance summary lines
+                if re.search(
+                    r'(?:OPENING\s+)?BALANCE(?:\s+(?:B/F|C/F|BROUGHT|CARRIED))?'
+                    r'|TOTAL\s+(?:DEBITS|CREDITS|DEPOSITS|WITHDRAWALS)'
+                    r'|SUB\s*TOTAL|GRAND\s+TOTAL'
+                    r'|CUMULATIVE\s+TOTAL',
+                    line, re.IGNORECASE,
+                ):
+                    continue
+                # Skip column headers
+                if re.match(r'^(Date|Id)\s', line, re.IGNORECASE):
                     continue
                 # Insert space after DD-MM-YYYY date if followed by non-whitespace
                 normalized = re.sub(r'^(\d{2}-\d{2}-\d{4})(\S)', r'\1 \2', line)
                 normalized_lines.append(normalized)
             lines = normalized_lines
+
+            # Fetch existing expenses for duplicate checking
+            existing_expenses = self.data_provider.get_expenses()
 
             # ── Phase 1: Group lines into entries ──────────────────────
             # A new entry starts with a DATE (DD-MM-YYYY) line.
@@ -819,6 +1368,15 @@ class OrchestratorAgent(BaseAgent):
                 """
                 combined = "\n".join(entry["all_lines"])
 
+                # Reject cumulative/balance-summary/non-transaction rows
+                if re.search(
+                    r'(?:TOTAL\s+(?:DEBITS|CREDITS|DEPOSITS|WITHDRAWALS)'
+                    r'|BALANCE\s+(?:B/F|C/F|BROUGHT|CARRIED)'
+                    r'|SUB\s*TOTAL|GRAND\s+TOTAL)',
+                    combined, re.IGNORECASE,
+                ):
+                    return None
+
                 # Find all decimal numbers in order, along with Cr/Dr suffix
                 all_amounts = list(re.finditer(r'([\d,]+\.\d{2})\s*(Cr|Dr)?', combined, re.IGNORECASE))
                 if not all_amounts:
@@ -837,14 +1395,19 @@ class OrchestratorAgent(BaseAgent):
                 txn_amount = float(txn_amount_str)
                 txn_suffix = (all_amounts[-2].group(2) or "").upper()
 
-                # Skip if the transaction amount has Dr suffix (definitely a withdrawal)
+                # If the transaction amount has Dr suffix → definitely a withdrawal
                 if txn_suffix == "DR":
-                    return None
+                    return {
+                        "type": "debit",
+                        "amount": txn_amount,
+                        "balance": balance,
+                    }
                 
                 # If the transaction amount has Cr suffix → definitely a deposit
                 if txn_suffix == "CR":
                     return {
-                        "deposit": txn_amount,
+                        "type": "credit",
+                        "amount": txn_amount,
                         "balance": balance,
                     }
 
@@ -857,25 +1420,35 @@ class OrchestratorAgent(BaseAgent):
                 # Match an all-digit token right before the amount
                 cheque_match = re.search(r'\b(\d{6,9})\s*$', text_before_amt)
                 if cheque_match:
-                    # This is a cheque withdrawal — skip it
-                    return None
+                    # This is a cheque withdrawal
+                    return {
+                        "type": "debit",
+                        "amount": txn_amount,
+                        "balance": balance,
+                    }
 
                 # If we have a previous balance, determine debit/credit by balance movement.
                 # This handles single-column formats (no Dr/Cr on transaction amounts).
                 if prev_balance is not None:
                     if abs(balance - (prev_balance - txn_amount)) < 0.01:
                         # Balance decreased by txn_amount → withdrawal
-                        return None
+                        return {
+                            "type": "debit",
+                            "amount": txn_amount,
+                            "balance": balance,
+                        }
                     elif abs(balance - (prev_balance + txn_amount)) < 0.01:
                         # Balance increased by txn_amount → deposit
                         return {
-                            "deposit": txn_amount,
+                            "type": "credit",
+                            "amount": txn_amount,
                             "balance": balance,
                         }
 
                 # No distinguishing feature — assume deposit (most common case)
                 return {
-                    "deposit": txn_amount,
+                    "type": "credit",
+                    "amount": txn_amount,
                     "balance": balance,
                 }
 
@@ -1018,12 +1591,13 @@ class OrchestratorAgent(BaseAgent):
                         prev_balance = _entry_balance
                     continue
 
-                deposit = amounts["deposit"]
-                if deposit <= 0:
+                amount = amounts["amount"]
+                entry_type = amounts["type"]
+                if amount <= 0:
                     if _entry_balance is not None:
                         prev_balance = _entry_balance
                     continue
-                if deposit < 100:
+                if amount < 100:
                     if _entry_balance is not None:
                         prev_balance = _entry_balance
                     continue  # skip test/trivial transactions
@@ -1036,8 +1610,9 @@ class OrchestratorAgent(BaseAgent):
                     "date": entry["date"],
                     "particulars": first_line,
                     "full_particulars": all_text,
-                    "amount": deposit,
+                    "amount": amount,
                     "balance": amounts["balance"],
+                    "entry_type": entry_type,
                     "txn_type": txn_type,
                     "txn_id": txn_id,
                     "search_tokens": search_tokens,
@@ -1046,13 +1621,15 @@ class OrchestratorAgent(BaseAgent):
                     prev_balance = _entry_balance
 
             if not parsed_entries:
-                return "No deposit entries found in the statement. Only DEPOSITS are processed."
+                return "No entries found in the statement."
 
             # ── Phase 3: Match entries to members ──────────────────────
             members = self.data_provider.get_all_members()
             results = []
             unmatched = []
             duplicates = []
+            dup_expenses = []
+            pending_entries = []
 
             for pentry in parsed_entries:
                 tokens = pentry["search_tokens"]
@@ -1151,94 +1728,286 @@ class OrchestratorAgent(BaseAgent):
                             best_match = member
                             best_reason = ", ".join(reason_parts)
 
+                entry_type = pentry.get("entry_type", "credit")
+
                 # Only auto-match if score >= 5 (avoids weak/false matches)
                 if best_match and best_score >= 5 and amount:
                     mid = best_match["ID"]
                     ledger = self.data_provider.get_member_ledger(mid)
 
-                    # ── Duplicate check ──
-                    dup_entry = _check_duplicate_payment(ledger, pentry.get("txn_id") or "", date, amount)
-                    if not dup_entry:
-                        # Also check by date + amount + particulars prefix (covers missing txn_id)
-                        part_clean = str(particulars or "").strip()[:40]
-                        for e in ledger:
-                            e_date = str(e.get("Date", "") or "").strip()
-                            e_credit = _safe_float(e.get("Credit"))
-                            if e_date == date and abs(e_credit - amount) < 0.01:
-                                e_part = str(e.get("Particulars", "") or "").strip()
-                                e_part_clean = e_part[3:] if e_part.upper().startswith("BY ") else e_part
-                                e_part_clean = e_part_clean[:40]
-                                if part_clean and e_part_clean and (part_clean in e_part_clean or e_part_clean in part_clean):
-                                    dup_entry = e
-                                    break
+                    if entry_type == "debit":
+                        # ── DEBIT → auto-create expense (with duplicate check) ──
+                        dup_exp = _check_duplicate_expense(existing_expenses, date, amount, particulars[:80])
+                        if dup_exp:
+                            dup_expenses.append({
+                                "date": date,
+                                "amount": amount,
+                                "particulars": particulars[:80],
+                            })
+                            results.append({
+                                "date": date,
+                                "amount": amount,
+                                "txn_type": pentry.get('txn_type', ''),
+                                "entry_type": "debit_duplicate",
+                                "member_name": best_match.get("Plot_Owner_Name", ""),
+                                "plot_no": best_match.get("Plot_No", ""),
+                                "receipt_id": f"EXP-{dup_exp.get('ID', '?')}",
+                                "member_id": mid,
+                                "particulars": particulars[:80],
+                            })
+                        else:
+                            exp_id = self.data_provider.add_expense({
+                                "Member_ID": mid,
+                                "Date": date,
+                                "Particulars": particulars[:80],
+                                "Amount": amount,
+                                "Category": "Other",
+                                "Bill_File": "",
+                                "Comments": f"Bank withdrawal — {particulars[:60]}",
+                                "Transaction_ID": pentry.get("txn_id") or "",
+                                "Transaction_Type": pentry.get("txn_type", ""),
+                            })
+                            results.append({
+                                "date": date,
+                                "amount": amount,
+                                "txn_type": pentry.get('txn_type', ''),
+                                "entry_type": "debit",
+                                "member_name": best_match.get("Plot_Owner_Name", ""),
+                                "plot_no": best_match.get("Plot_No", ""),
+                                "receipt_id": f"EXP-{exp_id}",
+                                "member_id": mid,
+                                "particulars": particulars[:80],
+                            })
+                    else:
+                        # ── CREDIT → duplicate check + receipt (existing) ──
+                        dup_entry = _check_duplicate_payment(ledger, pentry.get("txn_id") or "", date, amount)
+                        if not dup_entry:
+                            # Also check by date + amount + particulars prefix (covers missing txn_id)
+                            raw_part = str(particulars or "").strip()
+                            part_clean = raw_part[3:] if raw_part.upper().startswith("BY ") else raw_part
+                            part_clean = part_clean[:40].upper()
+                            for e in ledger:
+                                e_part_upper = str(e.get("Particulars", "") or "").upper()
+                                if "SPLIT FROM" in e_part_upper:
+                                    continue
+                                e_date = str(e.get("Date", "") or "").strip()
+                                e_credit = _safe_float(e.get("Credit"))
+                                if e_date == date and abs(e_credit - amount) < 0.01:
+                                    e_part = str(e.get("Particulars", "") or "").strip()
+                                    e_part_clean = e_part[3:] if e_part.upper().startswith("BY ") else e_part
+                                    e_part_clean = e_part_clean[:40].upper()
+                                    if part_clean and e_part_clean and (part_clean in e_part_clean or e_part_clean in part_clean):
+                                        dup_entry = e
+                                        break
 
-                    if dup_entry:
-                        duplicates.append({
+                        # — Check for partial match: same date + particulars but different amount —
+                        update_entry = None
+                        if not dup_entry:
+                            raw_part = str(particulars or "").strip()
+                            part_clean = raw_part[3:] if raw_part.upper().startswith("BY ") else raw_part
+                            part_clean = part_clean[:40].upper()
+                            for e in ledger:
+                                e_part_upper = str(e.get("Particulars", "") or "").upper()
+                                if "SPLIT FROM" in e_part_upper:
+                                    continue
+                                e_date = str(e.get("Date", "") or "").strip()
+                                e_credit = _safe_float(e.get("Credit"))
+                                if e_date == date and e_credit > 0 and abs(e_credit - amount) >= 0.01:
+                                    e_part = str(e.get("Particulars", "") or "").strip()
+                                    e_part_clean = e_part[3:] if e_part.upper().startswith("BY ") else e_part
+                                    e_part_clean = e_part_clean[:40].upper()
+                                    if part_clean and e_part_clean and (part_clean in e_part_clean or e_part_clean in part_clean):
+                                        update_entry = e
+                                        break
+
+                        if update_entry:
+                            old_amt = _safe_float(update_entry.get("Credit"))
+                            vch_no = int(update_entry.get("Vch_No", 0))
+                            self.data_provider.update_ledger_entry(mid, vch_no, {
+                                "Credit": amount,
+                                "Transaction_ID": pentry.get("txn_id") or update_entry.get("Transaction_ID", ""),
+                            })
+                            ref_id = _extract_ref_id(str(update_entry.get("Description", "")) or "")
+                            txn_type = pentry.get("txn_type", "")
+                            plot_str = str(best_match.get("Plot_No", "") or "")
+                            plot_part = f"Plot_No_{plot_str.zfill(2)}" if plot_str else "Unknown"
+                            fy = get_fy_from_date(date)
+                            _delete_pdf_files(ref_id)
+                            if generate_receipts:
+                                receipt_dir = config.RECEIPTS_DIR / fy
+                                receipt_dir.mkdir(parents=True, exist_ok=True)
+                                rpath = receipt_dir / f"Receipt_{plot_part}_{ref_id}.pdf"
+                                receipt_data = {
+                                    "receipt_id": ref_id or f"{fy}-{str(vch_no).zfill(3)}",
+                                    "date": date,
+                                    "member_name": best_match.get("Plot_Owner_Name", ""),
+                                    "plot_no": plot_str,
+                                    "amount": amount,
+                                    "transaction_id": pentry.get("txn_id") or "N/A",
+                                    "transaction_type": txn_type,
+                                    "payment_details": clean_payment_details(particulars)[:120],
+                                }
+                                create_simple_receipt_pdf(rpath, receipt_data)
+                            results.append({
+                                "date": date,
+                                "amount": amount,
+                                "txn_type": txn_type,
+                                "entry_type": "credit_updated",
+                                "member_name": best_match.get("Plot_Owner_Name", ""),
+                                "plot_no": plot_str,
+                                "receipt_id": ref_id or f"{fy}-{str(vch_no).zfill(3)}",
+                                "member_id": mid,
+                                "particulars": particulars[:80],
+                                "note": f"Updated from ₹{old_amt:,.2f} to ₹{amount:,.2f}",
+                            })
+                        elif dup_entry:
+                            duplicates.append({
+                                "date": date,
+                                "amount": amount,
+                                "txn_type": pentry['txn_type'],
+                                "member_name": best_match.get("Plot_Owner_Name", ""),
+                                "plot_no": best_match.get("Plot_No", ""),
+                                "particulars": particulars[:80],
+                            })
+                        else:
+                            fy = get_fy_from_date(date)
+                            vch_no = self.data_provider.get_next_voucher_number()
+                            receipt_id = f"{fy}-{str(vch_no).zfill(3)}"
+
+                            txn_type = pentry.get("txn_type", "")
+                            # Outstanding as of the transaction date
+                            led_after = list(ledger) + [{"Date": date, "Credit": amount, "Debit": None}]
+                            current_outstanding = compute_outstanding_as_of(led_after, date)
+                            receipt_data = {
+                                "receipt_id": receipt_id,
+                                "date": date,
+                                "member_name": best_match.get("Plot_Owner_Name", ""),
+                                "plot_no": best_match.get("Plot_No", ""),
+                                "amount": amount,
+                                "transaction_id": pentry.get("txn_id") or "N/A",
+                                "transaction_type": txn_type,
+                                "outstanding_balance": current_outstanding,
+                                "payment_details": clean_payment_details(particulars)[:120],
+                            }
+                            if generate_receipts:
+                                receipt_dir = config.RECEIPTS_DIR / fy
+                                receipt_dir.mkdir(parents=True, exist_ok=True)
+                                plot_str = str(best_match.get("Plot_No", "") or "")
+                                plot_part = f"Plot_No_{plot_str.zfill(2)}" if plot_str else "Unknown"
+                                rpath = receipt_dir / f"Receipt_{plot_part}_{receipt_id}.pdf"
+                                create_simple_receipt_pdf(rpath, receipt_data)
+
+                            pending_entries.append((mid, {
+                                "Date": date,
+                                "Particulars": f"By {particulars[:60]}",
+                                "Vch_Type": "Journal",
+                                "Vch_No": vch_no,
+                                "Debit": None,
+                                "Credit": amount,
+                                "Description": f"Receipt {receipt_id} — Bank Statement ({txn_type})",
+                                "Transaction_Type": txn_type,
+                            }))
+
+                            # ── Auto-split check ──
+                            split_group = self.data_provider.get_split_group_for_member(mid)
+                            if split_group:
+                                split_amt = round(amount / len(split_group), 2)
+                                for smid in split_group:
+                                    if smid == mid:
+                                        continue
+                                    svch = self.data_provider.get_next_voucher_number()
+                                    sfy = get_fy_from_date(date)
+                                    srid = f"{sfy}-{str(svch).zfill(3)}"
+                                    sdata = {
+                                        "receipt_id": srid,
+                                        "date": date,
+                                        "member_name": "Split Receipt",
+                                        "plot_no": "",
+                                        "amount": split_amt,
+                                        "transaction_id": f"SPLIT-{receipt_id}",
+                                        "transaction_type": "SPLIT",
+                                        "outstanding_balance": 0,
+                                        "payment_details": f"Split from {receipt_id} — {clean_payment_details(particulars)[:60]}",
+                                    }
+                                    if generate_receipts:
+                                        sdir = config.RECEIPTS_DIR / sfy
+                                        sdir.mkdir(parents=True, exist_ok=True)
+                                        spath = sdir / f"Receipt_Plot_No_{str(smid).zfill(2)}_{srid}.pdf"
+                                        create_simple_receipt_pdf(spath, sdata)
+                                    pending_entries.append((smid, {
+                                        "Date": date,
+                                        "Particulars": f"By Split from {best_match.get('Plot_Owner_Name', '')} ({particulars[:40]})",
+                                        "Vch_Type": "Journal",
+                                        "Vch_No": svch,
+                                        "Debit": None,
+                                        "Credit": split_amt,
+                                        "Description": f"Split Receipt {srid} (from {receipt_id})",
+                                        "Transaction_Type": "SPLIT",
+                                    }))
+
+                            # Record known identifiers for future matching
+                            TITLE_WORDS = {"MR", "MRS", "MS", "SHRI", "SMT", "DR", "SRI",
+                                           "M/S", "CMN", "PAY", "AND", "THE", "FROM", "B"}
+                            for token in tokens:
+                                if "@" in str(token):
+                                    self.data_provider.record_payment_reference(mid, "UPI_ID", token, date)
+                                elif token.isdigit() and len(token) == 10:
+                                    self.data_provider.record_payment_reference(mid, "MOBILE", token, date)
+                                elif len(token) > 3 and not token.isdigit() and token not in TITLE_WORDS:
+                                    self.data_provider.record_payment_reference(mid, "PAYEE_NAME", token, date)
+
+                            results.append({
+                                "date": date,
+                                "amount": amount,
+                                "txn_type": pentry['txn_type'],
+                                "member_name": best_match.get("Plot_Owner_Name", ""),
+                                "plot_no": best_match.get("Plot_No", ""),
+                                "receipt_id": receipt_id,
+                                "member_id": mid,
+                                "particulars": particulars[:80],
+                                "has_pdf": generate_receipts,
+                            })
+                elif entry_type == "debit":
+                    # Unmatched DEBIT → auto-create expense with duplicate check
+                    dup_exp = _check_duplicate_expense(existing_expenses, date, amount, particulars[:80])
+                    if dup_exp:
+                        dup_expenses.append({
                             "date": date,
                             "amount": amount,
-                            "txn_type": pentry['txn_type'],
-                            "member_name": best_match.get("Plot_Owner_Name", ""),
-                            "plot_no": best_match.get("Plot_No", ""),
                             "particulars": particulars[:80],
                         })
-                    else:
-                        fy = get_fy_from_date(date)
-                        vch_no = self.data_provider.get_next_voucher_number()
-                        receipt_id = f"{fy}-{str(vch_no).zfill(3)}"
-
-                        txn_type = pentry.get("txn_type", "")
-                        # Outstanding as of the transaction date
-                        led_after = list(ledger) + [{"Date": date, "Credit": amount, "Debit": None}]
-                        current_outstanding = compute_outstanding_as_of(led_after, date)
-                        receipt_data = {
-                            "receipt_id": receipt_id,
-                            "date": date,
-                            "member_name": best_match.get("Plot_Owner_Name", ""),
-                            "plot_no": best_match.get("Plot_No", ""),
-                            "amount": amount,
-                            "transaction_id": pentry.get("txn_id") or "N/A",
-                            "transaction_type": txn_type,
-                            "outstanding_balance": current_outstanding,
-                            "payment_details": particulars[:120],
-                        }
-                        receipt_dir = config.RECEIPTS_DIR / fy
-                        receipt_dir.mkdir(parents=True, exist_ok=True)
-                        plot_str = str(best_match.get("Plot_No", "") or "")
-                        plot_part = f"Plot_No_{plot_str.zfill(2)}" if plot_str else "Unknown"
-                        rpath = receipt_dir / f"Receipt_{plot_part}_{receipt_id}.pdf"
-                        create_simple_receipt_pdf(rpath, receipt_data)
-
-                        self.data_provider.add_ledger_entry(mid, {
-                            "Date": date,
-                            "Particulars": f"By {particulars[:60]}",
-                            "Vch_Type": "Journal",
-                            "Vch_No": vch_no,
-                            "Debit": None,
-                            "Credit": amount,
-                            "Description": f"Receipt {receipt_id} — Bank Statement ({txn_type})",
-                            "Transaction_Type": txn_type,
-                        })
-                        self.data_provider.update_member(mid, {"Current_Outstanding": self.data_provider.get_current_outstanding(mid)})
-
-                        # Record known identifiers for future matching
-                        TITLE_WORDS = {"MR", "MRS", "MS", "SHRI", "SMT", "DR", "SRI",
-                                       "M/S", "CMN", "PAY", "AND", "THE", "FROM", "B"}
-                        for token in tokens:
-                            if "@" in str(token):
-                                self.data_provider.record_payment_reference(mid, "UPI_ID", token, date)
-                            elif token.isdigit() and len(token) == 10:
-                                self.data_provider.record_payment_reference(mid, "MOBILE", token, date)
-                            elif len(token) > 3 and not token.isdigit() and token not in TITLE_WORDS:
-                                self.data_provider.record_payment_reference(mid, "PAYEE_NAME", token, date)
-
                         results.append({
                             "date": date,
                             "amount": amount,
-                            "txn_type": pentry['txn_type'],
-                            "member_name": best_match.get("Plot_Owner_Name", ""),
-                            "plot_no": best_match.get("Plot_No", ""),
-                            "receipt_id": receipt_id,
-                            "member_id": mid,
+                            "txn_type": pentry.get('txn_type', ''),
+                            "entry_type": "debit_duplicate",
+                            "member_name": "(Unmatched Withdrawal)",
+                            "plot_no": "",
+                            "receipt_id": f"EXP-{dup_exp.get('ID', '?')}",
+                            "member_id": None,
+                            "particulars": particulars[:80],
+                        })
+                    else:
+                        exp_id = self.data_provider.add_expense({
+                            "Member_ID": None,
+                            "Date": date,
+                            "Particulars": particulars[:80],
+                            "Amount": amount,
+                            "Category": "Other",
+                            "Bill_File": "",
+                            "Comments": f"Auto-recorded bank withdrawal — {particulars[:60]}",
+                            "Transaction_ID": pentry.get("txn_id") or "",
+                            "Transaction_Type": pentry.get("txn_type", ""),
+                        })
+                        results.append({
+                            "date": date,
+                            "amount": amount,
+                            "txn_type": pentry.get('txn_type', ''),
+                            "entry_type": "debit",
+                            "member_name": "(Unmatched Withdrawal)",
+                            "plot_no": "",
+                            "receipt_id": f"EXP-{exp_id}",
+                            "member_id": None,
                             "particulars": particulars[:80],
                         })
                 else:
@@ -1253,16 +2022,41 @@ class OrchestratorAgent(BaseAgent):
 
             lines = []
             lines.append("Bank Statement Processing Results:\n")
+            receipt_count = 0
+            expense_count = 0
+            update_count = 0
+            expense_dup_count = 0
             for r in results:
-                lines.append(
-                    f"  ✓ {r['date']} | ₹{r['amount']:>8,.2f} | [{r['txn_type']}] "
-                    f"{r['member_name']} (Plot {r['plot_no']}) → Receipt {r['receipt_id']}"
-                )
+                if r.get("entry_type") == "debit":
+                    lines.append(
+                        f"  ↓ {r['date']} | ₹{r['amount']:>8,.2f} | [{r['txn_type']}] "
+                        f"{r['member_name']} → Expense {r['receipt_id']}"
+                    )
+                    expense_count += 1
+                elif r.get("entry_type") == "debit_duplicate":
+                    lines.append(
+                        f"  ⚠️ {r['date']} | ₹{r['amount']:>8,.2f} | [{r['txn_type']}] "
+                        f"{r['member_name']} — expense skipped (already exists {r['receipt_id']})"
+                    )
+                    expense_dup_count += 1
+                elif r.get("entry_type") == "credit_updated":
+                    note = r.get("note", "")
+                    lines.append(
+                        f"  ✎ {r['date']} | ₹{r['amount']:>8,.2f} | [{r['txn_type']}] "
+                        f"{r['member_name']} (Plot {r['plot_no']}) → {r['receipt_id']} {note}"
+                    )
+                    update_count += 1
+                else:
+                    lines.append(
+                        f"  ✓ {r['date']} | ₹{r['amount']:>8,.2f} | [{r['txn_type']}] "
+                        f"{r['member_name']} (Plot {r['plot_no']}) → Receipt {r['receipt_id']}"
+                    )
+                    receipt_count += 1
             if not results:
-                lines.append("  (No auto-matched entries)")
+                lines.append("  (No entries processed)")
 
             if unmatched:
-                lines.append("\n\n--- UNMATCHED ENTRIES (need your validation) ---")
+                lines.append("\n\n--- UNMATCHED CREDIT ENTRIES (need your validation) ---")
                 for u in unmatched:
                     tag = f"[{u['txn_type']}]" if u['txn_type'] else ""
                     lines.append(
@@ -1278,18 +2072,34 @@ class OrchestratorAgent(BaseAgent):
                         f"{d['member_name']} (Plot {d['plot_no']}) — already exists"
                     )
 
+            if dup_expenses:
+                lines.append(f"\n⚠️ DUPLICATE EXPENSES SKIPPED: {len(dup_expenses)}")
+                for d in dup_expenses:
+                    lines.append(
+                        f"  ⚠️ {d['date']} | ₹{d['amount']:>8,.2f} | {d['particulars'][:40]} — expense already exists"
+                    )
+
             lines.append(f"\n{'-'*50}")
-            lines.append(f"Matched & processed: {len(results)} receipts generated.")
+            parts = [f"Receipts generated: {receipt_count}", f"Expenses recorded: {expense_count}", f"Total processed: {len(results)}"]
+            if update_count:
+                parts.insert(0, f"Entries updated: {update_count}")
+            lines.append(" | ".join(parts))
             if duplicates:
                 lines.append(f"Duplicates skipped: {len(duplicates)} entries already existed.")
-            lines.append(f"Unmatched: {len(unmatched)} entries need your input.")
+            if dup_expenses:
+                lines.append(f"Duplicate expenses skipped: {len(dup_expenses)} entries already existed.")
+            lines.append(f"Unmatched credit entries: {len(unmatched)} need your input.")
             summary_text = "\n".join(lines)
+
+            if pending_entries:
+                self.data_provider.add_ledger_entries(pending_entries)
 
             return {
                 "summary": summary_text,
                 "matched": results,
                 "unmatched": unmatched,
                 "duplicates": duplicates,
+                "dup_expenses": dup_expenses,
             }
 
         # ── Admin tools ───────────────────────────────────────────────
@@ -1320,8 +2130,6 @@ class OrchestratorAgent(BaseAgent):
                     "Description": f"YEARLY MAINTENANCE DEMAND FY {fy}",
                     "Transaction_Type": "DEMAND",
                 })
-                o = self.data_provider.get_current_outstanding(mid)
-                self.data_provider.update_member(mid, {"Current_Outstanding": o})
                 success += 1
             return f"April entries: {success} added, {skipped} skipped"
 
@@ -1374,7 +2182,6 @@ class OrchestratorAgent(BaseAgent):
                 "Transaction_Type": "DEMAND",
             })
             o = self.data_provider.get_current_outstanding(member_id)
-            self.data_provider.update_member(member_id, {"Current_Outstanding": o})
             return f"Demand of ₹{amount:,.2f} added for {member.get('Plot_Owner_Name')} (Plot {member.get('Plot_No')}) for FY {fy}. Outstanding: ₹{abs(o):,.2f} ({'demand' if o < 0 else 'surplus' if o > 0 else 'zero'})"
 
         def batch_add_demand_entries(input_str: str = None):
@@ -1419,8 +2226,6 @@ class OrchestratorAgent(BaseAgent):
                     "Description": f"YEARLY MAINTENANCE DEMAND FY {fy}",
                     "Transaction_Type": "DEMAND",
                 })
-                o = self.data_provider.get_current_outstanding(mid)
-                self.data_provider.update_member(mid, {"Current_Outstanding": o})
                 added += 1
                 results.append(f"  ✓ {member.get('Plot_Owner_Name')} (Plot {member.get('Plot_No')}): ₹{amount:,.2f}")
 
@@ -1447,7 +2252,6 @@ class OrchestratorAgent(BaseAgent):
                 "Plot_Owner_Name": name,
                 "Email": email,
                 "Phone": phone,
-                "Current_Outstanding": 0,
                 "Pending_Interest": 0,
             }
             member_id = self.data_provider.add_member(member_data)
@@ -1474,55 +2278,172 @@ class OrchestratorAgent(BaseAgent):
                 return f"Rates updated: {settings}"
             return "No rates provided"
 
-        self.register_tool(process_bank_statement, "process_bank_statement",
-                           "Parse a copy-pasted bank statement and auto-generate receipts for matched members. "
-                           "CRITICAL: Do NOT ask the user to reformat — the tool handles raw multi-line bank statement text with date lines. "
-                           "Just pass the raw text exactly as the user pasted it. "
-                           "The tool auto-detects: date rows, multi-line NEFT entries, deposit vs withdrawal, transaction types, "
-                           "and matches members by name/surname/email/phone/known identifiers.")
+        self.register_tool(process_bank_statement_pdf, "process_bank_statement_pdf",
+                           "Process parsed bank statement entries (from PDF upload) "
+                           "and auto-generate receipts for matched members. "
+                           "Input is JSON with key=statement (cleaned entries text), "
+                           "key=generate_receipts (bool, default true), "
+                           "key=format (format profile name), "
+                           "key=filename (original PDF filename). "
+                           "Returns dict with matched, unmatched, duplicates. "
+                           "Wrapper around the existing entry processing logic.")
 
         # ── Register all tools ────────────────────────────────────────
 
         self.register_tool(get_member_details, "get_member_details",
-                           "Look up a member by plot_no or member_id. Returns member details including member_id. Use this FIRST to resolve plot numbers.")
+                           "Look up a member by plot_no or member_id. "
+                           "Returns JSON with keys: member_id, name, plot_no, outstanding. "
+                           "Use this FIRST to resolve plot numbers to member_ids before calling other tools. "
+                           "The member_id from the output is accepted by all tools that take member_id.")
+
         self.register_tool(extract_payment_from_screenshot, "extract_payment",
-                           "Extract payment details from a screenshot image. Input: file path to image. Returns JSON with amount, date, transaction_id.")
+                           "Extract payment details (amount, date, transaction_id) from a payment screenshot "
+                           "using vision AI. Input: file path to the image. Returns JSON with parsed fields. "
+                           "Pass extracted fields to generate_receipt to record the payment.")
+
         self.register_tool(batch_process_historical_receipts, "batch_process_historical_receipts",
-                           "Process ALL historical receipt images from a folder. Scans folder, runs OCR on each image, generates receipt PDFs, and updates ledgers. Input JSON: folder_path (optional, defaults to Historical_Receipts folder), default_plot_no (optional for fallback).")
+                           "Process ALL historical receipt images from a folder. "
+                           "Scans folder, runs OCR on each image, generates receipt PDFs, and updates ledgers. "
+                           "Input JSON keys: folder_path (optional, defaults to Historical_Receipts folder), "
+                           "default_plot_no (optional for fallback). "
+                           "Returns summary of processed receipts (added/duplicates/skipped/failed).")
+
         self.register_tool(generate_receipt, "generate_receipt",
-                           "Generate a single receipt PDF and update the ledger. Input JSON: member_id, amount, date, transaction_id (optional). Use get_member_details first to get member_id.")
+                           "Generate a receipt for a member payment (adds a credit entry to the ledger "
+                           "+ creates receipt PDF). "
+                           "Input JSON keys: member_id (or plot_no), amount, date (DD-MM-YYYY), "
+                           "transaction_id (optional for bank ref), "
+                           "transaction_type (optional: NEFT/UPI/CHQ/IMPS/CASH), "
+                           "particulars (optional), force (optional bool to bypass duplicate check). "
+                           "The receipt reference follows the pattern RCPT-<FY>-<VchNo>. "
+                           "To reduce the amount after creation (e.g., for splitting), "
+                           "call update_ledger_entry with a lower credit value. "
+                           "Outstanding is auto-updated.")
+
+        self.register_tool(regenerate_receipt, "regenerate_receipt",
+                           "Regenerate a receipt PDF from an existing ledger entry. "
+                           "Input JSON keys: member_id, vch_no (both required). "
+                           "Optionally add new_member_id to MOVE the entry to a different member. "
+                           "Useful when fixing a receipt that was assigned to the wrong member. "
+                           "To SPLIT instead (keep original at reduced amount + create new entry for other member), "
+                           "first call update_ledger_entry to reduce the amount, "
+                           "then call generate_receipt for the new entry.")
+
+        self.register_tool(generate_consolidated_receipt, "generate_consolidated_receipt",
+                           "Generate a consolidated receipt PDF for a member listing all receipts in a FY. "
+                           "Input JSON keys: member_id (required), fy (optional, e.g. '2025-26'). "
+                           "Returns the PDF filename and total amount of receipts included.")
+
         self.register_tool(get_member_ledger, "get_member_ledger",
-                           "View the complete ledger for a member. Input: member_id or plot_no. Shows all transactions with credit/debit and the current balance.")
+                           "View the complete ledger for a member. "
+                           "Input: member_id or plot_no. "
+                           "OUTPUT includes: Date, Vch_No (use with update_ledger_entry / delete_ledger_entry), "
+                           "Type (RECEIPT/INVOICE/DEMAND), Particulars, "
+                           "Txn_ID (use to match entries across members — same Txn_ID in both ledgers "
+                           "indicates a split payment), Amount (Cr/Dr), and Description. "
+                           "Use the Vch_No from the output to reference entries for updates or deletion. "
+                           "Use the Txn_ID to identify which entries are split across two members' ledgers.")
+
         self.register_tool(get_outstanding_summary, "get_outstanding_summary",
-                           "Get outstanding balance summary for ALL members. Shows who owes money (demand) and who has overpaid (surplus).")
+                           "Get outstanding balance summary for ALL members. "
+                           "Shows each member's plot, name, and balance (demand if negative, surplus if positive). "
+                           "Outstanding is auto-updated after every ledger write operation "
+                           "(generate_receipt, delete_ledger_entry, update_ledger_entry, etc.) — "
+                           "no manual recalculation needed.")
+
+        self.register_tool(update_ledger_entry, "update_ledger_entry",
+                           "Modify fields of an existing ledger entry — amount (credit/debit), "
+                           "particulars, date, transaction_id, description. "
+                           "Outstanding is auto-recalculated after update. "
+                           "Use this to reduce an entry's credit when splitting a payment across two members: "
+                           "call update_ledger_entry to halve the amount, "
+                           "then call generate_receipt to add the other half to the second member. "
+                           "Input JSON keys: member_id (required), vch_no (required), "
+                            "plus any of: credit, debit, particulars, date, transaction_id, description. "
+                           "Example input: member_id=5, vch_no=42, credit=5000")
+
+        self.register_tool(delete_ledger_entry, "delete_ledger_entry",
+                            "Delete ANY ledger entry by member_id and vch_no — works for receipts, invoices, "
+                           "demands, or any Vch_Type. Outstanding is auto-recalculated after deletion. "
+                           "Use this to remove an entry before recreating it with adjusted amounts "
+                           "(e.g., when re-splitting a payment that was assigned to the wrong member). "
+                            "Input JSON keys: member_id, vch_no. "
+                           "Example input: member_id=5, vch_no=42")
+
         self.register_tool(add_demand_entry, "add_demand_entry",
-                           "Add a yearly maintenance demand (debit entry) for a single member. Input JSON: member_id or plot_no, amount (optional), fy (optional). Use this to record new annual maintenance charges.")
+                           "Add a yearly maintenance demand (debit entry) for a single member. "
+                           "Use this to record new annual maintenance charges. "
+                           "Input JSON keys: member_id or plot_no (required), "
+                           "amount (optional, defaults to configured AUTO_ENTRY_AMOUNT), "
+                           "fy (optional, e.g. '26-27'), date (optional, defaults to 1-Apr of FY). "
+                           "Skips if a demand for the same FY already exists. "
+                           "Outstanding is auto-updated.")
+
         self.register_tool(batch_add_demand_entries, "batch_add_demand_entries",
-                           "Add yearly maintenance demand entries for ALL members (or a specific list of plots) at once. Input JSON: amount (optional), fy (optional), plots (optional list).")
+                           "Add yearly maintenance demand entries for ALL members (or specific plots) at once. "
+                           "Input JSON keys: amount (optional, defaults to configured AUTO_ENTRY_AMOUNT), "
+                           "fy (optional, e.g. '26-27'), plots (optional list, e.g. [1,2,3] — omit for all). "
+                           "Skips members that already have a demand for the given FY. "
+                           "Outstanding is auto-updated for each member.")
+
         self.register_tool(generate_invoice, "generate_invoice",
                            "Generate a single invoice PDF AND auto-add a debit entry to the ledger. "
                            "CRITICAL: ALWAYS pass from_date & to_date in DD-MM-YYYY when the user mentions a specific period "
                            "(e.g. 'Nov 21 to Mar 22' -> from_date='01-11-2021', to_date='31-03-2022'). "
                            "Without these, it defaults to the current FY. "
                            "Input JSON keys: member_id or plot_no (required), "
-                           "from_date (DD-MM-YYYY, e.g. '01-11-2021'), to_date (DD-MM-YYYY, e.g. '31-03-2022'), "
-                           "invoice_date (DD-MM-YYYY, defaults to today), fy (fallback if from/to missing).")
+                           "from_date (DD-MM-YYYY), to_date (DD-MM-YYYY), "
+                           "invoice_date (DD-MM-YYYY, defaults to today), fy (fallback if from/to missing). "
+                           "Outstanding is auto-updated.")
+
+        self.register_tool(regenerate_invoice, "regenerate_invoice",
+                           "Regenerate an invoice PDF from an existing ledger entry using current rates. "
+                           "Input JSON keys: member_id, vch_no (both required). "
+                           "Optionally add new_member_id to MOVE the invoice to a different member. "
+                           "Useful when rates have changed and an invoice needs re-issuing. "
+                           "Outstanding is auto-updated.")
+
+        self.register_tool(delete_invoice, "delete_invoice",
+                           "Delete an invoice entry AND its PDF from the ledger. "
+                           "Only works for invoice-type entries (Vch_Type=INVOICE). "
+                           "For other entry types (receipts, demands), use delete_ledger_entry instead. "
+                           "Input JSON keys: member_id, vch_no. "
+                           "Outstanding is auto-updated.")
+
         self.register_tool(batch_generate_invoices, "batch_generate_invoices",
                            "Generate invoice PDFs for ALL members (or specific plots) AND auto-add debit entries. "
                            "CRITICAL: ALWAYS pass from_date & to_date in DD-MM-YYYY when the user mentions a specific period "
                            "(e.g. 'November 21 to March 22' -> from_date='01-11-2021', to_date='31-03-2022'). "
                            "Without these, it defaults to the current FY (12 months). "
                            "Input JSON keys: "
-                           "from_date (DD-MM-YYYY, e.g. '01-11-2021'), "
-                           "to_date (DD-MM-YYYY, e.g. '31-03-2022'), "
+                           "from_date (DD-MM-YYYY), to_date (DD-MM-YYYY), "
                            "invoice_date (DD-MM-YYYY, defaults to today), "
                            "fy (fallback if from/to missing), "
-                           "plots (optional list, e.g. [1,2,3] — omits for all).")
+                           "plots (optional list, e.g. [1,2,3] — omits for all members). "
+                           "Skips members that already have an invoice for the given period. "
+                           "Outstanding is auto-updated for each member.")
+
         self.register_tool(trigger_april_entries, "trigger_april_entries",
-                           "Trigger yearly maintenance demand entries for all members (legacy tool).")
+                           "Trigger yearly maintenance demand entries for all members (legacy tool). "
+                           "Input JSON key: fy (optional, defaults to current FY). "
+                           "Skips members that already have a demand for the FY. "
+                           "Outstanding is auto-updated.")
+
         self.register_tool(get_current_settings, "get_current_settings",
-                           "View current system settings and rates.")
+                           "View current system settings and rates. "
+                           "Returns all key-value pairs: Current_FY, Repair_Fund_Rate, "
+                           "Service_Charges_Rate, Sinking_Fund_Rate, etc. "
+                           "Use this to check rates before generating invoices.")
+
         self.register_tool(add_new_member, "add_new_member",
-                           "Add a new member to the system. Input JSON: plot_no, name, email (optional), phone (optional).")
+                           "Add a new member to the system. "
+                           "Input JSON keys: plot_no (required), name (required), "
+                           "email (optional), phone (optional). "
+                           "Returns the new member's ID.")
+
         self.register_tool(update_rates, "update_rates",
-                           "Update invoice rates. Input JSON: repair, service, sinking (all optional).")
+                           "Update invoice rates. "
+                           "Input JSON keys: repair (Repair_Fund_Rate), "
+                           "service (Service_Charges_Rate), sinking (Sinking_Fund_Rate) — all optional. "
+                            "Only provided rates are updated; others remain unchanged. "
+                           "Example input: repair=150, service=900, sinking=20")
