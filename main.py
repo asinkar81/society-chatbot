@@ -1364,6 +1364,85 @@ def show_dashboard_page():
                         st.info("No tagged entries.")
                     else:
                         _show_suspense_table(tagged, data_provider, members)
+                        st.divider()
+                        batch_cols = st.columns(2)
+                        with batch_cols[0]:
+                            if st.button("📐 Run Split Rules on Tagged", type="primary", use_container_width=True, key="sus_split_tagged"):
+                                split_rules = data_provider.get_split_rules()
+                                mid_to_group = {}
+                                for rule in split_rules:
+                                    src_mid = int(rule["Source_Member_ID"])
+                                    members_str = str(rule.get("Members", ""))
+                                    grp = [int(x.strip()) for x in members_str.split(",") if x.strip().isdigit()]
+                                    mid_to_group[src_mid] = grp
+                                tagged_entries = [s for s in suspense_list if s.get("Status") == "Tagged"]
+                                processed = 0
+                                for se in tagged_entries:
+                                    sid = se["ID"]
+                                    tagged_mid = int(se.get("Tagged_To", 0))
+                                    if tagged_mid not in mid_to_group:
+                                        continue
+                                    grp = mid_to_group[tagged_mid]
+                                    per_head = round(float(se.get("Amount", 0)) / len(grp), 2)
+                                    date_str = str(se.get("Date", "") or "")
+                                    particulars = str(se.get("Particulars", "") or "")
+                                    for gmid in grp:
+                                        vch_no = data_provider.get_next_voucher_number()
+                                        data_provider.add_ledger_entry(gmid, {
+                                            "Date": date_str,
+                                            "Particulars": f"By Suspense Split ({particulars[:40]})",
+                                            "Vch_Type": "Journal",
+                                            "Vch_No": vch_no,
+                                            "Debit": None,
+                                            "Credit": per_head,
+                                            "Description": f"Split from suspense #{sid}",
+                                            "Transaction_Type": "SPLIT",
+                                        })
+                                    data_provider.delete_suspense_entry(sid)
+                                    processed += 1
+                                st.success(f"✅ Applied split rules to {processed} tagged entries")
+                                st.rerun()
+                        with batch_cols[1]:
+                            if st.button("🔍 Match Identifiers on Tagged", type="primary", use_container_width=True, key="sus_match_id_tagged"):
+                                identifiers = data_provider.get_all_identifiers()
+                                tagged_entries = [s for s in suspense_list if s.get("Status") == "Tagged"]
+                                processed = 0
+                                for se in tagged_entries:
+                                    sid = se["ID"]
+                                    tagged_mid = int(se.get("Tagged_To", 0))
+                                    particulars = str(se.get("Particulars", "") or "").upper()
+                                    extra = str(se.get("Description", "") or "").upper()
+                                    combined = particulars + " " + extra
+                                    matched_identifiers = [
+                                        idr for idr in identifiers
+                                        if idr.get("Member_ID") == tagged_mid
+                                        and str(idr.get("Identifier_Value", "")).upper() in combined
+                                    ]
+                                    if not matched_identifiers:
+                                        continue
+                                    date_str = str(se.get("Date", "") or "")
+                                    amount = float(se.get("Amount", 0))
+                                    member_data = _find_member(tagged_mid)
+                                    mname = member_data.get("Plot_Owner_Name", "") if member_data else ""
+                                    mplot = str(member_data.get("Plot_No", "") or "") if member_data else ""
+                                    vch_no = data_provider.get_next_voucher_number()
+                                    fy = get_fy_from_date(date_str)
+                                    receipt_id = f"{fy}-{str(vch_no).zfill(3)}"
+                                    data_provider.add_ledger_entry(tagged_mid, {
+                                        "Date": date_str,
+                                        "Particulars": f"By {particulars[:60]}",
+                                        "Vch_Type": "Journal",
+                                        "Vch_No": vch_no,
+                                        "Debit": None,
+                                        "Credit": amount,
+                                        "Description": f"Receipt {receipt_id} — Suspense Identifier Match",
+                                        "Transaction_Type": se.get("Transaction_Type", ""),
+                                        "Transaction_ID": se.get("Transaction_ID", ""),
+                                    })
+                                    data_provider.delete_suspense_entry(sid)
+                                    processed += 1
+                                st.success(f"✅ Matched {processed} tagged entries via identifiers")
+                                st.rerun()
 
         # ── Receipts List ─────────────────────────────────────────
         st.subheader("📄 Receipts")
