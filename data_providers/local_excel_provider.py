@@ -277,25 +277,6 @@ class LocalExcelDataProvider(DataProvider):
         except Exception:
             pass
 
-    def _plot_ledger_sheet(self, plot_no) -> str:
-        return f"Ledger_Plot_{str(plot_no).zfill(2)}"
-
-    def _get_or_create_plot_ledger_sheet(self, member_id: int, plot_no=None) -> str:
-        if plot_no is None:
-            member = self.get_member(member_id)
-            if not member:
-                return self.ledger_sheet
-            plot_no = member.get("Plot_No", str(member_id))
-        sheet_name = self._plot_ledger_sheet(plot_no)
-        wb = openpyxl.load_workbook(self.excel_file)
-        if sheet_name not in wb.sheetnames:
-            ws = wb.create_sheet(sheet_name)
-            ws.append(self.LEDGER_HEADERS)
-            wb.save(self.excel_file)
-        else:
-            wb.close()
-        return sheet_name
-
     def _ensure_workbook_exists(self):
         if not self.excel_file.exists():
             wb = openpyxl.Workbook()
@@ -353,8 +334,6 @@ class LocalExcelDataProvider(DataProvider):
         df = pd.concat([df, new_row], ignore_index=True)
         self._write_sheet(df, self.members_sheet)
         self._invalidate_cache()
-        plot_no = member_data.get("Plot_No", str(new_id))
-        self._get_or_create_plot_ledger_sheet(new_id, str(plot_no))
         return new_id
 
     def update_member(self, member_id: int, member_data: Dict[str, Any]) -> bool:
@@ -379,81 +358,39 @@ class LocalExcelDataProvider(DataProvider):
         cached = self._cache["ledger_by_mid"].get(member_id)
         if cached is not None:
             return cached
-        plot_no = self._get_plot_no(member_id)
-        sheet_name = self._plot_ledger_sheet(plot_no)
         try:
-            df = pd.read_excel(self.excel_file, sheet_name=sheet_name)
-            entries = df[df["Member_ID"] == member_id].to_dict("records")
-            if entries:
-                return entries
+            df = pd.read_excel(self.excel_file, sheet_name=self.ledger_sheet)
         except Exception:
-            pass
-        df = pd.read_excel(self.excel_file, sheet_name=self.ledger_sheet)
-        member_ledger = df[df["Member_ID"] == member_id]
-        if not member_ledger.empty:
-            self._get_or_create_plot_ledger_sheet(member_id, plot_no)
-            self._write_sheet(member_ledger, sheet_name)
-        return member_ledger.to_dict("records")
+            return []
+        if df.empty:
+            return []
+        if "Plot_No" in df.columns:
+            member_df = df[df["Plot_No"] == member_id]
+        else:
+            member_df = df[df["Member_ID"] == member_id]
+        return member_df.to_dict("records")
 
     def add_ledger_entry(self, member_id: int, entry: Dict[str, Any]) -> bool:
         entry["Member_ID"] = member_id
+        entry["Plot_No"] = member_id
         entry_df = pd.DataFrame([entry])
         df = pd.read_excel(self.excel_file, sheet_name=self.ledger_sheet)
         df = _ensure_columns(df, entry_df.columns)
         df = pd.concat([df, entry_df.reindex(columns=df.columns)], ignore_index=True)
         self._write_sheet(df, self.ledger_sheet)
         self._invalidate_cache()
-
-        plot_no = self._get_plot_no(member_id)
-        sheet_name = self._get_or_create_plot_ledger_sheet(member_id, plot_no)
-        try:
-            pdf = pd.read_excel(self.excel_file, sheet_name=sheet_name)
-        except Exception:
-            pdf = pd.DataFrame(columns=self.LEDGER_HEADERS)
-        pdf = _ensure_columns(pdf, entry_df.columns)
-        pdf = pd.concat([pdf, entry_df.reindex(columns=pdf.columns)], ignore_index=True)
-        self._write_sheet(pdf, sheet_name)
-        self._invalidate_cache()
-
-        o = self.get_current_outstanding(member_id)
-        self.update_member(member_id, {"Current_Outstanding": o})
-
         return True
 
     def add_ledger_entries(self, entries: List[tuple]) -> int:
-        mid_entry_groups = []
+        df = pd.read_excel(self.excel_file, sheet_name=self.ledger_sheet)
         for member_id, entry in entries:
             entry["Member_ID"] = member_id
-            mid_entry_groups.append((member_id, entry))
-
-        df = pd.read_excel(self.excel_file, sheet_name=self.ledger_sheet)
-        plot_dfs = {}
-        for member_id, entry in mid_entry_groups:
+            entry["Plot_No"] = member_id
             entry_df = pd.DataFrame([entry])
             df = _ensure_columns(df, entry_df.columns)
             df = pd.concat([df, entry_df.reindex(columns=df.columns)], ignore_index=True)
-
-            plot_no = self._get_plot_no(member_id)
-            sheet_name = self._plot_ledger_sheet(plot_no)
-            if sheet_name not in plot_dfs:
-                try:
-                    plot_dfs[sheet_name] = pd.read_excel(self.excel_file, sheet_name=sheet_name)
-                except Exception:
-                    plot_dfs[sheet_name] = pd.DataFrame(columns=self.LEDGER_HEADERS)
-            pdf = plot_dfs[sheet_name]
-            pdf = _ensure_columns(pdf, entry_df.columns)
-            pdf = pd.concat([pdf, entry_df.reindex(columns=pdf.columns)], ignore_index=True)
-            plot_dfs[sheet_name] = pdf
-
         self._write_sheet(df, self.ledger_sheet)
-        for sheet_name, pdf in plot_dfs.items():
-            self._write_sheet(pdf, sheet_name)
         self._invalidate_cache()
-
-        for member_id, _ in mid_entry_groups:
-            o = self.get_current_outstanding(member_id)
-            self.update_member(member_id, {"Current_Outstanding": o})
-
         return len(entries)
 
     def get_ledger_entries(
@@ -470,67 +407,25 @@ class LocalExcelDataProvider(DataProvider):
         return df.to_dict("records")
 
     def update_ledger_entry(self, member_id: int, vch_no: int, updates: Dict[str, Any]) -> bool:
-        updated = False
-
-        def _update(df, col, val):
-            nonlocal updated
-            mask = df[col] == val
-            if mask.any():
-                for key, value in updates.items():
-                    df.loc[mask, key] = value
-                updated = True
-            return df
-
-        plot_no = self._get_plot_no(member_id)
-        sheet_name = self._plot_ledger_sheet(plot_no)
-        try:
-            pdf = pd.read_excel(self.excel_file, sheet_name=sheet_name)
-            pdf = _update(pdf, "Vch_No", vch_no)
-            self._write_sheet(pdf, sheet_name)
-        except Exception:
-            pass
-
         df = pd.read_excel(self.excel_file, sheet_name=self.ledger_sheet)
-        df = _update(df, "Vch_No", vch_no)
+        mask = df["Vch_No"] == vch_no
+        if not mask.any():
+            return False
+        for key, value in updates.items():
+            df.loc[mask, key] = value
         self._write_sheet(df, self.ledger_sheet)
-
-        if updated:
-            self._invalidate_cache()
-            o = self.get_current_outstanding(member_id)
-            self.update_member(member_id, {"Current_Outstanding": o})
-
-        return updated
+        self._invalidate_cache()
+        return True
 
     def delete_ledger_entry(self, member_id: int, vch_no: int) -> bool:
-        deleted = False
-
-        def _remove_row(df, col, val):
-            nonlocal deleted
-            mask = df[col] == val
-            if mask.any():
-                df = df[~mask].reset_index(drop=True)
-                deleted = True
-            return df
-
-        plot_no = self._get_plot_no(member_id)
-        sheet_name = self._plot_ledger_sheet(plot_no)
-        try:
-            pdf = pd.read_excel(self.excel_file, sheet_name=sheet_name)
-            pdf = _remove_row(pdf, "Vch_No", vch_no)
-            self._write_sheet(pdf, sheet_name)
-        except Exception:
-            pass
-
         df = pd.read_excel(self.excel_file, sheet_name=self.ledger_sheet)
-        df = _remove_row(df, "Vch_No", vch_no)
+        mask = df["Vch_No"] == vch_no
+        if not mask.any():
+            return False
+        df = df[~mask].reset_index(drop=True)
         self._write_sheet(df, self.ledger_sheet)
-
-        if deleted:
-            self._invalidate_cache()
-            o = self.get_current_outstanding(member_id)
-            self.update_member(member_id, {"Current_Outstanding": o})
-
-        return deleted
+        self._invalidate_cache()
+        return True
 
     # ── Settings ───────────────────────────────────────────────────────────
 
@@ -592,30 +487,64 @@ class LocalExcelDataProvider(DataProvider):
 
     def get_current_outstanding(self, member_id: int) -> float:
         ledger = self.get_member_ledger(member_id)
-        if ledger:
-            total_credit = sum(self._safe_float(e.get("Credit")) for e in ledger)
-            total_debit = sum(self._safe_float(e.get("Debit")) for e in ledger)
-            return total_credit - total_debit
-        member = self.get_member(member_id)
-        if member:
-            return -float(member.get("Current_Outstanding", 0) or 0)
-        return 0.0
+        total_credit = sum(self._safe_float(e.get("Credit")) for e in ledger)
+        total_debit = sum(self._safe_float(e.get("Debit")) for e in ledger)
+        return total_credit - total_debit
 
-    def refresh_all_outstandings(self) -> int:
+
+
+    def get_member_ledger_all(self) -> List[Dict[str, Any]]:
+        try:
+            df = pd.read_excel(self.excel_file, sheet_name=self.ledger_sheet)
+        except Exception:
+            return []
+        if df.empty:
+            return []
+        return df.to_dict("records")
+
+    def get_processed_statements(self) -> List[Dict[str, Any]]:
+        try:
+            df = pd.read_excel(self.excel_file, sheet_name="Processed_Statements")
+        except Exception:
+            return []
+        if df.empty:
+            return []
+        return df.to_dict("records")
+
+    def record_processed_statement(self, filename: str, date_range: str,
+                                    entry_count: int, fmt: str, file_hash: str):
+        try:
+            df = pd.read_excel(self.excel_file, sheet_name="Processed_Statements")
+        except Exception:
+            df = pd.DataFrame(columns=["Filename", "Date_Range", "Processed_At",
+                                        "Entry_Count", "Format", "File_Hash"])
+        import datetime
+        new_row = {
+            "Filename": filename,
+            "Date_Range": date_range,
+            "Processed_At": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "Entry_Count": entry_count,
+            "Format": fmt,
+            "File_Hash": file_hash,
+        }
+        df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+        self._write_sheet(df, "Processed_Statements")
+
+    def refresh_reports_sheet(self):
         members = self.get_all_members()
-        count = 0
-        errors = 0
+        rows = []
+        import datetime
         for m in members:
-            try:
-                o = self.get_current_outstanding(m["ID"])
-                self.update_member(m["ID"], {"Current_Outstanding": o})
-                count += 1
-            except Exception:
-                errors += 1
-        self._invalidate_cache()
-        if errors:
-            logging.warning(f"refresh_all_outstandings: {errors}/{len(members)} members failed")
-        return count
+            mid = int(m.get("Member_ID", m.get("Plot_No", m.get("ID", 0))))
+            outstanding = self.get_current_outstanding(mid)
+            rows.append({
+                "Plot_No": mid,
+                "Owner_Name": m.get("Plot_Owner_Name", ""),
+                "Current_Outstanding": outstanding,
+                "Generated_At": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+        df = pd.DataFrame(rows)
+        self._write_sheet(df, "Reports")
 
     # ── Payment References ─────────────────────────────────────────────────
 
