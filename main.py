@@ -884,7 +884,7 @@ def show_dashboard_page():
             skip_dup = st.checkbox(
                 "Reprocess entries already in ledger (skip duplicate check)",
                 key="bs_skip_dup",
-                help="Check this when re-pasting a statement to allow adding entries that were previously skipped as duplicates.",
+                help="Check this when re-processing to allow adding entries that were previously skipped as duplicates.",
             )
 
             members_list = [
@@ -894,24 +894,97 @@ def show_dashboard_page():
             all_member_options = [m["label"] for m in members_list]
             member_id_map = {m["label"]: m["id"] for m in members_list}
 
-            for i, u in enumerate(unmatched):
-                if i in processed_idx:
-                    continue
-                with st.container(border=True):
-                    cols = st.columns([2, 1.5, 2, 1, 0.7, 0.5, 0.5, 0.5])
-                    cols[0].markdown(f"**{u['date']}**")
-                    cols[1].markdown(f"₹{u['amount']:>,.2f}")
-                    cols[2].markdown(f"`{u['particulars'][:40]}`")
-                    cols[3].markdown(f"`{u['txn_type'] or '—'}`")
-                    with cols[4]:
-                        sel_member = st.selectbox(
-                            "Assign to", all_member_options, key=f"bs_sel_{i}",
-                            label_visibility="collapsed",
-                            placeholder="Select member...",
-                        )
-                    with cols[5]:
-                        if st.button("Add", key=f"bs_add_{i}", use_container_width=True):
-                            mid = member_id_map.get(sel_member)
+            def _add_unmatched_row(u, mid, members, gen_receipts_flag):
+                """Add a ledger entry for an unmatched row. Returns (vch_no, receipt_id)."""
+                fy = get_fy_from_date(u["date"])
+                vch_no = data_provider.get_next_voucher_number()
+                receipt_id = f"{fy}-{str(vch_no).zfill(3)}"
+                data_provider.add_ledger_entry(mid, {
+                    "Date": u["date"],
+                    "Particulars": f"By {u['particulars'][:60]}",
+                    "Vch_Type": "Journal",
+                    "Vch_No": vch_no,
+                    "Debit": None,
+                    "Credit": u["amount"],
+                    "Description": f"Receipt {receipt_id} — Bank Statement ({u['txn_type'] or 'N/A'})",
+                    "Transaction_Type": u.get("txn_type", "") or "",
+                    "Transaction_ID": u.get("txn_id") or "",
+                })
+                member_data = next((m for m in members if m["ID"] == mid), {})
+                mname = member_data.get("Plot_Owner_Name", "")
+                mplot = str(member_data.get("Plot_No", "") or "")
+                manual_match = {
+                    "date": u["date"], "amount": u["amount"],
+                    "txn_type": u.get("txn_type", ""),
+                    "member_name": mname, "plot_no": mplot, "receipt_id": receipt_id,
+                }
+                st.session_state.bank_stmt_manual_matches.append(manual_match)
+                if gen_receipts_flag:
+                    plot_part = f"Plot_No_{mplot.zfill(2)}" if mplot else "Unknown"
+                    rdir = config.RECEIPTS_DIR / fy
+                    rdir.mkdir(parents=True, exist_ok=True)
+                    rpath = rdir / f"Receipt_{plot_part}_{receipt_id}.pdf"
+                    ledger = data_provider.get_member_ledger(mid)
+                    led_after = list(ledger) + [{"Date": u["date"], "Credit": u["amount"], "Debit": None}]
+                    as_of_o = compute_outstanding_as_of(led_after, u["date"])
+                    create_simple_receipt_pdf(rpath, {
+                        "receipt_id": receipt_id, "date": u["date"],
+                        "member_name": mname, "plot_no": mplot,
+                        "amount": u["amount"], "transaction_id": u.get("txn_id") or "",
+                        "transaction_type": u.get("txn_type") or "",
+                        "payment_details": clean_payment_details(u.get("particulars", "")),
+                        "outstanding_balance": as_of_o,
+                    })
+                return vch_no, receipt_id
+
+            # ── Bulk move all to suspense ──
+            if st.button("📋 Move All Unmatched to Suspense", type="secondary", use_container_width=True, key="bs_move_all_suspense"):
+                count = 0
+                for i, u in enumerate(unmatched):
+                    if i in processed_idx:
+                        continue
+                    data_provider.add_suspense_entry({
+                        "Date": u["date"],
+                        "Particulars": u.get("particulars", "")[:80],
+                        "Amount": u["amount"],
+                        "Transaction_ID": u.get("txn_id") or "",
+                        "Transaction_Type": u.get("txn_type") or "",
+                        "Description": f"From bank statement — {u.get('particulars', '')[:60]}",
+                    })
+                    st.session_state.bank_stmt_processed.add(i)
+                    count += 1
+                st.session_state.bank_stmt_confirmation = f"📋 Moved {count} entries to suspense"
+                st.rerun()
+
+            # ── Batch form (no rerun on checkbox/dropdown change) ──
+            with st.form("unmatched_batch"):
+                for i, u in enumerate(unmatched):
+                    if i in processed_idx:
+                        continue
+                    with st.container(border=True):
+                        cols = st.columns([0.4, 2, 1.5, 2, 1, 1.5, 2, 0.7, 0.7, 0.7])
+                        with cols[0]:
+                            st.checkbox("", key=f"bs_chk_{i}", label_visibility="collapsed")
+                        cols[1].markdown(f"**{u['date']}**")
+                        cols[2].markdown(f"₹{u['amount']:>,.2f}")
+                        cols[3].markdown(f"`{u['particulars'][:40]}`")
+                        cols[4].markdown(f"`{u['txn_type'] or '—'}`")
+                        with cols[5]:
+                            st.selectbox("Action", ["", "Add", "Ignore", "Suspense"],
+                                         key=f"bs_act_{i}", label_visibility="collapsed")
+                        with cols[6]:
+                            st.selectbox("To", all_member_options,
+                                         key=f"bs_to_{i}", label_visibility="collapsed",
+                                         placeholder="Select")
+                        with cols[7]:
+                            add_i = st.form_submit_button("Add", use_container_width=True)
+                        with cols[8]:
+                            ign_i = st.form_submit_button("Ignore", use_container_width=True)
+                        with cols[9]:
+                            sus_i = st.form_submit_button("Suspense", use_container_width=True)
+
+                        if add_i:
+                            mid = member_id_map.get(st.session_state.get(f"bs_to_{i}", ""))
                             if mid:
                                 if not skip_dup and _check_duplicate(
                                     data_provider, mid, u["date"], u["amount"],
@@ -919,69 +992,22 @@ def show_dashboard_page():
                                 ):
                                     st.session_state.bank_stmt_confirmation = (
                                         f"⚠️ Duplicate — entry for ₹{u['amount']:>,.2f} "
-                                        f"on {u['date']} already exists for {sel_member}"
+                                        f"on {u['date']} already exists for {st.session_state.get(f'bs_to_{i}', '')}"
                                     )
                                 else:
-                                    fy = get_fy_from_date(u["date"])
-                                    vch_no = data_provider.get_next_voucher_number()
-                                    receipt_id = f"{fy}-{str(vch_no).zfill(3)}"
-                                    data_provider.add_ledger_entry(mid, {
-                                        "Date": u["date"],
-                                        "Particulars": f"By {u['particulars'][:60]}",
-                                        "Vch_Type": "Journal",
-                                        "Vch_No": vch_no,
-                                        "Debit": None,
-                                        "Credit": u["amount"],
-                                        "Description": f"Receipt {receipt_id} — Manual Bank Statement ({u['txn_type'] or 'N/A'})",
-                                        "Transaction_Type": u.get("txn_type", "") or "",
-                                        "Transaction_ID": u.get("txn_id") or "",
-                                    })
-                                    member_data = next((m for m in members if m["ID"] == mid), {})
-                                    mname = member_data.get("Plot_Owner_Name", "")
-                                    mplot = str(member_data.get("Plot_No", "") or "")
-                                    manual_match = {
-                                        "date": u["date"],
-                                        "amount": u["amount"],
-                                        "txn_type": u.get("txn_type", ""),
-                                        "member_name": mname,
-                                        "plot_no": mplot,
-                                        "receipt_id": receipt_id,
-                                    }
-                                    st.session_state.bank_stmt_manual_matches.append(manual_match)
-                                    plot_part = f"Plot_No_{mplot.zfill(2)}" if mplot else "Unknown"
-                                    receipt_dir = config.RECEIPTS_DIR / fy
-                                    receipt_dir.mkdir(parents=True, exist_ok=True)
-                                    receipt_path = receipt_dir / f"Receipt_{plot_part}_{receipt_id}.pdf"
-                                    ledger = data_provider.get_member_ledger(mid)
-                                    led_after = list(ledger) + [{"Date": u["date"], "Credit": u["amount"], "Debit": None}]
-                                    as_of_o = compute_outstanding_as_of(led_after, u["date"])
-                                    create_simple_receipt_pdf(receipt_path, {
-                                        "receipt_id": receipt_id,
-                                        "date": u["date"],
-                                        "member_name": mname,
-                                        "plot_no": mplot,
-                                        "amount": u["amount"],
-                                        "transaction_id": u.get("txn_id") or "",
-                                        "transaction_type": u.get("txn_type") or "",
-                                        "payment_details": clean_payment_details(u.get("particulars", "")),
-                                        "outstanding_balance": as_of_o,
-                                    })
+                                    _add_unmatched_row(u, mid, members, True)
                                     st.session_state.bank_stmt_processed.add(i)
                                     st.session_state.bank_stmt_confirmation = (
-                                        f"✅ Added ₹{u['amount']:>,.2f} to {sel_member}"
+                                        f"✅ Added ₹{u['amount']:>,.2f} to {st.session_state.get(f'bs_to_{i}', '')}"
                                     )
-                                st.rerun()
                             else:
-                                st.error("Select a member first")
-                    with cols[6]:
-                        if st.button("Ignore", key=f"bs_ign_{i}", use_container_width=True):
+                                st.warning("Select a member first")
+                        if ign_i:
                             st.session_state.bank_stmt_processed.add(i)
                             st.session_state.bank_stmt_confirmation = (
-                                f"⏭️ Ignored — ₹{u['amount']:>,.2f} on {u['date']} ({u.get('particulars','')[:40]})"
+                                f"⏭️ Ignored — ₹{u['amount']:>,.2f} on {u['date']}"
                             )
-                            st.rerun()
-                    with cols[7]:
-                        if st.button("Suspense", key=f"bs_sus_{i}", use_container_width=True):
+                        if sus_i:
                             data_provider.add_suspense_entry({
                                 "Date": u["date"],
                                 "Particulars": u.get("particulars", "")[:80],
@@ -994,7 +1020,72 @@ def show_dashboard_page():
                             st.session_state.bank_stmt_confirmation = (
                                 f"📋 Moved to suspense — ₹{u['amount']:>,.2f} on {u['date']}"
                             )
-                            st.rerun()
+
+                st.divider()
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    sub_all = st.form_submit_button("✅ Submit All Checked", use_container_width=True)
+                with c2:
+                    sub_ign_all = st.form_submit_button("⏭️ Ignore All Checked", use_container_width=True)
+                with c3:
+                    sub_sus_all = st.form_submit_button("📋 Suspense All Checked", use_container_width=True)
+
+                if sub_all:
+                    counts = {"Add": 0, "Ignore": 0, "Suspense": 0}
+                    for i, u in enumerate(unmatched):
+                        if i in processed_idx or not st.session_state.get(f"bs_chk_{i}", False):
+                            continue
+                        action = st.session_state.get(f"bs_act_{i}", "")
+                        if action == "Add":
+                            mid = member_id_map.get(st.session_state.get(f"bs_to_{i}", ""))
+                            if mid and (skip_dup or not _check_duplicate(
+                                data_provider, mid, u["date"], u["amount"],
+                                u.get("txn_id"), u.get("particulars")
+                            )):
+                                _add_unmatched_row(u, mid, members, gen_receipts_checkbox)
+                                st.session_state.bank_stmt_processed.add(i)
+                                counts["Add"] += 1
+                        elif action == "Ignore":
+                            st.session_state.bank_stmt_processed.add(i)
+                            counts["Ignore"] += 1
+                        elif action == "Suspense":
+                            data_provider.add_suspense_entry({
+                                "Date": u["date"],
+                                "Particulars": u.get("particulars", "")[:80],
+                                "Amount": u["amount"],
+                                "Transaction_ID": u.get("txn_id") or "",
+                                "Transaction_Type": u.get("txn_type") or "",
+                                "Description": f"From bank statement — {u.get('particulars', '')[:60]}",
+                            })
+                            st.session_state.bank_stmt_processed.add(i)
+                            counts["Suspense"] += 1
+                    st.session_state.bank_stmt_confirmation = (
+                        f"✅ Processed: {counts['Add']} added, {counts['Ignore']} ignored, {counts['Suspense']} suspended"
+                    )
+                elif sub_ign_all:
+                    count = sum(1 for i in range(len(unmatched))
+                                if i not in processed_idx and st.session_state.get(f"bs_chk_{i}", False))
+                    for i in range(len(unmatched)):
+                        if i in processed_idx or not st.session_state.get(f"bs_chk_{i}", False):
+                            continue
+                        st.session_state.bank_stmt_processed.add(i)
+                    st.session_state.bank_stmt_confirmation = f"⏭️ Ignored {count} entries"
+                elif sub_sus_all:
+                    count = 0
+                    for i, u in enumerate(unmatched):
+                        if i in processed_idx or not st.session_state.get(f"bs_chk_{i}", False):
+                            continue
+                        data_provider.add_suspense_entry({
+                            "Date": u["date"],
+                            "Particulars": u.get("particulars", "")[:80],
+                            "Amount": u["amount"],
+                            "Transaction_ID": u.get("txn_id") or "",
+                            "Transaction_Type": u.get("txn_type") or "",
+                            "Description": f"From bank statement — {u.get('particulars', '')[:60]}",
+                        })
+                        st.session_state.bank_stmt_processed.add(i)
+                        count += 1
+                    st.session_state.bank_stmt_confirmation = f"📋 Moved {count} entries to suspense"
 
             st.divider()
             st.subheader("↔️ Split Entry Equally")
