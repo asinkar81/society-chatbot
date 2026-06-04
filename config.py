@@ -61,6 +61,9 @@ HISTORICAL_RECEIPTS_DIR = DATA_DIR / "Historical_Receipts"
 UPLOADS_DIR = DATA_DIR / "uploads"
 BILLS_DIR = DATA_DIR / "bills"
 
+MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB
+ALLOWED_UPLOAD_TYPES = {".jpg", ".jpeg", ".png", ".pdf", ".heic", ".webp"}
+
 # Bank statement storage
 BANK_STATEMENTS_DIR = DATA_DIR / "bank_statements"
 BACKUPS_DIR = DATA_DIR / "backups"
@@ -69,9 +72,6 @@ BANK_STMT_PASSWORD = os.getenv("BANK_STMT_PASSWORD", "")
 
 # Default format profile if autodetection fails
 DEFAULT_STMT_FORMAT = os.getenv("DEFAULT_STMT_FORMAT", "netbanking")
-
-MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB
-ALLOWED_UPLOAD_TYPES = {".jpg", ".jpeg", ".png", ".pdf", ".heic", ".webp"}
 
 # Ensure data directories exist
 DATA_DIR.mkdir(exist_ok=True)
