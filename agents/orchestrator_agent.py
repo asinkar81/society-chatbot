@@ -1286,12 +1286,12 @@ class OrchestratorAgent(BaseAgent):
                 return "Please provide the bank statement text (copy-pasted from the statement)."
 
             # Support JSON-wrapped input for passing options like generate_receipts
-            generate_receipts = True
+            generate_receipts = False
             if raw.strip().startswith("{"):
                 try:
                     parsed = json.loads(raw)
                     raw = parsed.get("statement", "")
-                    generate_receipts = parsed.get("generate_receipts", True)
+                    generate_receipts = parsed.get("generate_receipts", False)
                 except (json.JSONDecodeError, TypeError):
                     pass
 

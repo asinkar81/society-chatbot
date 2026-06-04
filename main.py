@@ -614,7 +614,7 @@ def show_dashboard_page():
             with pay_col1:
                 pay_date = st.text_input("Date (DD-MM-YYYY)", value="", key="pay_date", placeholder="e.g. 15-05-2026")
                 pay_amount = st.number_input("Amount (₹)", min_value=0.0, step=100.0, key="pay_amount")
-                pay_generate_receipt = st.checkbox("Generate Receipt PDF", value=True, key="pay_gen_rec")
+                pay_generate_receipt = st.checkbox("Generate Receipt PDF", value=False, key="pay_gen_rec")
             with pay_col2:
                 pay_particulars = st.text_input("Particulars", key="pay_particulars", placeholder="e.g. Maintenance payment")
                 pay_txn_type = st.selectbox("Transaction Type", ["NEFT", "UPI", "CHQ", "CASH", "IMPS", "RTGS", "Other"], key="pay_txn_type")
@@ -696,7 +696,7 @@ def show_dashboard_page():
 
         gen_receipts_checkbox = st.checkbox(
             "📄 Generate Receipt PDFs (uncheck to add ledger entries only)",
-            value=True, key="bs_gen_receipts",
+            value=False, key="bs_gen_receipts",
             help="When unchecked, only ledger entries are created. You can generate receipts later from the Receipts tab.",
         )
 
