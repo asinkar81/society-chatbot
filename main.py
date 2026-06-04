@@ -562,6 +562,49 @@ def _receipt_exists(entry: dict) -> str:
     return "no"
 
 
+def _generate_receipt_for_entry(dp, entry, member_id) -> Optional[str]:
+    """Generate a receipt PDF for a single credit ledger entry. Returns receipt_id or None."""
+    if _s(entry.get("Credit", 0)) <= 0:
+        return None
+    member = dp.get_member(member_id)
+    if not member:
+        return None
+    ref_id = _extract_ref_id(str(entry.get("Description", "")))
+    if not ref_id:
+        ref_id = _extract_ref_id(str(entry.get("Particulars", "")))
+    if not ref_id:
+        date_str = str(entry.get("Date", ""))
+        fy = get_fy_from_date(date_str)
+        vch_no = int(entry.get("Vch_No", 0))
+        ref_id = f"{fy}-{str(vch_no).zfill(3)}"
+        old_desc = str(entry.get("Description", "") or "")
+        new_desc = f"Receipt {ref_id}"
+        if old_desc.strip():
+            new_desc = f"{old_desc.strip()} Receipt {ref_id}"
+        dp.update_ledger_entry(member_id, vch_no, {"Description": new_desc})
+    if _get_pdf_path(config.RECEIPTS_DIR, ref_id):
+        return ref_id
+    date_str = str(entry.get("Date", "")) or get_current_date()
+    fy = get_fy_from_date(date_str[:10] if len(date_str) >= 10 else date_str)
+    plot_str = str(member.get("Plot_No", "") or "")
+    plot_part = f"Plot_No_{plot_str.zfill(2)}" if plot_str else "Unknown"
+    receipt_dir = config.RECEIPTS_DIR / fy
+    receipt_dir.mkdir(parents=True, exist_ok=True)
+    rpath = receipt_dir / f"Receipt_{plot_part}_{ref_id}.pdf"
+    receipt_data = {
+        "receipt_id": ref_id,
+        "date": date_str,
+        "member_name": member.get("Plot_Owner_Name", ""),
+        "plot_no": plot_str,
+        "amount": _s(entry.get("Credit")),
+        "transaction_id": str(entry.get("Transaction_ID", "") or "N/A"),
+        "transaction_type": str(entry.get("Transaction_Type", "") or ""),
+        "payment_details": clean_payment_details(str(entry.get("Particulars", "")))[:120],
+    }
+    success = create_simple_receipt_pdf(rpath, receipt_data)
+    return ref_id if success else None
+
+
 def _invoice_exists(entry: dict) -> str:
     """Return 'yes', 'no', or 'na' for a ledger entry's invoice status."""
     if _s(entry.get("Debit", 0)) <= 0:
@@ -1182,7 +1225,21 @@ def show_dashboard_page():
 
         missing_count = sum(1 for e in rec_filtered if _receipt_exists(e) == "no")
         if missing_count:
-            st.warning(f"⚠️ {missing_count} receipt{'s' if missing_count != 1 else ''} pending generation")
+            warn_cols = st.columns([3, 1])
+            with warn_cols[0]:
+                st.warning(f"⚠️ {missing_count} receipt{'s' if missing_count != 1 else ''} pending generation")
+            with warn_cols[1]:
+                if st.button("📄 Generate Missing", type="primary", use_container_width=True, key="rec_gen_missing"):
+                    gen_count = 0
+                    for e in rec_filtered:
+                        if _receipt_exists(e) == "no":
+                            if _generate_receipt_for_entry(data_provider, e, e["_mid"]):
+                                gen_count += 1
+                    if gen_count:
+                        st.success(f"✅ Generated {gen_count} missing receipt(s)")
+                    else:
+                        st.warning("No receipts could be generated")
+                    st.rerun()
 
         if rec_filtered:
             # ── Batch toolbar ──
