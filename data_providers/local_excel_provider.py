@@ -1,6 +1,7 @@
 """
 Local Excel-based implementation of DataProvider
 """
+import logging
 import pandas as pd
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -12,11 +13,18 @@ from data_providers.base_provider import DataProvider
 import config
 
 
+def _ensure_columns(df, entry_columns):
+    for col in entry_columns:
+        if col not in df.columns:
+            df[col] = None
+    return df
+
+
 class LocalExcelDataProvider(DataProvider):
     """Local Excel file-based data storage using openpyxl and pandas"""
 
     LEDGER_HEADERS = [
-        "Member_ID", "Date", "Particulars", "Vch_Type",
+        "Member_ID", "Plot_No", "Date", "Particulars", "Vch_Type",
         "Vch_No", "Debit", "Credit", "Description", "Transaction_ID",
         "Transaction_Type",
     ]
@@ -32,6 +40,19 @@ class LocalExcelDataProvider(DataProvider):
         "Tagged_To", "Tagged_Date",
     ]
 
+    EXPENSES_HEADERS = [
+        "ID", "Date", "Particulars", "Amount", "Category",
+        "Description", "Transaction_ID", "Entry_Date", "Member_ID",
+    ]
+
+    EXPENSE_CATEGORIES_HEADERS = [
+        "ID", "Name", "Parent",
+    ]
+
+    SPLIT_RULES_HEADERS = [
+        "ID", "Source_Member_ID", "Members",
+    ]
+
     def __init__(self, excel_file: Path = None):
         self.excel_file = excel_file or config.SOCIETY_DATA_FILE
         self.members_sheet = "Members"
@@ -39,12 +60,188 @@ class LocalExcelDataProvider(DataProvider):
         self.settings_sheet = "Settings"
         self.payment_refs_sheet = "Payment_References"
         self.suspense_sheet = "Suspense_Entries"
+        self.expenses_sheet = "Expenses"
+        self.expense_categories_sheet = "Expense_Categories"
+        self.split_rules_sheet = "Split_Rules"
         self._ensure_workbook_exists()
         self._ensure_payment_refs_sheet_exists()
         self._ensure_suspense_sheet_exists()
+        self._ensure_sheet(self.expenses_sheet, self.EXPENSES_HEADERS)
+        self._ensure_sheet(self.expense_categories_sheet, self.EXPENSE_CATEGORIES_HEADERS)
+        self._ensure_sheet(self.split_rules_sheet, self.SPLIT_RULES_HEADERS)
+        self._seed_default_categories()
+        self._migrate_members_schema()
+        self._migrate_expenses_schema()
+        self._migrate_single_ledger()
+        self._remove_current_outstanding_column()
+        self._ensure_reports_sheet()
+        self._ensure_processed_statements_sheet()
+        self._cache = None
+
+    # ── Cache ──────────────────────────────────────────────────────────────
+
+    def _load_cache(self):
+        if self._cache is not None:
+            return
+        try:
+            mdf = pd.read_excel(self.excel_file, sheet_name=self.members_sheet)
+            ldf = pd.read_excel(self.excel_file, sheet_name=self.ledger_sheet)
+        except Exception:
+            logging.exception("Failed to load cache")
+            self._cache = {"members_list": [], "members_by_id": {}, "ledger_by_mid": {}}
+            return
+        cache = {}
+        cache["members_list"] = mdf.to_dict("records")
+        cache["members_by_id"] = {m["ID"]: m for m in cache["members_list"]}
+        for m in cache["members_list"]:
+            m.setdefault("WhatsApp_No", "")
+        ledger_by_mid = {}
+        for _, row in ldf.iterrows():
+            plot_no = row.get("Plot_No")
+            if pd.isna(plot_no):
+                continue
+            mid = int(plot_no)
+            if mid not in ledger_by_mid:
+                ledger_by_mid[mid] = []
+            entry = row.to_dict()
+            for k, v in entry.items():
+                if isinstance(v, float) and v != v:
+                    entry[k] = 0.0
+            ledger_by_mid[mid].append(entry)
+        cache["ledger_by_mid"] = ledger_by_mid
+        self._cache = cache
+
+    def _invalidate_cache(self):
+        self._cache = None
+
+    # ── Schema migrations ─────────────────────────────────────────────────
+
+    def _migrate_members_schema(self):
+        try:
+            df = pd.read_excel(self.excel_file, sheet_name=self.members_sheet)
+            changed = False
+            if "WhatsApp_No" not in df.columns:
+                df["WhatsApp_No"] = ""
+                changed = True
+            if changed:
+                self._write_sheet(df, self.members_sheet)
+        except Exception as e:
+            logging.warning(f"Member schema migration: {e}")
+
+    def _migrate_expenses_schema(self):
+        try:
+            df = pd.read_excel(self.excel_file, sheet_name=self.expenses_sheet)
+            changed = False
+            if "Transaction_Type" not in df.columns:
+                df["Transaction_Type"] = ""
+                changed = True
+            if changed:
+                self._write_sheet(df, self.expenses_sheet)
+        except Exception as e:
+            logging.warning(f"Expenses schema migration: {e}")
+
+    def _backup_file(self, label: str = ""):
+        import shutil
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        suffix = f"_{label}" if label else ""
+        backup_path = config.BACKUPS_DIR / f"society_data_{ts}{suffix}.xlsx"
+        shutil.copy2(self.excel_file, backup_path)
+        logging.info(f"Backed up to {backup_path}")
+
+    def _migrate_single_ledger(self):
+        import re
+        wb = openpyxl.load_workbook(self.excel_file)
+        if "Ledger" in wb.sheetnames:
+            ws = wb["Ledger"]
+            headers = [cell.value for cell in ws[1]]
+            if "Plot_No" in headers:
+                wb.close()
+                return
+        wb.close()
+        self._backup_file("pre_migration_single_ledger")
+        master_df = pd.read_excel(self.excel_file, sheet_name=self.ledger_sheet)
+        if "Plot_No" not in master_df.columns:
+            master_df["Plot_No"] = None
+        wb = openpyxl.load_workbook(self.excel_file)
+        for sheet_name in list(wb.sheetnames):
+            if re.match(r"^Plot_No_\d+$", sheet_name):
+                plot_num = int(sheet_name.split("_")[-1])
+                pdf = pd.read_excel(self.excel_file, sheet_name=sheet_name)
+                if pdf.empty:
+                    continue
+                pdf["Plot_No"] = plot_num
+                for _, row in pdf.iterrows():
+                    match = (
+                        (master_df["Date"] == row.get("Date"))
+                        & (master_df["Particulars"] == row.get("Particulars"))
+                        & (master_df["Vch_No"] == row.get("Vch_No"))
+                        & (master_df["Credit"].fillna(0) == float(row.get("Credit", 0) or 0))
+                        & (master_df["Debit"].fillna(0) == float(row.get("Debit", 0) or 0))
+                    )
+                    if not match.any():
+                        master_df = pd.concat([master_df, pd.DataFrame([row])], ignore_index=True)
+        for sheet_name in list(wb.sheetnames):
+            if re.match(r"^Plot_No_\d+$", sheet_name):
+                del wb[sheet_name]
+        wb.close()
+        self._write_sheet(master_df, self.ledger_sheet)
+
+    def _remove_current_outstanding_column(self):
+        wb = openpyxl.load_workbook(self.excel_file)
+        if "Members" not in wb.sheetnames:
+            wb.close()
+            return
+        ws = wb["Members"]
+        headers = [cell.value for cell in ws[1]]
+        if "Current_Outstanding" not in headers:
+            wb.close()
+            return
+        col_idx = headers.index("Current_Outstanding") + 1
+        ws.delete_cols(col_idx)
+        wb.save(self.excel_file)
+        wb.close()
+
+    def _ensure_reports_sheet(self):
+        wb = openpyxl.load_workbook(self.excel_file)
+        if "Reports" in wb.sheetnames:
+            wb.close()
+            return
+        ws = wb.create_sheet("Reports")
+        ws.cell(row=1, column=1, value="Plot_No")
+        ws.cell(row=1, column=2, value="Owner_Name")
+        ws.cell(row=1, column=3, value="Current_Outstanding")
+        ws.cell(row=1, column=4, value="Generated_At")
+        wb.save(self.excel_file)
+        wb.close()
+
+    def _ensure_processed_statements_sheet(self):
+        wb = openpyxl.load_workbook(self.excel_file)
+        if "Processed_Statements" in wb.sheetnames:
+            wb.close()
+            return
+        ws = wb.create_sheet("Processed_Statements")
+        for col_idx, col_name in enumerate(
+            ["Filename", "Date_Range", "Processed_At", "Entry_Count", "Format", "File_Hash"], 1
+        ):
+            ws.cell(row=1, column=col_idx, value=col_name)
+        wb.save(self.excel_file)
+        wb.close()
+
+    def _ensure_sheet(self, sheet_name, headers):
+        try:
+            wb = openpyxl.load_workbook(self.excel_file)
+            if sheet_name not in wb.sheetnames:
+                ws = wb.create_sheet(sheet_name)
+                ws.append(headers)
+                wb.save(self.excel_file)
+            wb.close()
+        except Exception:
+            pass
+
+    # ── Payment refs / Suspense sheet helpers ─────────────────────────────
 
     def _ensure_payment_refs_sheet_exists(self):
-        """Create Payment_References sheet if it doesn't exist in existing workbook."""
         try:
             wb = openpyxl.load_workbook(self.excel_file)
             if self.payment_refs_sheet not in wb.sheetnames:
@@ -56,7 +253,6 @@ class LocalExcelDataProvider(DataProvider):
             pass
 
     def _ensure_suspense_sheet_exists(self):
-        """Create Suspense_Entries sheet if it doesn't exist."""
         try:
             wb = openpyxl.load_workbook(self.excel_file)
             if self.suspense_sheet not in wb.sheetnames:
@@ -67,12 +263,24 @@ class LocalExcelDataProvider(DataProvider):
         except Exception:
             pass
 
+    def _seed_default_categories(self):
+        defaults = [
+            "Maintenance", "Repairs", "Utilities", "Salaries", "Other",
+            "Repair & Maintenance", "Service Charges", "Sinking Fund", "Interest",
+        ]
+        try:
+            existing = self.get_expense_categories()
+            existing_names = {c["Name"] for c in existing}
+            for name in defaults:
+                if name not in existing_names:
+                    self.add_expense_category(name)
+        except Exception:
+            pass
+
     def _plot_ledger_sheet(self, plot_no) -> str:
-        """Get the ledger sheet name for a given plot number."""
         return f"Ledger_Plot_{str(plot_no).zfill(2)}"
 
     def _get_or_create_plot_ledger_sheet(self, member_id: int, plot_no=None) -> str:
-        """Ensure a per-plot ledger sheet exists for the member."""
         if plot_no is None:
             member = self.get_member(member_id)
             if not member:
@@ -89,7 +297,6 @@ class LocalExcelDataProvider(DataProvider):
         return sheet_name
 
     def _ensure_workbook_exists(self):
-        """Create workbook with required sheets if it doesn't exist"""
         if not self.excel_file.exists():
             wb = openpyxl.Workbook()
             wb.remove(wb.active)
@@ -97,7 +304,7 @@ class LocalExcelDataProvider(DataProvider):
             ws_members = wb.create_sheet(self.members_sheet)
             ws_members.append([
                 "ID", "Plot_No", "Plot_Owner_Name", "Email",
-                "Phone", "Current_Outstanding", "Pending_Interest",
+                "Phone", "Pending_Interest",
             ])
 
             ws_ledger = wb.create_sheet(self.ledger_sheet)
@@ -120,21 +327,17 @@ class LocalExcelDataProvider(DataProvider):
 
             wb.save(self.excel_file)
 
+    # ── Members ────────────────────────────────────────────────────────────
+
     def get_all_members(self) -> List[Dict[str, Any]]:
-        """Fetch all members from Excel"""
-        df = pd.read_excel(self.excel_file, sheet_name=self.members_sheet)
-        return df.to_dict("records")
+        self._load_cache()
+        return self._cache["members_list"]
 
     def get_member(self, member_id: int) -> Optional[Dict[str, Any]]:
-        """Fetch a specific member by ID"""
-        df = pd.read_excel(self.excel_file, sheet_name=self.members_sheet)
-        member = df[df["ID"] == member_id]
-        if member.empty:
-            return None
-        return member.iloc[0].to_dict()
+        self._load_cache()
+        return self._cache["members_by_id"].get(member_id)
 
     def get_member_by_plot_no(self, plot_no: str) -> Optional[Dict[str, Any]]:
-        """Fetch member by plot number"""
         df = pd.read_excel(self.excel_file, sheet_name=self.members_sheet)
         member = df[df["Plot_No"].astype(str) == str(plot_no).zfill(2)]
         if member.empty:
@@ -142,7 +345,6 @@ class LocalExcelDataProvider(DataProvider):
         return member.iloc[0].to_dict()
 
     def add_member(self, member_data: Dict[str, Any]) -> int:
-        """Add a new member and create their per-plot ledger sheet"""
         df = pd.read_excel(self.excel_file, sheet_name=self.members_sheet)
         max_id = df["ID"].max() if len(df) > 0 else 0
         new_id = int(max_id) + 1
@@ -150,15 +352,12 @@ class LocalExcelDataProvider(DataProvider):
         new_row = pd.DataFrame([member_data])
         df = pd.concat([df, new_row], ignore_index=True)
         self._write_sheet(df, self.members_sheet)
-
-        # Create per-plot ledger sheet
+        self._invalidate_cache()
         plot_no = member_data.get("Plot_No", str(new_id))
         self._get_or_create_plot_ledger_sheet(new_id, str(plot_no))
-
         return new_id
 
     def update_member(self, member_id: int, member_data: Dict[str, Any]) -> bool:
-        """Update member details"""
         df = pd.read_excel(self.excel_file, sheet_name=self.members_sheet)
         mask = df["ID"] == member_id
         if not mask.any():
@@ -166,19 +365,22 @@ class LocalExcelDataProvider(DataProvider):
         for key, value in member_data.items():
             df.loc[mask, key] = value
         self._write_sheet(df, self.members_sheet)
+        self._invalidate_cache()
         return True
 
     def _get_plot_no(self, member_id: int) -> str:
-        """Get plot number string for a member."""
         member = self.get_member(member_id)
         return str(member.get("Plot_No", member_id)) if member else str(member_id)
 
+    # ── Ledger ─────────────────────────────────────────────────────────────
+
     def get_member_ledger(self, member_id: int) -> List[Dict[str, Any]]:
-        """Fetch complete ledger for a member from their per-plot sheet"""
+        self._load_cache()
+        cached = self._cache["ledger_by_mid"].get(member_id)
+        if cached is not None:
+            return cached
         plot_no = self._get_plot_no(member_id)
         sheet_name = self._plot_ledger_sheet(plot_no)
-
-        # Try per-plot sheet first
         try:
             df = pd.read_excel(self.excel_file, sheet_name=sheet_name)
             entries = df[df["Member_ID"] == member_id].to_dict("records")
@@ -186,8 +388,6 @@ class LocalExcelDataProvider(DataProvider):
                 return entries
         except Exception:
             pass
-
-        # Fall back to main Ledger sheet and populate per-plot sheet
         df = pd.read_excel(self.excel_file, sheet_name=self.ledger_sheet)
         member_ledger = df[df["Member_ID"] == member_id]
         if not member_ledger.empty:
@@ -196,25 +396,14 @@ class LocalExcelDataProvider(DataProvider):
         return member_ledger.to_dict("records")
 
     def add_ledger_entry(self, member_id: int, entry: Dict[str, Any]) -> bool:
-        """Add a transaction entry to member's ledger (writes to both per-plot and main sheets)"""
         entry["Member_ID"] = member_id
-
-        def _ensure_columns(df, entry_columns):
-            """Add any missing columns from entry to df to avoid data loss on concat."""
-            for col in entry_columns:
-                if col not in df.columns:
-                    df[col] = None
-            return df
-
         entry_df = pd.DataFrame([entry])
-
-        # Write to main Ledger sheet
         df = pd.read_excel(self.excel_file, sheet_name=self.ledger_sheet)
         df = _ensure_columns(df, entry_df.columns)
         df = pd.concat([df, entry_df.reindex(columns=df.columns)], ignore_index=True)
         self._write_sheet(df, self.ledger_sheet)
+        self._invalidate_cache()
 
-        # Write to per-plot sheet
         plot_no = self._get_plot_no(member_id)
         sheet_name = self._get_or_create_plot_ledger_sheet(member_id, plot_no)
         try:
@@ -224,33 +413,133 @@ class LocalExcelDataProvider(DataProvider):
         pdf = _ensure_columns(pdf, entry_df.columns)
         pdf = pd.concat([pdf, entry_df.reindex(columns=pdf.columns)], ignore_index=True)
         self._write_sheet(pdf, sheet_name)
+        self._invalidate_cache()
+
+        o = self.get_current_outstanding(member_id)
+        self.update_member(member_id, {"Current_Outstanding": o})
 
         return True
+
+    def add_ledger_entries(self, entries: List[tuple]) -> int:
+        mid_entry_groups = []
+        for member_id, entry in entries:
+            entry["Member_ID"] = member_id
+            mid_entry_groups.append((member_id, entry))
+
+        df = pd.read_excel(self.excel_file, sheet_name=self.ledger_sheet)
+        plot_dfs = {}
+        for member_id, entry in mid_entry_groups:
+            entry_df = pd.DataFrame([entry])
+            df = _ensure_columns(df, entry_df.columns)
+            df = pd.concat([df, entry_df.reindex(columns=df.columns)], ignore_index=True)
+
+            plot_no = self._get_plot_no(member_id)
+            sheet_name = self._plot_ledger_sheet(plot_no)
+            if sheet_name not in plot_dfs:
+                try:
+                    plot_dfs[sheet_name] = pd.read_excel(self.excel_file, sheet_name=sheet_name)
+                except Exception:
+                    plot_dfs[sheet_name] = pd.DataFrame(columns=self.LEDGER_HEADERS)
+            pdf = plot_dfs[sheet_name]
+            pdf = _ensure_columns(pdf, entry_df.columns)
+            pdf = pd.concat([pdf, entry_df.reindex(columns=pdf.columns)], ignore_index=True)
+            plot_dfs[sheet_name] = pdf
+
+        self._write_sheet(df, self.ledger_sheet)
+        for sheet_name, pdf in plot_dfs.items():
+            self._write_sheet(pdf, sheet_name)
+        self._invalidate_cache()
+
+        for member_id, _ in mid_entry_groups:
+            o = self.get_current_outstanding(member_id)
+            self.update_member(member_id, {"Current_Outstanding": o})
+
+        return len(entries)
 
     def get_ledger_entries(
         self, member_id: int, start_date: Optional[datetime] = None, end_date: Optional[datetime] = None
     ) -> List[Dict[str, Any]]:
-        """Fetch ledger entries for a date range"""
         df = pd.read_excel(self.excel_file, sheet_name=self.ledger_sheet)
         df = df[df["Member_ID"] == member_id]
-
         if start_date or end_date:
             df["Date"] = pd.to_datetime(df["Date"], format="%d-%m-%Y", errors="coerce")
             if start_date:
                 df = df[df["Date"] >= start_date]
             if end_date:
                 df = df[df["Date"] <= end_date]
-
         return df.to_dict("records")
 
+    def update_ledger_entry(self, member_id: int, vch_no: int, updates: Dict[str, Any]) -> bool:
+        updated = False
+
+        def _update(df, col, val):
+            nonlocal updated
+            mask = df[col] == val
+            if mask.any():
+                for key, value in updates.items():
+                    df.loc[mask, key] = value
+                updated = True
+            return df
+
+        plot_no = self._get_plot_no(member_id)
+        sheet_name = self._plot_ledger_sheet(plot_no)
+        try:
+            pdf = pd.read_excel(self.excel_file, sheet_name=sheet_name)
+            pdf = _update(pdf, "Vch_No", vch_no)
+            self._write_sheet(pdf, sheet_name)
+        except Exception:
+            pass
+
+        df = pd.read_excel(self.excel_file, sheet_name=self.ledger_sheet)
+        df = _update(df, "Vch_No", vch_no)
+        self._write_sheet(df, self.ledger_sheet)
+
+        if updated:
+            self._invalidate_cache()
+            o = self.get_current_outstanding(member_id)
+            self.update_member(member_id, {"Current_Outstanding": o})
+
+        return updated
+
+    def delete_ledger_entry(self, member_id: int, vch_no: int) -> bool:
+        deleted = False
+
+        def _remove_row(df, col, val):
+            nonlocal deleted
+            mask = df[col] == val
+            if mask.any():
+                df = df[~mask].reset_index(drop=True)
+                deleted = True
+            return df
+
+        plot_no = self._get_plot_no(member_id)
+        sheet_name = self._plot_ledger_sheet(plot_no)
+        try:
+            pdf = pd.read_excel(self.excel_file, sheet_name=sheet_name)
+            pdf = _remove_row(pdf, "Vch_No", vch_no)
+            self._write_sheet(pdf, sheet_name)
+        except Exception:
+            pass
+
+        df = pd.read_excel(self.excel_file, sheet_name=self.ledger_sheet)
+        df = _remove_row(df, "Vch_No", vch_no)
+        self._write_sheet(df, self.ledger_sheet)
+
+        if deleted:
+            self._invalidate_cache()
+            o = self.get_current_outstanding(member_id)
+            self.update_member(member_id, {"Current_Outstanding": o})
+
+        return deleted
+
+    # ── Settings ───────────────────────────────────────────────────────────
+
     def get_settings(self) -> Dict[str, Any]:
-        """Fetch system settings"""
         df = pd.read_excel(self.excel_file, sheet_name=self.settings_sheet)
         settings = {}
         for _, row in df.iterrows():
             key = row["Key"]
             value = row["Value"]
-            # Try to convert to appropriate type
             if isinstance(value, str):
                 if value.isdigit():
                     settings[key] = int(value)
@@ -263,7 +552,6 @@ class LocalExcelDataProvider(DataProvider):
         return settings
 
     def update_settings(self, settings: Dict[str, Any]) -> bool:
-        """Update system settings"""
         df = pd.read_excel(self.excel_file, sheet_name=self.settings_sheet)
         for key, value in settings.items():
             mask = df["Key"] == key
@@ -273,54 +561,65 @@ class LocalExcelDataProvider(DataProvider):
                 new_row = pd.DataFrame([{"Key": key, "Value": value}])
                 df = pd.concat([df, new_row], ignore_index=True)
         self._write_sheet(df, self.settings_sheet)
+        self._invalidate_cache()
         return True
 
     def get_next_voucher_number(self) -> int:
-        """Get next sequential voucher number"""
         settings = self.get_settings()
         last_vch = int(settings.get("Last_Voucher_No", 0))
         next_vch = last_vch + 1
         self.update_settings({"Last_Voucher_No": str(next_vch)})
         return next_vch
 
+    def get_next_voucher_numbers(self, count: int) -> List[int]:
+        settings = self.get_settings()
+        last_vch = int(settings.get("Last_Voucher_No", 0))
+        numbers = list(range(last_vch + 1, last_vch + count + 1))
+        self.update_settings({"Last_Voucher_No": str(numbers[-1])})
+        return numbers
+
+    # ── Outstanding ────────────────────────────────────────────────────────
+
     @staticmethod
     def _safe_float(val) -> float:
-        """Convert a value to float, treating NaN/None as 0."""
         if val is None:
             return 0.0
         try:
             v = float(val)
-            return 0.0 if v != v else v  # NaN check
+            return 0.0 if v != v else v
         except (ValueError, TypeError):
             return 0.0
 
     def get_current_outstanding(self, member_id: int) -> float:
-        """Calculate current outstanding for a member.
-        
-        Convention: Credit = payment received (+), Debit = demand charged (-)
-        Outstanding = total_credit - total_debit
-        Positive = surplus (member overpaid), Negative = demand due (member owes)
-        
-        Falls back to the stored Current_Outstanding (negated for old convention)
-        when no ledger entries exist.
-        """
         ledger = self.get_member_ledger(member_id)
         if ledger:
             total_credit = sum(self._safe_float(e.get("Credit")) for e in ledger)
             total_debit = sum(self._safe_float(e.get("Debit")) for e in ledger)
             return total_credit - total_debit
-        # No entries yet — use stored value (negate: old debit-credit → new credit-debit)
         member = self.get_member(member_id)
         if member:
             return -float(member.get("Current_Outstanding", 0) or 0)
         return 0.0
 
+    def refresh_all_outstandings(self) -> int:
+        members = self.get_all_members()
+        count = 0
+        errors = 0
+        for m in members:
+            try:
+                o = self.get_current_outstanding(m["ID"])
+                self.update_member(m["ID"], {"Current_Outstanding": o})
+                count += 1
+            except Exception:
+                errors += 1
+        self._invalidate_cache()
+        if errors:
+            logging.warning(f"refresh_all_outstandings: {errors}/{len(members)} members failed")
+        return count
+
+    # ── Payment References ─────────────────────────────────────────────────
+
     def record_payment_reference(self, member_id: int, identifier_type: str, identifier_value: str, date: str = None):
-        """Store or update a known payment identifier for a member.
-        
-        identifier_type: UPI_ID, MOBILE, PAYEE_NAME, EMAIL, TRANSACTION_ID, TRANSACTION_TYPE
-        identifier_value: the actual value (e.g. 'rameshdhebe070', '9422318440', 'SHWETA S')
-        """
         if not identifier_value or not identifier_type:
             return
         val = str(identifier_value).strip()
@@ -349,43 +648,7 @@ class LocalExcelDataProvider(DataProvider):
 
         self._write_sheet(df, self.payment_refs_sheet)
 
-    def delete_ledger_entry(self, member_id: int, vch_no: int) -> bool:
-        """Remove a ledger entry by member ID and voucher number from both main
-        and per-plot sheets. Recalculates and updates the member's outstanding balance."""
-        deleted = False
-
-        def _remove_row(df, col, val):
-            nonlocal deleted
-            mask = df[col] == val
-            if mask.any():
-                df = df[~mask].reset_index(drop=True)
-                deleted = True
-            return df
-
-        # Remove from per-plot sheet
-        plot_no = self._get_plot_no(member_id)
-        sheet_name = self._plot_ledger_sheet(plot_no)
-        try:
-            pdf = pd.read_excel(self.excel_file, sheet_name=sheet_name)
-            pdf = _remove_row(pdf, "Vch_No", vch_no)
-            self._write_sheet(pdf, sheet_name)
-        except Exception:
-            pass
-
-        # Remove from main Ledger sheet
-        df = pd.read_excel(self.excel_file, sheet_name=self.ledger_sheet)
-        df = _remove_row(df, "Vch_No", vch_no)
-        self._write_sheet(df, self.ledger_sheet)
-
-        if deleted:
-            o = self.get_current_outstanding(member_id)
-            self.update_member(member_id, {"Current_Outstanding": o})
-
-        return deleted
-
     def find_member_by_identifier(self, identifier_value: str) -> Optional[Dict[str, Any]]:
-        """Look up a member by any known payment identifier (UPI ID, mobile, email, payee name).
-        Returns the best-confidence match or None."""
         if not identifier_value:
             return None
         val = str(identifier_value).strip().upper()
@@ -404,7 +667,6 @@ class LocalExcelDataProvider(DataProvider):
         return self.get_member(int(best["Member_ID"]))
 
     def get_known_identifiers(self, member_id: int, min_confidence: int = 1) -> List[Dict[str, str]]:
-        """Get all known payment identifiers for a member with confidence >= threshold."""
         try:
             df = pd.read_excel(self.excel_file, sheet_name=self.payment_refs_sheet)
         except Exception:
@@ -414,10 +676,39 @@ class LocalExcelDataProvider(DataProvider):
         member_refs = df[(df["Member_ID"] == member_id) & (df["Confidence"] >= min_confidence)]
         return member_refs.to_dict("records")
 
-    # ── Suspense Entries ──────────────────────────────────────────────
+    def get_all_identifiers(self, id_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        try:
+            df = pd.read_excel(self.excel_file, sheet_name=self.payment_refs_sheet)
+        except Exception:
+            return []
+        if df.empty:
+            return []
+        if id_type:
+            df = df[df["Identifier_Type"] == id_type]
+        return df.to_dict("records")
+
+    def delete_identifier(self, ref_id: int) -> bool:
+        try:
+            df = pd.read_excel(self.excel_file, sheet_name=self.payment_refs_sheet)
+        except Exception:
+            return False
+        if df.empty:
+            return False
+        before = len(df)
+        df = df.drop(index=ref_id).reset_index(drop=True) if ref_id < len(df) else df
+        if len(df) == before:
+            return False
+        self._write_sheet(df, self.payment_refs_sheet)
+        return True
+
+    def add_identifier(self, member_id: int, id_type: str, id_value: str,
+                       date: str = None, confidence: int = 1) -> int:
+        self.record_payment_reference(member_id, id_type, id_value, date)
+        return 0
+
+    # ── Suspense Entries ──────────────────────────────────────────────────
 
     def add_suspense_entry(self, entry: Dict[str, Any]) -> int:
-        """Add an entry to Suspense_Entries sheet. Returns the new entry ID."""
         self._ensure_suspense_sheet_exists()
         try:
             df = pd.read_excel(self.excel_file, sheet_name=self.suspense_sheet)
@@ -438,7 +729,6 @@ class LocalExcelDataProvider(DataProvider):
         return new_id
 
     def get_suspense_entries(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Fetch suspense entries, optionally filtered by status."""
         self._ensure_suspense_sheet_exists()
         try:
             df = pd.read_excel(self.excel_file, sheet_name=self.suspense_sheet)
@@ -451,7 +741,6 @@ class LocalExcelDataProvider(DataProvider):
         return df.to_dict("records")
 
     def tag_suspense_entry(self, entry_id: int, member_id: int) -> bool:
-        """Tag a suspense entry to a member (Status → Tagged)."""
         try:
             df = pd.read_excel(self.excel_file, sheet_name=self.suspense_sheet)
         except Exception:
@@ -471,7 +760,6 @@ class LocalExcelDataProvider(DataProvider):
         return True
 
     def delete_suspense_entry(self, entry_id: int) -> bool:
-        """Remove a suspense entry by ID."""
         try:
             df = pd.read_excel(self.excel_file, sheet_name=self.suspense_sheet)
         except Exception:
@@ -485,13 +773,168 @@ class LocalExcelDataProvider(DataProvider):
         self._write_sheet(df.reset_index(drop=True), self.suspense_sheet)
         return True
 
-    # ── Ledger duplicate check ────────────────────────────────────────
+    # ── Expenses ───────────────────────────────────────────────────────────
+
+    def add_expense(self, entry: Dict[str, Any]) -> int:
+        try:
+            df = pd.read_excel(self.excel_file, sheet_name=self.expenses_sheet)
+        except Exception:
+            df = pd.DataFrame(columns=self.EXPENSES_HEADERS)
+        new_id = int(df["ID"].max()) + 1 if not df.empty and "ID" in df.columns else 1
+        entry["ID"] = new_id
+        entry["Entry_Date"] = entry.get("Entry_Date", datetime.now().strftime("%d-%m-%Y %H:%M"))
+        row = pd.DataFrame([{h: entry.get(h, "") for h in self.EXPENSES_HEADERS}])
+        if df.empty:
+            df = row
+        else:
+            df = pd.concat([df, row], ignore_index=True)
+        self._write_sheet(df, self.expenses_sheet)
+        return new_id
+
+    def get_expenses(self, member_id: Optional[int] = None, from_date: Optional[str] = None,
+                     to_date: Optional[str] = None, category: Optional[str] = None,
+                     search: Optional[str] = None) -> List[Dict[str, Any]]:
+        try:
+            df = pd.read_excel(self.excel_file, sheet_name=self.expenses_sheet)
+        except Exception:
+            return []
+        if df.empty:
+            return []
+        if member_id is not None:
+            df = df[df["Member_ID"] == member_id]
+        if from_date:
+            df = df[df["Date"] >= from_date]
+        if to_date:
+            df = df[df["Date"] <= to_date]
+        if category:
+            df = df[df["Category"] == category]
+        if search:
+            df = df[df.apply(lambda r: search.lower() in str(r.get("Particulars", "")).lower(), axis=1)]
+        return df.to_dict("records")
+
+    def delete_expense(self, expense_id: int) -> bool:
+        try:
+            df = pd.read_excel(self.excel_file, sheet_name=self.expenses_sheet)
+        except Exception:
+            return False
+        if df.empty or "ID" not in df.columns:
+            return False
+        before = len(df)
+        df = df[df["ID"] != expense_id]
+        if len(df) == before:
+            return False
+        self._write_sheet(df.reset_index(drop=True), self.expenses_sheet)
+        return True
+
+    def get_expense_summary(self, fy: str) -> Dict[str, float]:
+        try:
+            df = pd.read_excel(self.excel_file, sheet_name=self.expenses_sheet)
+        except Exception:
+            return {}
+        if df.empty:
+            return {}
+        summary = df.groupby("Category")["Amount"].sum().to_dict()
+        return {str(k): float(v) for k, v in summary.items()}
+
+    # ── Expense Categories ────────────────────────────────────────────────
+
+    def get_expense_categories(self, parent: Optional[str] = None) -> List[Dict[str, Any]]:
+        try:
+            df = pd.read_excel(self.excel_file, sheet_name=self.expense_categories_sheet)
+        except Exception:
+            return []
+        if df.empty:
+            return []
+        if parent:
+            df = df[df["Parent"] == parent]
+        return df.to_dict("records")
+
+    def add_expense_category(self, name: str, parent: Optional[str] = None) -> int:
+        try:
+            df = pd.read_excel(self.excel_file, sheet_name=self.expense_categories_sheet)
+        except Exception:
+            df = pd.DataFrame(columns=self.EXPENSE_CATEGORIES_HEADERS)
+        new_id = int(df["ID"].max()) + 1 if not df.empty and "ID" in df.columns else 1
+        row = pd.DataFrame([{"ID": new_id, "Name": name, "Parent": parent}])
+        if df.empty:
+            df = row
+        else:
+            df = pd.concat([df, row], ignore_index=True)
+        self._write_sheet(df, self.expense_categories_sheet)
+        return new_id
+
+    def delete_expense_category(self, category_id: int) -> bool:
+        try:
+            df = pd.read_excel(self.excel_file, sheet_name=self.expense_categories_sheet)
+        except Exception:
+            return False
+        if df.empty or "ID" not in df.columns:
+            return False
+        before = len(df)
+        df = df[df["ID"] != category_id]
+        if len(df) == before:
+            return False
+        self._write_sheet(df.reset_index(drop=True), self.expense_categories_sheet)
+        return True
+
+    # ── Split Rules ────────────────────────────────────────────────────────
+
+    def get_split_rules(self) -> List[Dict[str, Any]]:
+        try:
+            df = pd.read_excel(self.excel_file, sheet_name=self.split_rules_sheet)
+        except Exception:
+            return []
+        if df.empty:
+            return []
+        return df.to_dict("records")
+
+    def add_split_rule(self, source_member_id: int, member_ids: List[int]) -> int:
+        try:
+            df = pd.read_excel(self.excel_file, sheet_name=self.split_rules_sheet)
+        except Exception:
+            df = pd.DataFrame(columns=self.SPLIT_RULES_HEADERS)
+        new_id = int(df["ID"].max()) + 1 if not df.empty and "ID" in df.columns else 1
+        member_ids_str = ",".join(str(m) for m in member_ids)
+        row = pd.DataFrame([{
+            "ID": new_id,
+            "Source_Member_ID": source_member_id,
+            "Members": member_ids_str,
+        }])
+        if df.empty:
+            df = row
+        else:
+            df = pd.concat([df, row], ignore_index=True)
+        self._write_sheet(df, self.split_rules_sheet)
+        return new_id
+
+    def delete_split_rule(self, rule_id: int) -> bool:
+        try:
+            df = pd.read_excel(self.excel_file, sheet_name=self.split_rules_sheet)
+        except Exception:
+            return False
+        if df.empty or "ID" not in df.columns:
+            return False
+        before = len(df)
+        df = df[df["ID"] != rule_id]
+        if len(df) == before:
+            return False
+        self._write_sheet(df.reset_index(drop=True), self.split_rules_sheet)
+        return True
+
+    def get_split_group_for_member(self, member_id: int) -> Optional[List[int]]:
+        rules = self.get_split_rules()
+        for r in rules:
+            if int(r["Source_Member_ID"]) == member_id:
+                ids_str = str(r.get("Members", ""))
+                if ids_str:
+                    return [int(x.strip()) for x in ids_str.split(",") if x.strip()]
+        return None
+
+    # ── Ledger duplicate check ────────────────────────────────────────────
 
     def check_duplicate_ledger_entry(
         self, txn_id: str, date: str, amount: float, particulars: str = ""
     ) -> Optional[Dict[str, Any]]:
-        """Check if an entry with the same Transaction_ID (+ date + amount) exists
-        in ANY member's ledger. Returns the matching entry or None."""
         try:
             df = pd.read_excel(self.excel_file, sheet_name=self.ledger_sheet)
         except Exception:
@@ -499,25 +942,41 @@ class LocalExcelDataProvider(DataProvider):
         if df.empty:
             return None
         txn_clean = str(txn_id or "").strip()
-        part_clean = str(particulars or "").strip()[:40]
+        raw_part = str(particulars or "").strip()
+        part_clean = raw_part[3:] if raw_part.upper().startswith("BY ") else raw_part
+        part_clean = part_clean[:40].upper()
         for _, e in df.iterrows():
+            e_part_upper = str(e.get("Particulars", "") or "").upper()
+            if "SPLIT FROM" in e_part_upper:
+                continue
             e_date = str(e.get("Date", "") or "").strip()
             e_credit = float(e.get("Credit", 0) or 0)
             if e_date != date or abs(e_credit - amount) > 0.01:
                 continue
             e_txn = str(e.get("Transaction_ID", "") or "").strip()
-            # Primary: match by Transaction_ID
             if txn_clean and e_txn == txn_clean:
                 return e.to_dict()
-            # Fallback: match by particulars prefix
             e_part = str(e.get("Particulars", "") or "").strip()
             e_part_clean = e_part[3:] if e_part.upper().startswith("BY ") else e_part
-            e_part_clean = e_part_clean[:40]
+            e_part_clean = e_part_clean[:40].upper()
             if part_clean and e_part_clean and (part_clean in e_part_clean or e_part_clean in part_clean):
                 return e.to_dict()
         return None
 
+    # ── I/O ────────────────────────────────────────────────────────────────
+
     def _write_sheet(self, df: pd.DataFrame, sheet_name: str):
-        """Write dataframe to Excel sheet"""
-        with pd.ExcelWriter(self.excel_file, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
-            df.to_excel(writer, sheet_name=sheet_name, index=False)
+        wb = openpyxl.load_workbook(self.excel_file)
+        if sheet_name in wb.sheetnames:
+            del wb[sheet_name]
+        ws = wb.create_sheet(sheet_name)
+        for col_idx, col_name in enumerate(df.columns, 1):
+            ws.cell(row=1, column=col_idx, value=col_name)
+        for row_idx in range(len(df)):
+            for col_idx, col_name in enumerate(df.columns, 1):
+                val = df.iloc[row_idx, col_idx - 1]
+                if isinstance(val, float) and val != val:
+                    val = None
+                ws.cell(row=row_idx + 2, column=col_idx, value=val)
+        wb.save(self.excel_file)
+        wb.close()
