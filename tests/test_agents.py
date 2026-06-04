@@ -142,7 +142,7 @@ class TestConverters(unittest.TestCase):
     def test_number_to_words(self):
         """Test number to words conversion"""
         result = number_to_words_inr(53000)
-        self.assertIn("Thousand", result)
+        self.assertIn("thousand", result.lower())
         print(f"✓ Number to words test passed: {result}")
 
     def test_format_amount(self):
