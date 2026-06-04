@@ -31,6 +31,17 @@ def test_detect_format_printed():
     assert fmt == "printed_printout", f"Expected printed_printout, got {fmt}"
 
 
+def test_detect_format_serial_number_prefix():
+    lines = [
+        "STATEMENT OF ACCOUNT FOR THE PERIOD FROM 01-03-2026 TO 31-03-2026",
+        "SI Date Particulars Chq Num Withdrawal Deposit Balance",
+        "1 02-03-2026 PANDIT HIRAJI VAIRAL 17060260 12,000.00 5,09,607.62 Cr",
+        "2 02-03-2026 CLG:VAISHALI DADAPATIL WALUN 12034759 5,940.00 5,03,667.62 Cr",
+    ]
+    fmt = detect_format(lines)
+    assert fmt == "serial_number_prefix", f"Expected serial_number_prefix, got {fmt}"
+
+
 def test_detect_format_fallback():
     lines = ["garbage text", "no recognizable format"]
     fmt = detect_format(lines)
@@ -61,6 +72,25 @@ def test_clean_entries_continuation_lines():
     result = clean_entries(raw)
     assert len(result) == 1
     assert "CONTINUATION LINE 2" in result[0]
+
+
+def test_clean_entries_serial_number_prefix():
+    """Strips serial numbers before dates and skips headers in serial-number format."""
+    raw = [
+        "STATEMENT OF ACCOUNT FOR THE PERIOD FROM 01-03-2026 TO 31-03-2026",
+        "SI Date Particulars Chq Num Withdrawal Deposit Balance",
+        "1 02-03-2026 PANDIT HIRAJI VAIRAL 17060260 12,000.00 5,09,607.62 Cr",
+        "2 02-03-2026 CLG:VAISHALI DADAPATIL WALUN 12034759 5,940.00 5,03,667.62 Cr",
+        "3 04-03-2026 MOBFT/AVINASH BALKRISHNA",
+        "B/311483317873 1,000.00 5,04,667.62 Cr",
+    ]
+    result = clean_entries(raw)
+    assert len(result) == 3, f"Expected 3 entries, got {len(result)}: {result}"
+    assert result[0].startswith("02-03-2026"), f"Expected date-start, got: {result[0]}"
+    assert result[0].startswith("02-03-2026 PANDIT"), f"Expected PANDIT entry, got: {result[0]}"
+    assert result[2].startswith("04-03-2026 MOBFT"), "Third entry should start with MOBFT"
+    # Continuation line merged
+    assert "B/311483317873" in result[2], "Continuation line should be merged"
 
 
 def test_extract_text_from_pdf_raises_on_missing():

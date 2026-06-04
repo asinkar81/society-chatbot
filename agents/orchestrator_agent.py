@@ -1308,6 +1308,9 @@ class OrchestratorAgent(BaseAgent):
                 # Skip dashed separators
                 if re.match(r'^[\s\-]+$', line):
                     continue
+                # Skip statement header lines
+                if re.match(r'^STATEMENT\s+OF\s+ACCOUNT', line, re.IGNORECASE):
+                    continue
                 # Skip cumulative totals / balance summary lines
                 if re.search(
                     r'(?:OPENING\s+)?BALANCE(?:\s+(?:B/F|C/F|BROUGHT|CARRIED))?'
@@ -1317,9 +1320,11 @@ class OrchestratorAgent(BaseAgent):
                     line, re.IGNORECASE,
                 ):
                     continue
-                # Skip column headers
-                if re.match(r'^(Date|Id)\s', line, re.IGNORECASE):
+                # Skip column headers (Date/Id or SI Date/Serial Number formats)
+                if re.match(r'^(Date|Id|SI)\s', line, re.IGNORECASE):
                     continue
+                # Strip leading serial numbers before dates (e.g. "1 02-03-2026 ...")
+                line = re.sub(r'^\d+\s+(?=\d{2}-\d{2}-\d{4})', '', line)
                 # Insert space after DD-MM-YYYY date if followed by non-whitespace
                 normalized = re.sub(r'^(\d{2}-\d{2}-\d{4})(\S)', r'\1 \2', line)
                 normalized_lines.append(normalized)
@@ -1344,6 +1349,10 @@ class OrchestratorAgent(BaseAgent):
                         "all_lines": [line],
                     }
                 elif current:
+                    if re.match(r'^-{3,}$', line.strip()):
+                        entries.append(current)
+                        current = None
+                        continue
                     current["all_lines"].append(line)
 
             if current:
@@ -1469,7 +1478,7 @@ class OrchestratorAgent(BaseAgent):
                     return "IMPS"
                 if "RTGS" in p:
                     return "RTGS"
-                if "CHQ" in p or "CHEQUE" in p:
+                if "CHQ" in p or "CHEQUE" in p or "CTS" in p:
                     return "CHQ"
                 if "CASH" in p:
                     return "CASH"
@@ -1606,9 +1615,12 @@ class OrchestratorAgent(BaseAgent):
                 txn_id = _extract_txn_id(first_line, txn_type, entry["all_lines"])
                 search_tokens = _extract_search_tokens(first_line, txn_type)
 
+                # Merge continuation lines into particulars (e.g. UTR/ref number on next line)
+                contin_text = " ".join(l.strip() for l in entry["all_lines"][1:])
+                particulars = (first_line + " " + contin_text).strip() if contin_text else first_line
                 parsed_entries.append({
                     "date": entry["date"],
-                    "particulars": first_line,
+                    "particulars": particulars,
                     "full_particulars": all_text,
                     "amount": amount,
                     "balance": amounts["balance"],

@@ -1,6 +1,7 @@
 """
 Utility converters: number to words, date formatting, etc.
 """
+import re
 from num2words import num2words
 from datetime import datetime, timedelta
 from typing import Optional
@@ -173,3 +174,18 @@ def get_previous_invoices(ledger: list, up_to_date: str) -> list:
                 })
     invoices.sort(key=lambda x: parse_dmy(str(x["date"])))
     return invoices
+
+
+def clean_payment_details(raw: str) -> str:
+    """Strip date prefix and trailing amounts/balance from bank statement particulars.
+
+    Input:  "03-04-2023 UPIAB/309396270560/CR/SHRIKANT/CNRB/sbhate@ybl/Pay 6,000.00 1,93,145.10Cr"
+    Output: "UPIAB/309396270560/CR/SHRIKANT/CNRB/sbhate@ybl/Pay"
+    """
+    if not raw:
+        return ""
+    s = raw.strip()
+    s = re.sub(r'^\d{2}[-/]\d{2}[-/]\d{4}\s+', '', s)
+    s = re.sub(r'\s+[\d,]+\.\d{2}\s*(?:Cr|Dr)?\s*$', '', s)
+    s = re.sub(r'\s+[\d,]+\.\d{2}\s*$', '', s)
+    return s.strip()

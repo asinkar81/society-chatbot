@@ -20,6 +20,12 @@ FORMAT_PROFILES = {
             for l in lines[:20]
         ),
     },
+    "serial_number_prefix": {
+        "detect": lambda lines: any(
+            re.match(r"^\d+\s+\d{2}-\d{2}-\d{4}\s+", l)
+            for l in lines[:30]
+        ),
+    },
 }
 
 
@@ -55,7 +61,9 @@ def _strip_non_transaction(line: str) -> bool:
             return False
     if re.match(r"^[\s\-]+$", line):
         return False
-    if re.match(r"^(Date|Id|Particulars|Transaction)\s", line, re.IGNORECASE):
+    if re.match(r"^(Date|Id|SI|Particulars|Transaction)\s", line, re.IGNORECASE):
+        return False
+    if re.match(r"^STATEMENT\s+OF\s+ACCOUNT", line, re.IGNORECASE):
         return False
     if re.match(r"^\w+\s+BANK\s+(LTD|LIMITED)?$", line, re.IGNORECASE):
         return False
@@ -67,12 +75,14 @@ def _strip_non_transaction(line: str) -> bool:
 def clean_entries(lines: List[str]) -> List[str]:
     """Filter cumulative lines and merge continuation lines into entries."""
     filtered = [l for l in lines if _strip_non_transaction(l)]
-    while filtered and not re.match(r"^\d{2}-\d{2}-\d{4}", filtered[0]):
-        filtered.pop(0)
-    if not filtered:
+    # Strip leading serial numbers before dates (e.g. "1 02-03-2026 ..." → "02-03-2026 ...")
+    normalized = [re.sub(r'^\d+\s+(?=\d{2}-\d{2}-\d{4})', '', l) for l in filtered]
+    while normalized and not re.match(r"^\d{2}-\d{2}-\d{4}", normalized[0]):
+        normalized.pop(0)
+    if not normalized:
         return []
     merged = []
-    for line in filtered:
+    for line in normalized:
         if re.match(r"^\d{2}-\d{2}-\d{4}", line):
             merged.append(line)
         elif merged:

@@ -405,12 +405,6 @@ def create_simple_receipt_pdf(pdf_path: Path, receipt_data: Dict[str, Any]) -> b
         payment_details = receipt_data.get("payment_details", "")
         if payment_details:
             elements.append(Paragraph(f"Payment Details: {payment_details}", normal_style))
-        elements.append(Spacer(1, 0.3 * inch))
-
-        # Outstanding balance
-        outstanding = receipt_data.get("outstanding_balance", 0)
-        elements.append(Paragraph(f"Outstanding Balance: ₹ {outstanding:,.2f}", normal_style))
-
         elements.append(Spacer(1, 0.5 * inch))
 
         # Footer note
@@ -434,4 +428,74 @@ def create_simple_receipt_pdf(pdf_path: Path, receipt_data: Dict[str, Any]) -> b
 
     except Exception as e:
         print(f"Error creating receipt PDF: {e}")
+        return False
+
+
+def create_consolidated_receipt_pdf(pdf_path: Path, receipts: list[Dict[str, Any]], member_name: str, plot_no: str, fy: str = "") -> bool:
+    """Create a consolidated receipt PDF listing multiple receipts for one member."""
+    try:
+        pdf_path.parent.mkdir(parents=True, exist_ok=True)
+        doc = SimpleDocTemplate(str(pdf_path), pagesize=A4)
+        elements = []
+        styles = getSampleStyleSheet()
+
+        header_bold = ParagraphStyle("HB", parent=styles["Normal"], fontSize=14, leading=18, alignment=1, spaceAfter=4)
+        header_normal = ParagraphStyle("HN", parent=styles["Normal"], fontSize=10, leading=14, alignment=1, spaceAfter=2)
+        elements.append(Paragraph("Weekend Ville Maintenance Co-Op. Society Ltd 24-25", header_bold))
+        elements.append(Paragraph("Sr. No. 241/274/287/288/289, Mauje Jatede, Tal.- Mulshi, Dist.-Pune", header_normal))
+        elements.append(Spacer(1, 0.15 * inch))
+
+        hr = ParagraphStyle("HR", parent=styles["Normal"], fontSize=2, spaceAfter=6, alignment=1)
+        elements.append(Paragraph("_" * 90, hr))
+
+        title_style = ParagraphStyle("Title", parent=styles["Heading1"], fontSize=16, alignment=1, spaceAfter=8)
+        elements.append(Paragraph("CONSOLIDATED RECEIPT", title_style))
+
+        normal = styles["Normal"]
+        bold = ParagraphStyle("B", parent=normal, fontName="Helvetica-Bold")
+        elements.append(Paragraph(f"Member: {member_name}  |  Plot No: {plot_no}", bold))
+        if fy:
+            elements.append(Paragraph(f"Financial Year: {fy}", normal))
+        elements.append(Spacer(1, 0.15 * inch))
+        elements.append(Paragraph("_" * 90, hr))
+
+        # Table header
+        data = [["#", "Date", "Receipt No", "Transaction ID", "Amount (₹)"]]
+        total = 0.0
+        for i, r in enumerate(receipts, 1):
+            amt = float(r.get("amount", 0))
+            data.append([
+                str(i),
+                str(r.get("date", "")),
+                str(r.get("receipt_id", "")),
+                str(r.get("transaction_id", "")),
+                f"{amt:,.2f}",
+            ])
+            total += amt
+        data.append(["", "", "", "TOTAL", f"{total:,.2f}"])
+
+        table = Table(data, colWidths=[0.4*inch, 1.2*inch, 1.5*inch, 2.2*inch, 1.2*inch])
+        table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.grey),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 9),
+            ("BACKGROUND", (0, -1), (-1, -1), colors.lightgrey),
+            ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ]))
+        elements.append(table)
+        elements.append(Spacer(1, 0.3 * inch))
+
+        note = ParagraphStyle("Note", parent=styles["Normal"], fontSize=8, textColor=colors.gray, alignment=1)
+        elements.append(Paragraph("These receipts are subject to actual realization of payments.", note))
+
+        doc.build(elements)
+        return True
+    except Exception as e:
+        print(f"Error creating consolidated receipt PDF: {e}")
         return False

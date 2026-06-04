@@ -159,6 +159,105 @@ class TestConverters(unittest.TestCase):
         print(f"✓ FY string test passed: {result}")
 
 
+class TestBankStatementParser(unittest.TestCase):
+    """Test bank statement parsing with various formats"""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.test_file = Path(self.temp_dir.name) / "test_data.xlsx"
+        self.provider = LocalExcelDataProvider(self.test_file)
+        self.storage = LocalFileStorage(Path(self.temp_dir.name))
+        from agents.orchestrator_agent import OrchestratorAgent
+        self.agent = OrchestratorAgent(self.provider, self.storage)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def _get_tool(self, name):
+        for t in self.agent.tools:
+            if t.name == name:
+                return t
+        return None
+
+    def _parse(self, stmt):
+        tool = self._get_tool("process_bank_statement_pdf")
+        result = tool.func(stmt)
+        return result["summary"] if isinstance(result, dict) else str(result)
+
+    def test_serial_number_prefix_format(self):
+        """Parse statement with serial-number-prefixed rows"""
+        stmt = (
+            "STATEMENT OF ACCOUNT FOR THE PERIOD FROM 01-03-2026 TO 31-03-2026\n"
+            "SI Date Particulars Chq Num Withdrawal Deposit Balance\n"
+            "1 02-03-2026 PANDIT HIRAJI VAIRAL 17060260 12,000.00 5,09,607.62 Cr\n"
+            "2 02-03-2026 CLG:VAISHALI DADAPATIL WALUN 12034759 5,940.00 5,03,667.62 Cr\n"
+            "3 04-03-2026 MOBFT/AVINASH BALKRISHNA\n"
+            "B/311483317873 1,000.00 5,04,667.62 Cr\n"
+        )
+        summary = self._parse(stmt)
+        self.assertNotIn("Could not parse", summary)
+        self.assertNotIn("Expected DATE", summary)
+        self.assertIn("Total processed:", summary)
+
+    def test_serial_number_parses_correctly(self):
+        """Verify amounts and dates correctly extracted from serial-number format"""
+        stmt = (
+            "SI Date Particulars Chq Num Withdrawal Deposit Balance\n"
+            "1 02-03-2026 PANDIT HIRAJI VAIRAL 17060260 12,000.00 5,09,607.62 Cr\n"
+            "2 02-03-2026 CLG:VAISHALI DADAPATIL WALUN 12034759 5,940.00 5,03,667.62 Cr\n"
+        )
+        summary = self._parse(stmt)
+        self.assertIn("Expenses recorded: 2", summary)
+
+    def test_standard_format_still_works(self):
+        """Verify existing date-first format is not broken"""
+        stmt = (
+            "01-04-2026 NEFT/SOME TRANSACTION DETAILS 5,000.00 1,00,000.00 Cr\n"
+            "02-04-2026 UPI/PAYMENT VPA 2,000.00 1,02,000.00 Cr\n"
+        )
+        summary = self._parse(stmt)
+        self.assertNotIn("Could not parse", summary)
+        self.assertIn("UNMATCHED CREDIT ENTRIES", summary)
+
+    def test_serial_number_with_header(self):
+        """Parse with STATEMENT OF ACCOUNT header line"""
+        stmt = (
+            "STATEMENT OF ACCOUNT FOR THE PERIOD FROM 01-03-2026 TO 31-03-2026\n"
+            "1 02-03-2026 MOBFT/VINAYAK NEVGI 5,000.00 5,10,000.00 Cr\n"
+        )
+        summary = self._parse(stmt)
+        self.assertNotIn("Could not parse", summary)
+        self.assertNotIn("Expected DATE", summary)
+
+    def test_email_attachment_format_header(self):
+        """e-Statement header and Date column header are safely skipped"""
+        stmt = (
+            "e-Statement for April 2026\n"
+            "Date        Particulars          Withdrawals    Deposits    Balance\n"
+            "01-04-2026  NEFT X12345  SOME DESC            1,000.00  1,00,000.00\n"
+            "02-04-2026  UPI Y67890  ANOTHER               2,500.00  1,02,500.00\n"
+        )
+        summary = self._parse(stmt)
+        self.assertNotIn("Could not parse", summary)
+        self.assertIn("Total processed:", summary)
+        # 2 credit entries → unmatched
+        self.assertIn("Unmatched credit entries: 2", summary)
+
+    def test_printout_format_bank_header(self):
+        """Bank name/page lines before entries are safely ignored"""
+        stmt = (
+            "PUNJAB NATIONAL BANK\n"
+            "Page 1 of 2\n"
+            "01-04-2026  NEFT X12345  SOME DESCRIPTION  1,000.00  1,00,000.00\n"
+            "02-04-2026  CHQ Z54321  WITHDRAWAL         5,000.00    95,000.00\n"
+        )
+        summary = self._parse(stmt)
+        self.assertNotIn("Could not parse", summary)
+        self.assertIn("Total processed:", summary)
+        # 2 entries: 1 credit (NEFT) + 1 debit (CHQ, detected via balance movement 100k→95k)
+        self.assertIn("Expenses recorded: 1", summary)
+
+
 def run_tests():
     """Run all tests"""
     print("\n" + "="*60)
@@ -172,6 +271,7 @@ def run_tests():
     suite.addTests(loader.loadTestsFromTestCase(TestDataProvider))
     suite.addTests(loader.loadTestsFromTestCase(TestFileStorage))
     suite.addTests(loader.loadTestsFromTestCase(TestConverters))
+    suite.addTests(loader.loadTestsFromTestCase(TestBankStatementParser))
 
     # Run tests
     runner = unittest.TextTestRunner(verbosity=2)

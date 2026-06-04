@@ -17,10 +17,33 @@ from agents.ledger_agent import LedgerAgent
 from agents.admin_agent import AdminAgent
 from agents.orchestrator_agent import OrchestratorAgent
 from tools.pdf_generator import create_simple_receipt_pdf
+import pandas as pd
 from agents.router_agent import get_router
 import json
 from datetime import datetime
 import uuid
+
+
+def _normalize_particulars(text: str) -> str:
+    """Strip system-added prefixes from Particulars for cross-referencing.
+
+    Handles:
+      "By PANDIT HIRAJI VAIRAL 17060260 ..." → "PANDIT HIRAJI VAIRAL 17060260 ..."
+      "By Split from Owner Name (PANDIT ...)" → "PANDIT ..."
+      "RECEIVED FROM John Doe" → "John Doe"
+    """
+    s = str(text or "").strip()
+    # Strip "By Split from <name> (<particulars>)" → extract inner particulars
+    m = re.match(r'^By\s+Split\s+from\s+.+?\((.+)\)\s*$', s, re.DOTALL | re.IGNORECASE)
+    if m:
+        s = m.group(1).strip()
+    else:
+        # Strip common system prefixes
+        for prefix in ["By ", "RECEIVED FROM ", "FROM ", "PAID BY "]:
+            if s.upper().startswith(prefix.upper()):
+                s = s[len(prefix):]
+                break
+    return s.strip()
 
 
 # Page config
@@ -257,9 +280,9 @@ def _show_suspense_table(entries: List[Dict], dp: LocalExcelDataProvider, all_me
     for se in entries:
         sid = se["ID"]
         with st.container(border=True):
-            ca, cb, cc, cd = st.columns([2, 2, 2, 3])
+            ca, cb, cc, cd = st.columns([1.5, 3, 1.5, 3])
             ca.markdown(f"**{se.get('Date','')}** — ₹{float(se.get('Amount',0)):>,.2f}")
-            cb.markdown(f"`{str(se.get('Particulars',''))[:40]}`")
+            cb.markdown(f"`{str(se.get('Particulars',''))[:80]}`")
             cc.markdown(f"`{se.get('Transaction_Type','') or '—'}`")
             with cd:
                 if se.get("Status") == "Pending":
@@ -773,16 +796,8 @@ def show_dashboard_page():
                     with open(save_path, "wb") as f:
                         f.write(pdf_bytes)
 
-                    format_override = None
                     with st.spinner("Parsing PDF..."):
                         parsed = parse_bank_pdf(str(save_path), password=stmt_password)
-
-                    if parsed["format"] == "unknown":
-                        format_override = st.selectbox(
-                            "Could not detect statement format. Please select:",
-                            ["netbanking", "email_attachment", "printed_printout"],
-                            key="stmt_format_override",
-                        )
 
                     st.success(f"Extracted {parsed['entry_count']} entries from {pdf_file.name} (format: {parsed['format']}, {parsed['raw_lines']} raw lines)")
 
@@ -790,12 +805,11 @@ def show_dashboard_page():
                         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                         shutil.copy2(config.SOCIETY_DATA_FILE, config.BACKUPS_DIR / f"society_data_{ts}_auto_pre_stmt.xlsx")
 
-                        import json
                         entries_text = "\n".join(parsed["entries"])
                         tool_input = json.dumps({
                             "statement": entries_text,
                             "generate_receipts": gen_receipts_checkbox,
-                            "format": format_override or parsed["format"],
+                            "format": parsed["format"],
                             "filename": pdf_file.name,
                         })
 
@@ -806,7 +820,7 @@ def show_dashboard_page():
                             filename=pdf_file.name,
                             date_range=f"from_{pdf_file.name.replace('.pdf', '')}",
                             entry_count=parsed["entry_count"],
-                            fmt=format_override or parsed["format"],
+                            fmt=parsed["format"],
                             file_hash=file_hash,
                         )
                         data_provider.refresh_reports_sheet()
@@ -977,11 +991,11 @@ def show_dashboard_page():
                                          key=f"bs_to_{i}", label_visibility="collapsed",
                                          placeholder="Select")
                         with cols[7]:
-                            add_i = st.form_submit_button("Add", use_container_width=True)
+                            add_i = st.form_submit_button("Add", key=f"bs_fadd_{i}", use_container_width=True)
                         with cols[8]:
-                            ign_i = st.form_submit_button("Ignore", use_container_width=True)
+                            ign_i = st.form_submit_button("Ignore", key=f"bs_fign_{i}", use_container_width=True)
                         with cols[9]:
-                            sus_i = st.form_submit_button("Suspense", use_container_width=True)
+                            sus_i = st.form_submit_button("Suspense", key=f"bs_fsus_{i}", use_container_width=True)
 
                         if add_i:
                             mid = member_id_map.get(st.session_state.get(f"bs_to_{i}", ""))
@@ -1195,6 +1209,7 @@ def show_dashboard_page():
             if not proc_list:
                 st.info("No previously processed statements found.")
             else:
+                pwd = st.session_state.get("bank_stmt_password", config.BANK_STMT_PASSWORD) or ""
                 for ps in proc_list:
                     cols = st.columns([3, 1, 1])
                     cols[0].write(f"`{ps.get('Filename', '?')}` ({ps.get('Entry_Count', 0)} entries, {ps.get('Processed_At', '')})")
@@ -1215,7 +1230,11 @@ def show_dashboard_page():
                                 shutil.copy2(config.SOCIETY_DATA_FILE, config.BACKUPS_DIR / f"society_data_{ts}_auto_reprocess.xlsx")
 
                                 deleted = data_provider.clear_auto_ledger_entries()
-                                parsed = parse_bank_pdf(str(fpath), password=config.BANK_STMT_PASSWORD)
+                                try:
+                                    parsed = parse_bank_pdf(str(fpath), password=pwd)
+                                except Exception as e:
+                                    st.session_state.reprocess_msg = f"❌ Failed to parse '{fname}': {e}"
+                                    st.rerun()
                                 entries_text = "\n".join(parsed["entries"])
                                 tool_input = json.dumps({
                                     "statement": entries_text,
@@ -1242,15 +1261,72 @@ def show_dashboard_page():
                 ts = _dt.now().strftime("%Y%m%d_%H%M%S")
                 shutil.copy2(config.SOCIETY_DATA_FILE, config.BACKUPS_DIR / f"society_data_{ts}_auto_rebuild.xlsx")
 
+                # ── Snapshot existing ledger + suspense before clearing ──
+                legacy_snapshot = data_provider.get_member_ledger_all()
+                legacy_lookup = {}  # (date, amount_rounded) → [(Particulars, Plot_No, Vch_No)]
+                for e in legacy_snapshot:
+                    mid = e.get("Plot_No") or e.get("Member_ID")
+                    if mid is None:
+                        continue
+                    try:
+                        mid_int = int(float(mid))
+                    except (ValueError, TypeError):
+                        continue
+                    d = str(e.get("Date", "") or "")
+                    cr = e.get("Credit") or 0
+                    amt = round(float(cr), 2)
+                    key = (d, amt)
+                    legacy_lookup.setdefault(key, []).append({
+                        "particulars": str(e.get("Particulars", "") or ""),
+                        "plot_no": mid_int,
+                    })
+
+                suspense_lookup = {}  # same key format → {"status", "tagged_to", "particulars"}
+                for se in data_provider.get_suspense_entries():
+                    d = str(se.get("Date", "") or "")
+                    amt = round(float(se.get("Amount", 0) or 0), 2)
+                    key = (d, amt)
+                    suspense_lookup.setdefault(key, []).append({
+                        "status": str(se.get("Status", "") or "").strip(),
+                        "tagged_to": se.get("Tagged_To") or se.get("Member_ID"),
+                        "particulars": str(se.get("Particulars", "") or ""),
+                    })
+
+                def _match_unmatched(u_entry, lookup, source_label):
+                    """Find a match for an unmatched entry in a lookup dict by
+                    (date, amount) then disambiguate by normalized Particulars.
+                    Returns matching entry dict or None."""
+                    key = (u_entry["date"], round(u_entry["amount"], 2))
+                    candidates = lookup.get(key, [])
+                    if not candidates:
+                        return None
+                    if len(candidates) == 1:
+                        return candidates[0]
+                    # Multiple candidates — disambiguate by Particulars
+                    u_norm = _normalize_particulars(u_entry.get("particulars", ""))
+                    for c in candidates:
+                        c_norm = _normalize_particulars(c.get("particulars", ""))
+                        if u_norm and c_norm and (u_norm in c_norm or c_norm in u_norm):
+                            return c
+                    return None
+
                 deleted = data_provider.clear_auto_ledger_entries()
                 proc_list = data_provider.get_processed_statements()
                 total_parsed = 0
+                skipped_from_legacy = 0
+                skipped_from_suspense = 0
+                errors = []
                 for ps in proc_list:
                     fname = ps.get("Filename", "")
                     fpath = config.BANK_STATEMENTS_DIR / fname
                     if not fpath.exists():
+                        errors.append(f"'{fname}' not found")
                         continue
-                    parsed = parse_bank_pdf(str(fpath), password=config.BANK_STMT_PASSWORD)
+                    try:
+                        parsed = parse_bank_pdf(str(fpath), password=pwd)
+                    except Exception as e:
+                        errors.append(f"'{fname}': {e}")
+                        continue
                     entries_text = "\n".join(parsed["entries"])
                     tool_input = json.dumps({
                         "statement": entries_text,
@@ -1260,11 +1336,58 @@ def show_dashboard_page():
                     })
                     result = _run_tool("process_bank_statement_pdf", tool_input)
                     if isinstance(result, dict):
-                        total_parsed += len(result.get("matched", [])) + len(result.get("unmatched", []))
+                        # Filter unmatched against legacy snapshot + Suspense_Entries
+                        filtered_unmatched = []
+                        for u in result.get("unmatched", []):
+                            # 1) Check legacy snapshot
+                            match = _match_unmatched(u, legacy_lookup, "ledger")
+                            if match:
+                                data_provider.add_ledger_entry(match["plot_no"], {
+                                    "Date": u["date"],
+                                    "Particulars": f"By {u.get('particulars', '')[:60]}",
+                                    "Vch_Type": "Journal",
+                                    "Vch_No": data_provider.get_next_voucher_number(),
+                                    "Debit": None,
+                                    "Credit": u["amount"],
+                                    "Description": "Rebuilt from legacy snapshot",
+                                    "Transaction_Type": u.get("txn_type", ""),
+                                    "Transaction_ID": u.get("txn_id", ""),
+                                })
+                                skipped_from_legacy += 1
+                                continue
+                            # 2) Check Suspense_Entries
+                            match = _match_unmatched(u, suspense_lookup, "suspense")
+                            if match:
+                                if match["status"] == "Tagged" and match.get("tagged_to"):
+                                    data_provider.add_ledger_entry(int(float(match["tagged_to"])), {
+                                        "Date": u["date"],
+                                        "Particulars": f"By {u.get('particulars', '')[:60]}",
+                                        "Vch_Type": "Journal",
+                                        "Vch_No": data_provider.get_next_voucher_number(),
+                                        "Debit": None,
+                                        "Credit": u["amount"],
+                                        "Description": "Rebuilt from suspense tagging",
+                                        "Transaction_Type": u.get("txn_type", ""),
+                                        "Transaction_ID": u.get("txn_id", ""),
+                                    })
+                                # Tagged → recreated; Pending → skip (already in suspense)
+                                skipped_from_suspense += 1
+                                continue
+                            # 3) Genuinely new → keep
+                            filtered_unmatched.append(u)
+                        result["unmatched"] = filtered_unmatched
+                        total_parsed += len(result.get("matched", [])) + len(filtered_unmatched)
                     data_provider.refresh_reports_sheet()
+                err_msg = f" ⚠️ {len(errors)} errors: {'; '.join(errors[:3])}" if errors else ""
+                skip_msg = []
+                if skipped_from_legacy:
+                    skip_msg.append(f"auto-restored {skipped_from_legacy} from legacy ledger")
+                if skipped_from_suspense:
+                    skip_msg.append(f"skipped {skipped_from_suspense} from suspense")
+                skip_txt = f" ({'; '.join(skip_msg)})" if skip_msg else ""
                 st.session_state.reprocess_msg = (
                     f"✅ Rebuilt from {len(proc_list)} statements — deleted {deleted} old entries, "
-                    f"re-processed {total_parsed} entries. Review unmatched entries above."
+                    f"re-processed {total_parsed} entries.{skip_txt}{err_msg}"
                 )
                 st.session_state.bank_stmt_result = None
                 st.session_state.bank_stmt_processed = set()
@@ -1783,6 +1906,63 @@ def show_dashboard_page():
         elif led_fy_filter != "All":
             led_from_dt, led_to_dt = _fy_date_range(led_fy_filter)
 
+        # ── Search Particulars ──────────────────────────────────────
+        led_search = st.text_input("🔍 Search Particulars", placeholder="Enter text to search across all entries...", key="led_search_parts")
+        if led_search:
+            search_results = []
+            seen_vch = set()
+            search_members = [m] if led_member_id != 0 else members
+            for sm in search_members:
+                mid = sm["ID"]
+                for e in data_provider.get_member_ledger(mid):
+                    epart = str(e.get("Particulars", "") or "")
+                    if led_search.lower() not in epart.lower():
+                        continue
+                    vch = e.get("Vch_No")
+                    if vch and vch in seen_vch:
+                        continue
+                    if vch:
+                        seen_vch.add(vch)
+                    search_results.append({**e, "_src_mid": mid, "_src_label": _member_label(mid)})
+            if search_results:
+                st.warning(f"🔍 Found {len(search_results)} entries matching '{led_search}'")
+                with st.container(border=True):
+                    for se in search_results:
+                        sed = str(se.get("Date", "") or "")
+                        separt = str(se.get("Particulars", "") or "")
+                        se_amt = _s(se.get("Credit")) or _s(se.get("Debit"))
+                        se_type = str(se.get("Transaction_Type", "") or "")
+                        se_label = se.get("_src_label", "?")
+                        cols = st.columns([1.5, 3, 1.5, 2, 2])
+                        cols[0].text(sed)
+                        cols[1].caption(separt[:80])
+                        cols[2].text(f"₹{se_amt:,.2f}")
+                        cols[3].text(se_label)
+                        cols[4].text(se_type or "—")
+                    move_to_mid = st.selectbox(
+                        "Move all matched entries to:", options=[m["ID"] for m in members],
+                        format_func=_member_label, key="led_search_move_target",
+                    )
+                    if st.button(f"🚚 Move All {len(search_results)} to selected member", type="primary", key="led_search_move_all"):
+                        count = 0
+                        for se in search_results:
+                            svch = int(se.get("Vch_No", 0))
+                            if svch and data_provider.delete_ledger_entry(se["_src_mid"], svch):
+                                data_provider.add_ledger_entry(move_to_mid, {
+                                    "Date": str(se.get("Date", "") or ""),
+                                    "Particulars": str(se.get("Particulars", "") or "")[:60],
+                                    "Vch_Type": "Journal", "Vch_No": svch,
+                                    "Debit": se.get("Debit"), "Credit": se.get("Credit"),
+                                    "Description": str(se.get("Description", "") or ""),
+                                    "Transaction_Type": str(se.get("Transaction_Type", "") or ""),
+                                    "Transaction_ID": str(se.get("Transaction_ID", "") or ""),
+                                })
+                                count += 1
+                        st.success(f"✅ Moved {count} entries to {_member_label(move_to_mid)}")
+                        st.rerun()
+            else:
+                st.info(f"No entries match '{led_search}'")
+
         # ── All Plots view ────────────────────────────────────────
         if led_member_id == 0:
             summary = []
@@ -1935,7 +2115,7 @@ def show_dashboard_page():
                         is_credit = ecr > 0
                         lbl = f"₹{amt:,.2f} CR" if is_credit else f"₹{amt:,.2f} DR"
                         can_split = is_credit and split_group is not None
-                        c1, c2, c3, c4, c5 = st.columns([0.3, 2, 3, 2, 1.5])
+                        c1, c2, c3, c4, c5, c6 = st.columns([0.3, 1.5, 1.5, 3, 1.5, 1.5])
                         with c1:
                             st.checkbox("", key=f"led_sel_{idx}", label_visibility="collapsed")
                         with c2:
@@ -1943,10 +2123,54 @@ def show_dashboard_page():
                             st.text(ed)
                         with c3:
                             st.caption(etype)
-                            st.text((edesc or epart)[:60])
+                            st.text(edesc[:40] if edesc else "")
                         with c4:
-                            st.text(lbl)
+                            st.caption("Particulars")
+                            st.text(epart[:80])
                         with c5:
+                            st.text(lbl)
+                        with c6:
+                            # ── Undo Split ──
+                            if etype.upper() == "SPLIT" or "split from #" in edesc.lower():
+                                orig_match = re.search(r"Split from #(\d+)\s*\(src:(\d+)\)", edesc, re.IGNORECASE)
+                                if orig_match:
+                                    orig_vch = int(orig_match.group(1))
+                                    orig_mid = int(orig_match.group(2))
+                                    if st.button("↩️ Undo", key=f"led_unsplit_{idx}", help="Undo split, recreate original entry"):
+                                        all_ledger = data_provider.get_member_ledger_all()
+                                        siblings = [se for se in all_ledger
+                                                     if f"Split from #{orig_vch}" in str(se.get("Description", ""))]
+                                        total_amt = sum(float(se.get("Credit", 0) or 0) for se in siblings)
+                                        for se in siblings:
+                                            smid = se.get("Member_ID") or se.get("Plot_No")
+                                            svch = int(se.get("Vch_No", 0))
+                                            if smid and svch:
+                                                data_provider.delete_ledger_entry(int(float(smid)), svch)
+                                        data_provider.add_ledger_entry(orig_mid, {
+                                            "Date": ed, "Particulars": epart[:60],
+                                            "Vch_Type": "Journal", "Vch_No": orig_vch,
+                                            "Debit": None, "Credit": total_amt,
+                                            "Description": f"Undid split #{orig_vch} — restored entry",
+                                            "Transaction_Type": etype, "Transaction_ID": entry.get("Transaction_ID", ""),
+                                        })
+                                        st.success(f"↩️ Undid split #{orig_vch} — ₹{total_amt:,.2f} restored to member #{orig_mid}")
+                                        st.rerun()
+                            # ── Undo Move ──
+                            move_match = re.search(r"\(moved from #(\d+)\)", edesc)
+                            if move_match:
+                                src_mid = int(move_match.group(1))
+                                if st.button("↩️ Undo", key=f"led_unmove_{idx}", help="Move back to original member"):
+                                    vch_no = int(ev) if ev else 0
+                                    if vch_no and data_provider.delete_ledger_entry(led_member_id, vch_no):
+                                        data_provider.add_ledger_entry(src_mid, {
+                                            "Date": ed, "Particulars": epart[:60],
+                                            "Vch_Type": "Journal", "Vch_No": vch_no,
+                                            "Debit": None, "Credit": ecr,
+                                            "Description": edesc, "Transaction_Type": etype,
+                                            "Transaction_ID": entry.get("Transaction_ID", ""),
+                                        })
+                                    st.success(f"↩️ Moved ₹{ecr:,.2f} back to member #{src_mid}")
+                                    st.rerun()
                             if is_credit:
                                 if st.button("➡️ Move", key=f"led_move_{idx}", help="Move to another member"):
                                     src = {
@@ -2005,6 +2229,7 @@ def show_dashboard_page():
                             "Split across members", options=[m["ID"] for m in members],
                             format_func=_member_label, key="led_split_targets",
                         )
+                        split_gen_rcpt = st.checkbox("Generate receipts", value=False, key="led_split_gen_rcpt")
                         col_s1, col_s2 = st.columns(2)
                         with col_s1:
                             if st.button("Confirm Split", type="primary", use_container_width=True, key="led_confirm_split"):
@@ -2026,22 +2251,23 @@ def show_dashboard_page():
                                                     "Particulars": ss["particulars"][:60],
                                                     "Vch_Type": "Journal", "Vch_No": vch,
                                                     "Debit": None, "Credit": per_member,
-                                                    "Description": f"Receipt {rid} — Split from #{ss['vch_no']}",
+                                                    "Description": f"Receipt {rid} — Split from #{ss['vch_no']} (src:{ss['member_id']})",
                                                     "Transaction_ID": ss.get("txn_id", ""),
                                                     "Transaction_Type": ss.get("txn_type", ""),
                                                 })
-                                                fy_short = fy[:2]
-                                                receipt_dir = config.RECEIPTS_DIR / fy_short
-                                                receipt_dir.mkdir(parents=True, exist_ok=True)
-                                                rpath = receipt_dir / f"Receipt_{plot_part}_{rid}.pdf"
-                                                create_simple_receipt_pdf(rpath, {
-                                                    "receipt_id": rid, "date": ss["date"],
-                                                    "member_name": m.get("Plot_Owner_Name", ""),
-                                                    "plot_no": plot_str, "amount": per_member,
-                                                    "transaction_id": ss.get("txn_id", "N/A"),
-                                                    "transaction_type": ss.get("txn_type", ""),
-                                                    "payment_details": clean_payment_details(ss.get("particulars", ""))[:120],
-                                                })
+                                                if split_gen_rcpt:
+                                                    fy_short = fy[:2]
+                                                    receipt_dir = config.RECEIPTS_DIR / fy_short
+                                                    receipt_dir.mkdir(parents=True, exist_ok=True)
+                                                    rpath = receipt_dir / f"Receipt_{plot_part}_{rid}.pdf"
+                                                    create_simple_receipt_pdf(rpath, {
+                                                        "receipt_id": rid, "date": ss["date"],
+                                                        "member_name": m.get("Plot_Owner_Name", ""),
+                                                        "plot_no": plot_str, "amount": per_member,
+                                                        "transaction_id": ss.get("txn_id", "N/A"),
+                                                        "transaction_type": ss.get("txn_type", ""),
+                                                        "payment_details": clean_payment_details(ss.get("particulars", ""))[:120],
+                                                    })
                                     st.success(f"✅ Split {total_count} entries across {len(split_ids)} members")
                                     del st.session_state.split_src
                                     st.session_state.pop("split_src_list", None)
@@ -2065,6 +2291,7 @@ def show_dashboard_page():
                             "Move to member", options=[m["ID"] for m in members],
                             format_func=_member_label, key="led_move_target",
                         )
+                        move_gen_rcpt = st.checkbox("Generate receipts", value=False, key="led_move_gen_rcpt")
                         col_m1, col_m2 = st.columns(2)
                         with col_m1:
                             if st.button("Confirm Move", type="primary", key="led_confirm_move"):
@@ -2074,13 +2301,14 @@ def show_dashboard_page():
                                             "Date": ms["date"], "Particulars": ms["particulars"][:60],
                                             "Vch_Type": "Journal", "Vch_No": ms["vch_no"],
                                             "Debit": None, "Credit": ms["amount"],
-                                            "Description": ms["description"],
+                                            "Description": f"{ms['description']} (moved from #{ms['member_id']})",
                                             "Transaction_ID": ms.get("txn_id", ""),
                                             "Transaction_Type": ms.get("txn_type", ""),
                                         })
-                                        ref_id = _extract_ref_id(ms["description"])
-                                        if ref_id:
-                                            _delete_pdf_files(ref_id)
+                                        if move_gen_rcpt:
+                                            ref_id = _extract_ref_id(ms["description"])
+                                            if ref_id:
+                                                _delete_pdf_files(ref_id)
                                             tool = next((t for t in orchestrator_agent.tools if t.name == "regenerate_receipt"), None)
                                             if tool:
                                                 tool.func(json.dumps({"member_id": target_mid, "vch_no": ms["vch_no"]}))
@@ -2209,14 +2437,6 @@ def show_dashboard_page():
                 txn_id_map = {}  # Transaction_ID → list
                 part_map = {}  # normalized particulars → list
 
-                def norm_part(p):
-                    p = str(p or "").upper().strip()
-                    for prefix in ["BY ", "RECEIVED FROM ", "FROM ", "PAID BY ", "SPLIT FROM "]:
-                        if p.startswith(prefix):
-                            p = p[len(prefix):]
-                            break
-                    return p[:50]
-
                 for e in all_ledger:
                     mid = e.get("Member_ID") or e.get("Plot_No")
                     if not mid:
@@ -2232,12 +2452,19 @@ def show_dashboard_page():
                     txn_id = str(e.get("Transaction_ID", "") or "").strip()
                     if txn_id and txn_id != "N/A":
                         txn_id_map.setdefault(txn_id, []).append({**e, "_dup_mid": mid})
-                    pn = norm_part(e.get("Particulars", ""))
+                    pn = _normalize_particulars(e.get("Particulars", ""))
                     if pn:
                         part_map.setdefault(pn, []).append({**e, "_dup_mid": mid})
 
                 dup_groups = []
                 seen = set()
+                # Check normalized Particulars groups first (most reliable)
+                for pn, items in part_map.items():
+                    if len(items) >= 2 and len(pn) >= 5:
+                        ids = tuple(sorted((e.get("Vch_No"), e["_dup_mid"]) for e in items))
+                        if ids not in seen:
+                            seen.add(ids)
+                            dup_groups.append((f"Particulars: {pn}", items))
                 # Check date+amount groups
                 for key, items in entries_by_key.items():
                     if len(items) >= 2:
@@ -2252,13 +2479,6 @@ def show_dashboard_page():
                         if ids not in seen:
                             seen.add(ids)
                             dup_groups.append((f"Transaction ID: {txn_id}", items))
-                # Check normalized Particulars groups (but skip single-char/empty)
-                for pn, items in part_map.items():
-                    if len(items) >= 2 and len(pn) >= 5:
-                        ids = tuple(sorted((e.get("Vch_No"), e["_dup_mid"]) for e in items))
-                        if ids not in seen:
-                            seen.add(ids)
-                            dup_groups.append((f"Particulars: {pn}", items))
 
                 st.session_state.dup_result = dup_groups
 
