@@ -91,6 +91,11 @@ class DataProvider(ABC):
         """Remove a ledger entry by member ID and voucher number. Recalculates outstanding."""
         pass
 
+    @abstractmethod
+    def update_ledger_entry(self, member_id: int, vch_no: int, updates: Dict[str, Any]) -> bool:
+        """Update fields of a ledger entry (Date, Particulars, Debit, Credit, etc.). Recalculates outstanding."""
+        pass
+
     # ── Suspense Entries ────────────────────────────────────────────────
 
     @abstractmethod
@@ -111,4 +116,108 @@ class DataProvider(ABC):
     @abstractmethod
     def delete_suspense_entry(self, entry_id: int) -> bool:
         """Remove a suspense entry by ID."""
+        pass
+
+    # ── Expenses ───────────────────────────────────────────────────────
+
+    @abstractmethod
+    def add_expense(self, entry: Dict[str, Any]) -> int:
+        """Add an expense entry. Returns the expense ID."""
+        pass
+
+    @abstractmethod
+    def get_expenses(self, member_id: Optional[int] = None, from_date: Optional[str] = None,
+                     to_date: Optional[str] = None, category: Optional[str] = None,
+                     search: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Fetch expense entries with optional filters."""
+        pass
+
+    @abstractmethod
+    def delete_expense(self, expense_id: int) -> bool:
+        """Remove an expense entry by ID."""
+        pass
+
+    @abstractmethod
+    def get_expense_summary(self, fy: str) -> Dict[str, float]:
+        """Get total expense amounts per category for a given FY."""
+        pass
+
+    # ── Expense Categories ────────────────────────────────────────────
+
+    @abstractmethod
+    def get_expense_categories(self, parent: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Fetch all expense categories, optionally filtered by parent."""
+        pass
+
+    @abstractmethod
+    def add_expense_category(self, name: str, parent: Optional[str] = None) -> int:
+        """Add a new expense category. Returns ID."""
+        pass
+
+    @abstractmethod
+    def delete_expense_category(self, category_id: int) -> bool:
+        """Remove an expense category (fails if in-use)."""
+        pass
+
+    # ── Split Rules ───────────────────────────────────────────────────
+
+    @abstractmethod
+    def get_split_rules(self) -> List[Dict[str, Any]]:
+        """Fetch all split rules."""
+        pass
+
+    @abstractmethod
+    def add_split_rule(self, source_member_id: int, member_ids: List[int]) -> int:
+        """Add a split rule: source member + all members in group."""
+        pass
+
+    @abstractmethod
+    def delete_split_rule(self, rule_id: int) -> bool:
+        """Remove a split rule."""
+        pass
+
+    @abstractmethod
+    def get_split_group_for_member(self, member_id: int) -> Optional[List[int]]:
+        """If member_id is the source of a split rule, return the full member group list. Else None."""
+        pass
+
+    # ── Reports & Processed Statements ──────────────────────────────
+
+    @abstractmethod
+    def refresh_reports_sheet(self):
+        """Regenerate the Reports sheet with current outstanding balances."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_processed_statements(self) -> List[Dict[str, Any]]:
+        """Fetch all processed bank statement records."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def record_processed_statement(self, filename: str, date_range: str,
+                                    entry_count: int, fmt: str, file_hash: str):
+        """Record a successfully processed bank statement."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_member_ledger_all(self) -> List[Dict[str, Any]]:
+        """Fetch the entire ledger (all members)."""
+        raise NotImplementedError
+
+    # ── Identifiers (all types) ──────────────────────────────────────
+
+    @abstractmethod
+    def get_all_identifiers(self, id_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Fetch all identifiers, optionally filtered by type."""
+        pass
+
+    @abstractmethod
+    def delete_identifier(self, ref_id: int) -> bool:
+        """Remove a payment/expense identifier by its row ID."""
+        pass
+
+    @abstractmethod
+    def add_identifier(self, member_id: int, id_type: str, id_value: str,
+                       date: str = None, confidence: int = 1) -> int:
+        """Add a new identifier manually."""
         pass
