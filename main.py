@@ -906,7 +906,7 @@ def show_dashboard_page():
                     "Vch_No": vch_no,
                     "Debit": None,
                     "Credit": u["amount"],
-                    "Description": f"Receipt {receipt_id} — Bank Statement ({u['txn_type'] or 'N/A'})",
+                    "Description": f"Receipt {receipt_id} — Manual Bank Statement ({u['txn_type'] or 'N/A'})",
                     "Transaction_Type": u.get("txn_type", "") or "",
                     "Transaction_ID": u.get("txn_id") or "",
                 })
@@ -1179,6 +1179,96 @@ def show_dashboard_page():
                     st.rerun()
         else:
             st.success("🎉 All entries processed!")
+
+        # ── Reprocess / Rebuild from stored PDFs ─────────────────
+        if "reprocess_msg" not in st.session_state:
+            st.session_state.reprocess_msg = None
+        if st.session_state.reprocess_msg:
+            st.success(st.session_state.reprocess_msg)
+            if st.button("Dismiss", key="reprocess_dismiss"):
+                st.session_state.reprocess_msg = None
+                st.rerun()
+
+        with st.expander("🔄 Reprocess / Rebuild from Bank Statements", expanded=False):
+            st.markdown("**Previously processed statements:**")
+            proc_list = data_provider.get_processed_statements()
+            if not proc_list:
+                st.info("No previously processed statements found.")
+            else:
+                for ps in proc_list:
+                    cols = st.columns([3, 1, 1])
+                    cols[0].write(f"`{ps.get('Filename', '?')}` ({ps.get('Entry_Count', 0)} entries, {ps.get('Processed_At', '')})")
+                    cols[1].write(f"`{ps.get('Format', '')}`")
+                    with cols[2]:
+                        if st.button("Reprocess", key=f"reprocess_{ps.get('Filename', '')}"):
+                            fname = ps.get("Filename", "")
+                            fpath = config.BANK_STATEMENTS_DIR / fname
+                            if not fpath.exists():
+                                st.session_state.reprocess_msg = f"❌ File not found: {fname}"
+                            else:
+                                import hashlib
+                                import shutil
+                                from datetime import datetime as _dt
+                                from tools.pdf_parser import parse_bank_pdf
+
+                                ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+                                shutil.copy2(config.SOCIETY_DATA_FILE, config.BACKUPS_DIR / f"society_data_{ts}_auto_reprocess.xlsx")
+
+                                deleted = data_provider.clear_auto_ledger_entries()
+                                parsed = parse_bank_pdf(str(fpath), password=config.BANK_STMT_PASSWORD)
+                                entries_text = "\n".join(parsed["entries"])
+                                tool_input = json.dumps({
+                                    "statement": entries_text,
+                                    "generate_receipts": False,
+                                    "format": ps.get("Format", parsed["format"]),
+                                    "filename": fname,
+                                })
+                                result = _run_tool("process_bank_statement_pdf", tool_input)
+                                st.session_state.bank_stmt_result = result
+                                data_provider.refresh_reports_sheet()
+                                st.session_state.reprocess_msg = (
+                                    f"✅ Reprocessed '{fname}' — deleted {deleted} old entries, "
+                                    f"re-processed {parsed['entry_count']} entries"
+                                )
+                                st.session_state.bank_stmt_processed = set()
+                                st.rerun()
+
+            st.divider()
+            if st.button("🔄 Rebuild from All Statements", type="primary", use_container_width=True, key="rebuild_all"):
+                import shutil
+                from datetime import datetime as _dt
+                from tools.pdf_parser import parse_bank_pdf
+
+                ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+                shutil.copy2(config.SOCIETY_DATA_FILE, config.BACKUPS_DIR / f"society_data_{ts}_auto_rebuild.xlsx")
+
+                deleted = data_provider.clear_auto_ledger_entries()
+                proc_list = data_provider.get_processed_statements()
+                total_parsed = 0
+                for ps in proc_list:
+                    fname = ps.get("Filename", "")
+                    fpath = config.BANK_STATEMENTS_DIR / fname
+                    if not fpath.exists():
+                        continue
+                    parsed = parse_bank_pdf(str(fpath), password=config.BANK_STMT_PASSWORD)
+                    entries_text = "\n".join(parsed["entries"])
+                    tool_input = json.dumps({
+                        "statement": entries_text,
+                        "generate_receipts": False,
+                        "format": ps.get("Format", parsed["format"]),
+                        "filename": fname,
+                    })
+                    result = _run_tool("process_bank_statement_pdf", tool_input)
+                    if isinstance(result, dict):
+                        total_parsed += len(result.get("matched", [])) + len(result.get("unmatched", []))
+                    data_provider.refresh_reports_sheet()
+                st.session_state.reprocess_msg = (
+                    f"✅ Rebuilt from {len(proc_list)} statements — deleted {deleted} old entries, "
+                    f"re-processed {total_parsed} entries. Review unmatched entries above."
+                )
+                st.session_state.bank_stmt_result = None
+                st.session_state.bank_stmt_processed = set()
+                st.rerun()
 
     # ═══════════════════════════════════════════════════════════════
     # TAB 2: Expenses

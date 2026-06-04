@@ -502,6 +502,21 @@ class LocalExcelDataProvider(DataProvider):
             return []
         return df.to_dict("records")
 
+    def clear_auto_ledger_entries(self) -> int:
+        """Delete ledger entries created by auto-processing (non-manual, non-invoice).
+        Returns count of deleted entries. Preserves entries with 'Manual' in Description
+        or Transaction_Type 'INVOICE'."""
+        df = pd.read_excel(self.excel_file, sheet_name=self.ledger_sheet)
+        if df.empty:
+            return 0
+        before = len(df)
+        mask_manual = df["Description"].astype(str).str.contains("Manual", na=False)
+        mask_invoice = df["Transaction_Type"].astype(str).str.upper().str.contains("INVOICE", na=False)
+        df = df[mask_manual | mask_invoice].reset_index(drop=True)
+        self._write_sheet(df, self.ledger_sheet)
+        self._invalidate_cache()
+        return before - len(df)
+
     def get_processed_statements(self) -> List[Dict[str, Any]]:
         try:
             df = pd.read_excel(self.excel_file, sheet_name="Processed_Statements")
