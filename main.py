@@ -2199,6 +2199,119 @@ def show_dashboard_page():
 
         st.divider()
 
+        # ── Duplicate Detection ───────────────────────────────────
+        with st.expander("🔍 Duplicate Detection", expanded=False):
+            if "dup_result" not in st.session_state:
+                st.session_state.dup_result = []
+            if st.button("Run Duplicate Scan", key="dup_scan_btn"):
+                all_ledger = data_provider.get_member_ledger_all()
+                entries_by_key = {}  # (date, amount_rounded) → list of entries with member info
+                txn_id_map = {}  # Transaction_ID → list
+                part_map = {}  # normalized particulars → list
+
+                def norm_part(p):
+                    p = str(p or "").upper().strip()
+                    for prefix in ["BY ", "RECEIVED FROM ", "FROM ", "PAID BY ", "SPLIT FROM "]:
+                        if p.startswith(prefix):
+                            p = p[len(prefix):]
+                            break
+                    return p[:50]
+
+                for e in all_ledger:
+                    mid = e.get("Member_ID") or e.get("Plot_No")
+                    if not mid:
+                        continue
+                    try:
+                        mid = int(float(mid))
+                    except (ValueError, TypeError):
+                        continue
+                    date = str(e.get("Date", "") or "")
+                    amount = round(_s(e.get("Credit")) or _s(e.get("Debit")), 0)
+                    key = (date, amount)
+                    entries_by_key.setdefault(key, []).append({**e, "_dup_mid": mid})
+                    txn_id = str(e.get("Transaction_ID", "") or "").strip()
+                    if txn_id and txn_id != "N/A":
+                        txn_id_map.setdefault(txn_id, []).append({**e, "_dup_mid": mid})
+                    pn = norm_part(e.get("Particulars", ""))
+                    if pn:
+                        part_map.setdefault(pn, []).append({**e, "_dup_mid": mid})
+
+                dup_groups = []
+                seen = set()
+                # Check date+amount groups
+                for key, items in entries_by_key.items():
+                    if len(items) >= 2:
+                        ids = tuple(sorted((e.get("Vch_No"), e["_dup_mid"]) for e in items))
+                        if ids not in seen:
+                            seen.add(ids)
+                            dup_groups.append(("Date + Amount", items))
+                # Check Transaction_ID groups
+                for txn_id, items in txn_id_map.items():
+                    if len(items) >= 2:
+                        ids = tuple(sorted((e.get("Vch_No"), e["_dup_mid"]) for e in items))
+                        if ids not in seen:
+                            seen.add(ids)
+                            dup_groups.append((f"Transaction ID: {txn_id}", items))
+                # Check normalized Particulars groups (but skip single-char/empty)
+                for pn, items in part_map.items():
+                    if len(items) >= 2 and len(pn) >= 5:
+                        ids = tuple(sorted((e.get("Vch_No"), e["_dup_mid"]) for e in items))
+                        if ids not in seen:
+                            seen.add(ids)
+                            dup_groups.append((f"Particulars: {pn}", items))
+
+                st.session_state.dup_result = dup_groups
+
+            dup_groups = st.session_state.dup_result
+            if not dup_groups:
+                st.info("Click 'Run Duplicate Scan' to check for potential duplicates across all members.")
+            else:
+                st.warning(f"⚠️ Found {len(dup_groups)} potential duplicate group(s)")
+                for reason, items in dup_groups:
+                    with st.container(border=True):
+                        st.caption(f"**{reason}**")
+                        all_vch = set()
+                        for e in items:
+                            member_info = _find_member(e["_dup_mid"])
+                            mlabel = f"P{member_info.get('Plot_No','?')} {member_info.get('Plot_Owner_Name','?')}" if member_info else f"ID {e['_dup_mid']}"
+                            cr = _s(e.get("Credit"))
+                            amt_lbl = f"CR ₹{cr:>,.2f}" if cr > 0 else f"DR ₹{_s(e.get('Debit')):>,.2f}"
+                            is_split = str(e.get("Transaction_Type", "") or "").upper() == "SPLIT"
+                            cols = st.columns([2, 2, 1.5, 1.5, 0.7, 0.7])
+                            cols[0].write(f"{e.get('Date','')} {amt_lbl}")
+                            cols[1].write(mlabel)
+                            cols[2].write(f"Vch #{int(e.get('Vch_No',0))}")
+                            cols[3].write(f"{'SPLIT' if is_split else '—'}")
+                            with cols[4]:
+                                if st.button("🗑️", key=f"dup_del_{id(e)}", help="Delete this entry"):
+                                    if data_provider.delete_ledger_entry(e["_dup_mid"], int(e.get("Vch_No", 0))):
+                                        _delete_pdf_files(_extract_ref_id(str(e.get("Description", ""))))
+                                        st.session_state.dup_result = []
+                                        st.success(f"Deleted Vch #{int(e.get('Vch_No',0))}")
+                                        st.rerun()
+                            with cols[5]:
+                                if is_split:
+                                    if st.button("↩️", key=f"dup_unsp_{id(e)}", help="Undo split (delete all split entries)"):
+                                        vch_no = int(e.get("Vch_No", 0))
+                                        all_split_entries = [
+                                            oe for oe in data_provider.get_member_ledger_all()
+                                            if str(oe.get("Transaction_Type", "") or "").upper() == "SPLIT"
+                                            and f"Split from #{vch_no}" in str(oe.get("Description", ""))
+                                        ]
+                                        total_amt = 0
+                                        for se in all_split_entries:
+                                            se_mid = se.get("Member_ID") or se.get("Plot_No")
+                                            se_vch = int(se.get("Vch_No", 0))
+                                            if se_mid and se_vch:
+                                                total_amt += _s(se.get("Credit"))
+                                                data_provider.delete_ledger_entry(int(float(se_mid)), se_vch)
+                                        data_provider.delete_ledger_entry(e["_dup_mid"], vch_no)
+                                        st.session_state.dup_result = []
+                                        st.success(f"✅ Undid split — ₹{total_amt:>,.2f} total across {len(all_split_entries)+1} entries deleted")
+                                        st.rerun()
+
+        st.divider()
+
         # ── Budget Spend Analysis ─────────────────────────────────
         with st.expander("💰 Budget Spend Analysis", expanded=False):
             all_fys = _get_available_fys(
