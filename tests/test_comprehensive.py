@@ -1116,6 +1116,38 @@ class TestAccountsContinuity(unittest.TestCase):
             f"Legacy entry should not affect opening: expected {expected}, "
             f"got {fy_23_24['opening_balance']}")
 
+    def test_interest_income_crud(self):
+        """Add and retrieve Interest Income records"""
+        self.provider.get_accounts_entries()  # ensure sheet exists
+        self.provider.add_interest_income({
+            "Date": "04-04-2026",
+            "Particulars": "Int.Pd:01-01-2026 to 31-03-2026",
+            "Amount": 3056.00,
+            "Transaction_ID": "474902010030343",
+            "Transaction_Type": "NEFT",
+            "Source_File": "April_26.pdf",
+            "Accounts_Entry_ID": 100,
+        })
+        records = self.provider.get_interest_income()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["Amount"], 3056.00)
+        self.assertEqual(records[0]["Source_File"], "April_26.pdf")
+
+    def test_interest_income_filter_by_source_file(self):
+        """get_interest_income filters by source_file"""
+        self.provider.get_accounts_entries()
+        self.provider.add_interest_income({
+            "Date": "04-04-2026", "Particulars": "Int.Pd Q1", "Amount": 1000.0,
+            "Source_File": "A.pdf", "Accounts_Entry_ID": 1,
+        })
+        self.provider.add_interest_income({
+            "Date": "05-04-2026", "Particulars": "Int.Pd Q2", "Amount": 2000.0,
+            "Source_File": "B.pdf", "Accounts_Entry_ID": 2,
+        })
+        filtered = self.provider.get_interest_income(source_file="A.pdf")
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0]["Amount"], 1000.0)
+
 
 def run_tests():
     """Run all tests"""

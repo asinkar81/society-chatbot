@@ -926,6 +926,19 @@ def show_dashboard_page():
                     view.columns = list(avail.values())
                     st.dataframe(view, use_container_width=True, hide_index=True)
 
+                interest_entries = data_provider.get_interest_income()
+                if interest_entries:
+                    with st.expander(f"📈 Interest Income ({len(interest_entries)} entries)", expanded=False):
+                        ii_df = [{
+                            "ID": e.get("ID", ""),
+                            "Date": e.get("Date", ""),
+                            "Particulars": str(e.get("Particulars", "") or "")[:60],
+                            "Amount": f"₹{float(e.get('Amount', 0) or 0):,.2f}",
+                            "File": e.get("Source_File", ""),
+                            "Txn_ID": str(e.get("Transaction_ID", "") or ""),
+                        } for e in interest_entries]
+                        st.dataframe(ii_df, use_container_width=True, hide_index=True)
+
         # ── Create Ledger from Accounts ──
         if pending_count > 0 or unmatched_count > 0:
             st.divider()
@@ -978,7 +991,7 @@ def show_dashboard_page():
                 for u in unmatched_entries:
                     eid = u["Entry_ID"]
                     with st.container(border=True):
-                        cols = st.columns([0.3, 1.3, 1.3, 2.5, 1.8, 0.7, 0.7, 0.7])
+                        cols = st.columns([0.3, 1.3, 1.3, 2.5, 1.8, 0.7, 0.7, 0.7, 0.7])
                         cols[0].checkbox("", key=f"ac_chk_{eid}", label_visibility="collapsed")
                         cols[1].markdown(f"**{u.get('Date', '')}**")
                         cols[2].markdown(f"₹{float(u.get('Deposit', 0) or 0):>,.2f}")
@@ -992,6 +1005,8 @@ def show_dashboard_page():
                             ign_btn = st.form_submit_button("Ignore", key=f"ac_ign_{eid}", use_container_width=True)
                         with cols[7]:
                             sus_btn = st.form_submit_button("Suspense", key=f"ac_sus_{eid}", use_container_width=True)
+                        with cols[8]:
+                            inc_btn = st.form_submit_button("📈 Int.", key=f"ac_inc_{eid}", use_container_width=True)
 
                         if add_btn:
                             mid = member_id_map.get(st.session_state.get(f"ac_mem_{eid}", ""))
@@ -1057,6 +1072,19 @@ def show_dashboard_page():
                                 "Description": f"From Accounts (manual) — {str(u.get('Particulars', '') or '')[:60]}",
                             })
                             data_provider.update_accounts_entry(eid, {"Status": "Skipped"})
+                            st.rerun()
+                        if inc_btn:
+                            data_provider.add_interest_income({
+                                "Date": u.get("Date", ""),
+                                "Particulars": str(u.get("Particulars", "") or "")[:200],
+                                "Amount": float(u.get("Deposit", 0) or 0),
+                                "Transaction_ID": u.get("Transaction_ID", "") or "",
+                                "Transaction_Type": u.get("Transaction_Type", "") or "",
+                                "Source_File": u.get("Source_File", ""),
+                                "Accounts_Entry_ID": eid,
+                            })
+                            data_provider.update_accounts_entry(eid, {"Status": "Skipped"})
+                            st.info(f"📈 Recorded ₹{float(u.get('Deposit', 0) or 0):>,.2f} as Interest Income")
                             st.rerun()
 
                 st.divider()

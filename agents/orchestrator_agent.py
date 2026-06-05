@@ -2420,12 +2420,33 @@ class OrchestratorAgent(BaseAgent):
                 added += 1
 
             self.data_provider.add_accounts_entries(entries)
+
+            # Auto-record bank interest as Income
+            auto_income = 0
+            for e in entries:
+                particulars = str(e.get("Particulars", "") or "")
+                deposit = float(e.get("Deposit", 0) or 0)
+                if "Int.Pd" in particulars and deposit > 0:
+                    self.data_provider.add_interest_income({
+                        "Date": e["Date"],
+                        "Particulars": particulars[:200],
+                        "Amount": deposit,
+                        "Transaction_ID": e.get("Transaction_ID", "") or "",
+                        "Transaction_Type": e.get("Transaction_Type", "") or "",
+                        "Source_File": filename,
+                        "Accounts_Entry_ID": e["Entry_ID"],
+                    })
+                    self.data_provider.update_accounts_entry(e["Entry_ID"], {"Status": "Skipped"})
+                    auto_income += 1
+
             summary = self.data_provider.get_accounts_summary()
 
             lines_out = []
             lines_out.append(f"Parsed {fmt} → {result['entry_count']} entries found, {added} added to Accounts sheet.")
             if dup_flagged:
                 lines_out.append(f"⚠️ {dup_flagged} entries flagged as Potential Duplicates (review in Accounts tab).")
+            if auto_income:
+                lines_out.append(f"📈 {auto_income} interest entry(ies) auto-recorded as Income (Interest_Income sheet).")
             lines_out.append("")
             for stmt in summary.get("statements", []):
                 if stmt["source_file"] == filename:
@@ -2524,6 +2545,7 @@ class OrchestratorAgent(BaseAgent):
 
             from tools.pdf_parser import _ngram_match, _extract_search_tokens
 
+            auto_income = 0
             for acct_entry in deposit_entries:
                 date = str(acct_entry.get("Date", "") or "")
                 amount = float(acct_entry["Deposit"])
@@ -2531,6 +2553,21 @@ class OrchestratorAgent(BaseAgent):
                 txn_type = str(acct_entry.get("Transaction_Type", "") or "")
                 txn_id = str(acct_entry.get("Transaction_ID", "") or "")
                 entry_id = int(acct_entry.get("Entry_ID", 0))
+
+                # Auto-record bank interest as Income (skip member matching)
+                if "Int.Pd" in particulars:
+                    self.data_provider.add_interest_income({
+                        "Date": date,
+                        "Particulars": particulars[:200],
+                        "Amount": amount,
+                        "Transaction_ID": txn_id,
+                        "Transaction_Type": txn_type,
+                        "Source_File": acct_entry.get("Source_File", ""),
+                        "Accounts_Entry_ID": entry_id,
+                    })
+                    self.data_provider.update_accounts_entry(entry_id, {"Status": "Skipped"})
+                    auto_income += 1
+                    continue
 
                 search_tokens, search_identifiers = _extract_search_tokens(particulars, txn_type, txn_id)
 
@@ -2751,6 +2788,8 @@ class OrchestratorAgent(BaseAgent):
 
             lines = [f"Ledger creation for FY {fy} completed:"]
             lines.append(f"  ✓ Matched: {len(matched_results)} entries")
+            if auto_income:
+                lines.append(f"  📈 Interest Income (auto): {auto_income} entries")
             if matched_results:
                 for r in matched_results:
                     lines.append(f"    • ₹{r['amount']:>8,.2f} → {r['member_name']} (Plot {r['plot_no']}) "

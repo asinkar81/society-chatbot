@@ -102,8 +102,6 @@ def _strip_non_transaction(line: str) -> bool:
 def clean_entries(lines: List[str]) -> List[str]:
     filtered = [l for l in lines if _strip_non_transaction(l)]
     normalized = [re.sub(r'^\d+\s+(?=\d{2}-\d{2}-\d{4})', '', l) for l in filtered]
-    while normalized and not re.match(r"^\d{2}-\d{2}-\d{4}", normalized[0]):
-        normalized.pop(0)
     if not normalized:
         return []
     # Truncate at "Summary" — anything after is appendix (non-transaction)
@@ -111,12 +109,27 @@ def clean_entries(lines: List[str]) -> List[str]:
         if re.match(r"^Summary\b", line, re.IGNORECASE):
             normalized = normalized[:i]
             break
+    preamble = []
+    while normalized and not re.match(r"^\d{2}-\d{2}-\d{4}", normalized[0]):
+        preamble.append(normalized.pop(0))
+    if not normalized:
+        return []
+    _EMBEDDED_ENTRY = re.compile(r'\b(\d{1,3})\s+(?=\d{2}-\d{2}-\d{4})')
     merged = []
     for line in normalized:
         if re.match(r"^\d{2}-\d{2}-\d{4}", line):
+            if preamble:
+                line = line + " " + " ".join(preamble)
+                preamble = []
             merged.append(line)
         elif merged:
-            merged[-1] = merged[-1] + " " + line.strip()
+            parts = _EMBEDDED_ENTRY.split(line, maxsplit=1)
+            if len(parts) == 3:
+                before, _, after = parts
+                merged[-1] = merged[-1] + " " + before.strip()
+                merged.append(after)
+            else:
+                merged[-1] = merged[-1] + " " + line.strip()
     return merged
 
 
@@ -285,6 +298,8 @@ def _parse_entry_amounts(particulars: str, fmt: str, prev_balance: Optional[floa
             return {"withdrawal": None, "deposit": amount, "balance": bal, "entry_type": "credit"}
         if any(kw in text_u for kw in ["CHQ", "CHEQUE", "CTS", "CASH"]):
             return {"withdrawal": amount, "deposit": None, "balance": bal, "entry_type": "debit"}
+        if "INT.PD" in text_u or "INT PAID" in text_u or "INTEREST" in text_u:
+            return {"withdrawal": None, "deposit": amount, "balance": bal, "entry_type": "credit"}
         return {"withdrawal": None, "deposit": None, "balance": bal, "entry_type": None}
 
     if fmt in ("email_attachment", "printed_printout", "serial_number_prefix"):

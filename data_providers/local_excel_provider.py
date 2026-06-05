@@ -49,6 +49,11 @@ class LocalExcelDataProvider(DataProvider):
         "ID", "Name", "Parent",
     ]
 
+    INTEREST_INCOME_HEADERS = [
+        "ID", "Date", "Particulars", "Amount", "Transaction_ID",
+        "Transaction_Type", "Source_File", "Accounts_Entry_ID", "Entry_Date",
+    ]
+
     SPLIT_RULES_HEADERS = [
         "ID", "Source_Member_ID", "Members",
     ]
@@ -71,6 +76,7 @@ class LocalExcelDataProvider(DataProvider):
         self.expense_categories_sheet = "Expense_Categories"
         self.split_rules_sheet = "Split_Rules"
         self.accounts_sheet = "Accounts"
+        self.interest_income_sheet = "Interest_Income"
         self._ensure_workbook_exists()
         self._ensure_payment_refs_sheet_exists()
         self._ensure_suspense_sheet_exists()
@@ -78,6 +84,7 @@ class LocalExcelDataProvider(DataProvider):
         self._ensure_sheet(self.expense_categories_sheet, self.EXPENSE_CATEGORIES_HEADERS)
         self._ensure_sheet(self.split_rules_sheet, self.SPLIT_RULES_HEADERS)
         self._ensure_sheet(self.accounts_sheet, self.ACCOUNTS_HEADERS)
+        self._ensure_sheet(self.interest_income_sheet, self.INTEREST_INCOME_HEADERS)
         self._seed_default_categories()
         self._migrate_members_schema()
         self._migrate_expenses_schema()
@@ -902,6 +909,38 @@ class LocalExcelDataProvider(DataProvider):
             return False
         self._write_sheet(df.reset_index(drop=True), self.expense_categories_sheet)
         return True
+
+    # ── Interest Income ─────────────────────────────────────────────────
+
+    def add_interest_income(self, entry: Dict[str, Any]) -> int:
+        from datetime import datetime as _dt
+        self._ensure_sheet(self.interest_income_sheet, self.INTEREST_INCOME_HEADERS)
+        try:
+            df = pd.read_excel(self.excel_file, sheet_name=self.interest_income_sheet)
+        except Exception:
+            df = pd.DataFrame(columns=self.INTEREST_INCOME_HEADERS)
+        new_id = int(df["ID"].max()) + 1 if not df.empty and "ID" in df.columns else 1
+        entry["ID"] = new_id
+        entry["Entry_Date"] = entry.get("Entry_Date", _dt.now().strftime("%d-%m-%Y %H:%M"))
+        row = pd.DataFrame([{h: entry.get(h, "") for h in self.INTEREST_INCOME_HEADERS}])
+        if df.empty:
+            df = row
+        else:
+            df = pd.concat([df, row], ignore_index=True)
+        self._write_sheet(df, self.interest_income_sheet)
+        return new_id
+
+    def get_interest_income(self, source_file: Optional[str] = None) -> List[Dict[str, Any]]:
+        self._ensure_sheet(self.interest_income_sheet, self.INTEREST_INCOME_HEADERS)
+        try:
+            df = pd.read_excel(self.excel_file, sheet_name=self.interest_income_sheet)
+        except Exception:
+            return []
+        if df.empty:
+            return []
+        if source_file:
+            df = df[df["Source_File"] == source_file]
+        return df.to_dict("records")
 
     # ── Split Rules ────────────────────────────────────────────────────────
 

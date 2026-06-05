@@ -454,3 +454,42 @@ def test_strip_non_transaction_summary():
     in clean_entries after normalization."""
     assert _strip_non_transaction("Summary :") is True
     assert _strip_non_transaction("Summary") is True
+
+
+def test_clean_entries_preserves_preamble():
+    """Lines before the first date line (preamble) are prepended to the
+    first entry — e.g. transaction ID/particulars placed above the
+    serial+date+amounts line by pdfplumber."""
+    lines = [
+        "474902010030343:Int.Pd:01-01-",
+        "1 04-04-2026 3,056.00 4,07,842.72 Cr",
+        "2026 to 31-03-2026",
+    ]
+    result = clean_entries(lines)
+    assert len(result) == 1, f"Expected 1 entry, got {len(result)}"
+    assert result[0].startswith("04-04-2026")
+    assert "Int.Pd" in result[0]
+    assert "474902010030343:Int.Pd:01-01-" in result[0]
+    assert "3,056.00" in result[0]
+    assert "4,07,842.72 Cr" in result[0]
+
+
+def test_clean_entries_does_not_split_interest_continuation():
+    """Int.Pd continuation line containing a date in particulars
+    (e.g. '2026 to 31-03-2026') is NOT split — date is preceded by text,
+    not a serial number."""
+    lines = [
+        "1 04-04-2026 474902010030343:Int.Pd:01-01-",
+        "2026 to 31-03-2026 3,056.00 4,07,842.72 Cr",
+        "2 07-04-2026 Dr. Tran for funding A/c",
+        "474903030163834 50,000.00 3,57,842.72 Cr",
+    ]
+    result = clean_entries(lines)
+    assert len(result) == 2, f"Expected 2 entries, got {len(result)}"
+    # Entry 1: Int.Pd fully merged (not split at '31-03-2026')
+    assert result[0].startswith("04-04-2026")
+    assert "Int.Pd" in result[0]
+    assert "to 31-03-2026" in result[0]
+    assert "3,056.00 4,07,842.72 Cr" in result[0]
+    # Entry 2: Dr. Tran
+    assert result[1].startswith("07-04-2026 Dr. Tran")
