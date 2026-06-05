@@ -68,6 +68,8 @@ def _strip_non_transaction(line: str) -> bool:
         r"SUB\s*TOTAL",
         r"GRAND\s+TOTAL",
         r"CUMULATIVE\s+TOTAL",
+        r"\b(?:C/F|B/F)\b",
+        r"^Total\b",
     ]
     for pat in cumulative_patterns:
         if re.search(pat, line, re.IGNORECASE):
@@ -80,7 +82,19 @@ def _strip_non_transaction(line: str) -> bool:
         return False
     if re.match(r"^\w+\s+BANK\s+(LTD|LIMITED)?$", line, re.IGNORECASE):
         return False
-    if re.search(r"Page\s+\d+\s+of\s+\d+", line, re.IGNORECASE):
+    if re.search(r"Page\s+\d+(?:\s+of\s+\d+)?", line, re.IGNORECASE):
+        return False
+    if re.search(r"BROUGHT\s+FORWARD|CARRIED\s+FORWARD", line, re.IGNORECASE):
+        return False
+    if re.match(r"^REP\d+", line, re.IGNORECASE):
+        return False
+    if re.search(r"REPORT\s+FOR\s+THE\s+PERIOD", line, re.IGNORECASE):
+        return False
+    if re.search(r"CO\s+OPERATIVE\s+SOCIETY", line, re.IGNORECASE):
+        return False
+    if re.match(r"^\d{2}-\d{2}-\d{4}\s+\d{2}:\d{2}:\d{2}\s+", line):
+        return False
+    if re.match(r"^\d{2}:\d{2}:\d{2}\s+", line):
         return False
     return True
 
@@ -92,6 +106,11 @@ def clean_entries(lines: List[str]) -> List[str]:
         normalized.pop(0)
     if not normalized:
         return []
+    # Truncate at "Summary" — anything after is appendix (non-transaction)
+    for i, line in enumerate(normalized):
+        if re.match(r"^Summary\b", line, re.IGNORECASE):
+            normalized = normalized[:i]
+            break
     merged = []
     for line in normalized:
         if re.match(r"^\d{2}-\d{2}-\d{4}", line):
@@ -157,46 +176,90 @@ def _extract_txn_id(text: str, txn_type: str, all_lines: Optional[List[str]] = N
     return ""
 
 
-def _extract_search_tokens(particulars: str, txn_type: str) -> set:
+def _extract_search_tokens(particulars: str, txn_type: str, txn_id: str = None) -> tuple:
     tokens = set()
+    identifiers = []
+
+    TITLE_WORDS = {"MR", "MRS", "MS", "SHRI", "SMT", "DR", "SRI", "M/S", "CMN",
+                   "PAY", "AND", "THE", "FROM", "B"}
+    STOP_WORDS = TITLE_WORDS | {"PAYMENT", "RECEIVED", "TRANSFER", "NEFT", "RTGS",
+                                "IMPS", "CHQ", "CHEQUE", "BANK", "REFERENCE",
+                                "CREDIT", "DEBIT", "BY", "TO", "VIA", "THROUGH"}
+
+    def should_record_name(token: str) -> bool:
+        t = token.upper()
+        if len(t) <= 2:
+            return False
+        if t in STOP_WORDS:
+            return False
+        if t.isalpha() and t.isupper() and len(t) <= 4:
+            return False
+        if bool(re.match(r'^[\d,]+\.\d{2}$', t)):
+            return False
+        return True
+
     cr_match = re.search(r'/CR/([^/]+)', particulars)
     if cr_match:
         name_raw = cr_match.group(1).strip()
         name_raw = re.sub(r'^(Mr|Mrs|Ms|Shri|Smt|Dr|Sri)\s+', '', name_raw, flags=re.IGNORECASE)
         for t in re.split(r'[\s.]+', name_raw):
             if len(t) > 1:
-                tokens.add(t.upper())
+                token = t.upper()
+                tokens.add(token)
+                if should_record_name(token):
+                    identifiers.append((token, "PAYEE_NAME"))
+
     if txn_type == "UPI":
         segments = particulars.split("/")
         if segments:
             last_seg = segments[-1].strip().split()[0]
             last_seg = re.sub(r'[\s.,]', '', last_seg)
             if len(last_seg) > 3 and not last_seg.isdigit():
-                tokens.add(last_seg.upper())
+                token = last_seg.upper()
+                tokens.add(token)
+                identifiers.append((token, "UPI_ID"))
+
     if txn_type == "NEFT":
         after_prefix = re.sub(r'^NEFT:?\s*', '', particulars)
-        after_amounts = re.sub(r'\s+[\d,]+\.\d{2}\s*(?:Cr)?(?:\s+[\d,]+\.\d{2}\s*(?:Cr)?)?\s*$', '', after_prefix, count=1)
+        after_amounts = re.sub(r'(?:\s+[\d,]+\.\d{2}\s*(?:Cr)?){1,2}\s*$', '', after_prefix, count=1)
+        if after_amounts == after_prefix and re.match(r'^[\d,]+\.\d{2}\s*[/\\]?\s*', after_amounts):
+            after_amounts = re.sub(r'^[\d,]+\.\d{2}\s*[/\\]?\s*', '', after_amounts, count=1)
         parts = after_amounts.split()
         if len(parts) >= 2:
             name_tokens_list = parts[:-1]
             for t in name_tokens_list:
                 t_clean = re.sub(r'^(Mr|Mrs|Ms|Shri|Smt|Dr|Sri|MRS?)\s+', '', t, flags=re.IGNORECASE)
                 if len(t_clean) > 1:
-                    tokens.add(t_clean.upper())
+                    token = t_clean.upper()
+                    tokens.add(token)
+                    if should_record_name(token):
+                        identifiers.append((token, "PAYEE_NAME"))
+
     mobft_match = re.search(r'from:\s*([A-Za-z\s.]+?)(?:/|\s+\d)', particulars)
     if mobft_match:
         name_raw = mobft_match.group(1).strip()
         for t in re.split(r'[\s.]+', name_raw):
             if len(t) > 1:
-                tokens.add(t.upper())
+                token = t.upper()
+                tokens.add(token)
+                if should_record_name(token):
+                    identifiers.append((token, "PAYEE_NAME"))
+
     email_match = re.search(r'([\w.]+)@', particulars)
     if email_match:
         for p in email_match.group(1).split("."):
             if len(p) > 2:
-                tokens.add(p.upper())
-    for phone in re.findall(r'(\d{10})', particulars):
+                token = p.upper()
+                tokens.add(token)
+                identifiers.append((token, "UPI_ID"))
+
+    for phone in re.findall(r'([6-9]\d{9})', particulars):
+        if txn_id and phone in txn_id:
+            continue
         tokens.add(phone)
-    return tokens
+        identifiers.append((phone, "MOBILE"))
+
+    return tokens, identifiers
 
 
 def _parse_entry_amounts(particulars: str, fmt: str, prev_balance: Optional[float] = None) -> Optional[Dict[str, Any]]:
@@ -207,29 +270,38 @@ def _parse_entry_amounts(particulars: str, fmt: str, prev_balance: Optional[floa
     balance = float(amounts[-1].group(1).replace(",", ""))
     if n == 1:
         return {"withdrawal": None, "deposit": None, "balance": balance, "entry_type": None}
+    if n >= 3:
+        w_raw = float(amounts[-3].group(1).replace(",", ""))
+        d_raw = float(amounts[-2].group(1).replace(",", ""))
+        return {
+            "withdrawal": w_raw if w_raw > 0 else None,
+            "deposit": d_raw if d_raw > 0 else None,
+            "balance": balance,
+            "entry_type": "credit" if d_raw > 0 else "debit",
+        }
+    def _guess_direction(text: str, amount: float, bal: float) -> Dict[str, Any]:
+        text_u = text.upper()
+        if any(kw in text_u for kw in ["NEFT", "UPI", "MOBFT", "IMPS", "RTGS"]):
+            return {"withdrawal": None, "deposit": amount, "balance": bal, "entry_type": "credit"}
+        if any(kw in text_u for kw in ["CHQ", "CHEQUE", "CTS", "CASH"]):
+            return {"withdrawal": amount, "deposit": None, "balance": bal, "entry_type": "debit"}
+        return {"withdrawal": None, "deposit": None, "balance": bal, "entry_type": None}
+
     if fmt in ("email_attachment", "printed_printout", "serial_number_prefix"):
-        if n >= 3:
-            w_raw = float(amounts[-3].group(1).replace(",", ""))
-            d_raw = float(amounts[-2].group(1).replace(",", ""))
-            return {
-                "withdrawal": w_raw if w_raw > 0 else None,
-                "deposit": d_raw if d_raw > 0 else None,
-                "balance": balance,
-                "entry_type": "credit" if d_raw > 0 else "debit",
-            }
-        else:
-            txn = float(amounts[-2].group(1).replace(",", ""))
-            suffix = (amounts[-2].group(2) or "").upper()
-            if suffix == "DR":
-                return {"withdrawal": txn, "deposit": None, "balance": balance, "entry_type": "debit"}
-            elif suffix == "CR":
-                return {"withdrawal": None, "deposit": txn, "balance": balance, "entry_type": "credit"}
-            if prev_balance is not None:
-                if abs(balance - (prev_balance - txn)) < 0.01:
-                    return {"withdrawal": txn, "deposit": None, "balance": balance, "entry_type": "debit"}
-                elif abs(balance - (prev_balance + txn)) < 0.01:
-                    return {"withdrawal": None, "deposit": txn, "balance": balance, "entry_type": "credit"}
+        txn = float(amounts[-2].group(1).replace(",", ""))
+        suffix = (amounts[-2].group(2) or "").upper()
+        if suffix == "DR":
+            return {"withdrawal": txn, "deposit": None, "balance": balance, "entry_type": "debit"}
+        elif suffix == "CR":
             return {"withdrawal": None, "deposit": txn, "balance": balance, "entry_type": "credit"}
+        if prev_balance is not None:
+            diff_w = abs(balance - (prev_balance - txn))
+            diff_d = abs(balance - (prev_balance + txn))
+            if diff_w < diff_d:
+                return {"withdrawal": txn, "deposit": None, "balance": balance, "entry_type": "debit"}
+            elif diff_d < diff_w:
+                return {"withdrawal": None, "deposit": txn, "balance": balance, "entry_type": "credit"}
+        return _guess_direction(particulars, txn, balance)
     elif fmt == "netbanking":
         txn = float(amounts[-2].group(1).replace(",", ""))
         suffix = (amounts[-2].group(2) or "").upper()
@@ -241,11 +313,13 @@ def _parse_entry_amounts(particulars: str, fmt: str, prev_balance: Optional[floa
         if re.search(r'\b(\d{6,9})\s*$', text_before) and re.search(r'(?:CHQ|CHEQUE|CTS|INST)', text_before, re.IGNORECASE):
             return {"withdrawal": txn, "deposit": None, "balance": balance, "entry_type": "debit"}
         if prev_balance is not None:
-            if abs(balance - (prev_balance - txn)) < 0.01:
+            diff_w = abs(balance - (prev_balance - txn))
+            diff_d = abs(balance - (prev_balance + txn))
+            if diff_w < diff_d:
                 return {"withdrawal": txn, "deposit": None, "balance": balance, "entry_type": "debit"}
-            elif abs(balance - (prev_balance + txn)) < 0.01:
+            elif diff_d < diff_w:
                 return {"withdrawal": None, "deposit": txn, "balance": balance, "entry_type": "credit"}
-        return {"withdrawal": None, "deposit": txn, "balance": balance, "entry_type": "credit"}
+        return _guess_direction(particulars, txn, balance)
     else:
         if n >= 2:
             txn = float(amounts[-2].group(1).replace(",", ""))
@@ -255,12 +329,33 @@ def _parse_entry_amounts(particulars: str, fmt: str, prev_balance: Optional[floa
             elif suffix == "CR":
                 return {"withdrawal": None, "deposit": txn, "balance": balance, "entry_type": "credit"}
             if prev_balance is not None:
-                if abs(balance - (prev_balance - txn)) < 0.01:
+                diff_w = abs(balance - (prev_balance - txn))
+                diff_d = abs(balance - (prev_balance + txn))
+                if diff_w < diff_d:
                     return {"withdrawal": txn, "deposit": None, "balance": balance, "entry_type": "debit"}
-                elif abs(balance - (prev_balance + txn)) < 0.01:
+                elif diff_d < diff_w:
                     return {"withdrawal": None, "deposit": txn, "balance": balance, "entry_type": "credit"}
-            return {"withdrawal": None, "deposit": txn, "balance": balance, "entry_type": "credit"}
+            return _guess_direction(particulars, txn, balance)
     return None
+
+
+_FOOTER_ARTIFACT_PATTERNS = [
+    re.compile(r'\bPage\s+\d+\b', re.IGNORECASE),
+    re.compile(r'\bREP\d+\b', re.IGNORECASE),
+    re.compile(r'REPORT\s+FOR\s+THE\s+PERIOD', re.IGNORECASE),
+    re.compile(r'BROUGHT\s+FORWARD|CARRIED\s+FORWARD', re.IGNORECASE),
+    re.compile(r'\d{2}:\d{2}:\d{2}\s+UNION\s+BANK', re.IGNORECASE),
+    re.compile(r'CO\s+OPERATIVE\s+SOCIETY', re.IGNORECASE),
+    re.compile(r'UNION\s+BANK\s+OF\s+INDIA,\s*MUTHA', re.IGNORECASE),
+    re.compile(r'\bSummary\b', re.IGNORECASE),
+]
+
+
+def _is_footer_artifact(text: str) -> bool:
+    for pat in _FOOTER_ARTIFACT_PATTERNS:
+        if pat.search(text):
+            return True
+    return False
 
 
 def parse_entries_to_accounts(entries: List[str], fmt: str) -> Dict[str, Any]:
@@ -269,7 +364,7 @@ def parse_entries_to_accounts(entries: List[str], fmt: str) -> Dict[str, Any]:
     seq = 0
     for entry_text in entries:
         seq += 1
-        date_match = re.match(r'^(\d{2}-\d{2}-\d{4})\s+(.*)', entry_text)
+        date_match = re.match(r'^(\d{2}-\d{2}-\d{4})\s*(.*)', entry_text)
         if not date_match:
             continue
         date = date_match.group(1)
@@ -281,6 +376,11 @@ def parse_entries_to_accounts(entries: List[str], fmt: str) -> Dict[str, Any]:
         if amt is None:
             continue
 
+        if _is_footer_artifact(all_text):
+            if amt.get("balance") is not None:
+                prev_balance = amt["balance"]
+            continue
+
         txn_type = _get_txn_type(first_line)
         txn_id = _extract_txn_id(first_line, txn_type)
 
@@ -289,8 +389,7 @@ def parse_entries_to_accounts(entries: List[str], fmt: str) -> Dict[str, Any]:
         balance = amt["balance"]
 
         if withdrawal is None and deposit is None:
-            if prev_balance is not None:
-                prev_balance = balance
+            prev_balance = balance
             continue
 
         if prev_balance is None:
@@ -320,7 +419,7 @@ def parse_entries_to_accounts(entries: List[str], fmt: str) -> Dict[str, Any]:
             "Statement_Seq": seq,
         })
 
-        prev_balance = calc_balance
+        prev_balance = balance
 
     return {
         "entries": parsed,

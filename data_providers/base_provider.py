@@ -72,7 +72,7 @@ class DataProvider(ABC):
         pass
 
     @abstractmethod
-    def record_payment_reference(self, member_id: int, identifier_type: str, identifier_value: str, date: str = None):
+    def record_payment_reference(self, member_id: int, identifier_type: str, identifier_value: str, date: str = None, transaction_type: str = None):
         """Store a known payment identifier for future matching"""
         pass
 

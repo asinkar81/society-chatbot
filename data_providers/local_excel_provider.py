@@ -31,7 +31,7 @@ class LocalExcelDataProvider(DataProvider):
 
     PAYMENT_REF_HEADERS = [
         "Member_ID", "Identifier_Type", "Identifier_Value",
-        "Last_Seen_Date", "Confidence",
+        "Last_Seen_Date", "Confidence", "Transaction_Type",
     ]
 
     SUSPENSE_HEADERS = [
@@ -85,6 +85,8 @@ class LocalExcelDataProvider(DataProvider):
         self._remove_current_outstanding_column()
         self._ensure_reports_sheet()
         self._ensure_processed_statements_sheet()
+        self._migrate_payment_refs_schema()
+        self._clean_payment_refs()
         self._cache = None
 
     # ── Cache ──────────────────────────────────────────────────────────────
@@ -240,13 +242,13 @@ class LocalExcelDataProvider(DataProvider):
     def _ensure_sheet(self, sheet_name, headers):
         try:
             wb = openpyxl.load_workbook(self.excel_file)
-            if sheet_name not in wb.sheetnames:
-                ws = wb.create_sheet(sheet_name)
-                ws.append(headers)
-                wb.save(self.excel_file)
-            wb.close()
         except Exception:
-            pass
+            return
+        if sheet_name not in wb.sheetnames:
+            ws = wb.create_sheet(sheet_name)
+            ws.append(headers)
+            wb.save(self.excel_file)
+        wb.close()
 
     # ── Payment refs / Suspense sheet helpers ─────────────────────────────
 
@@ -314,6 +316,9 @@ class LocalExcelDataProvider(DataProvider):
 
             ws_refs = wb.create_sheet(self.payment_refs_sheet)
             ws_refs.append(self.PAYMENT_REF_HEADERS)
+
+            ws_accounts = wb.create_sheet(self.accounts_sheet)
+            ws_accounts.append(self.ACCOUNTS_HEADERS)
 
             wb.save(self.excel_file)
 
@@ -551,7 +556,13 @@ class LocalExcelDataProvider(DataProvider):
             "Format": fmt,
             "File_Hash": file_hash,
         }
-        df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+        mask = (df["Filename"] == filename) & (df["File_Hash"] == file_hash)
+        if mask.any():
+            idx = mask.idxmax()
+            for col, val in new_row.items():
+                df.at[idx, col] = val
+        else:
+            df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
         self._write_sheet(df, "Processed_Statements")
 
     def refresh_reports_sheet(self):
@@ -572,7 +583,7 @@ class LocalExcelDataProvider(DataProvider):
 
     # ── Payment References ─────────────────────────────────────────────────
 
-    def record_payment_reference(self, member_id: int, identifier_type: str, identifier_value: str, date: str = None):
+    def record_payment_reference(self, member_id: int, identifier_type: str, identifier_value: str, date: str = None, transaction_type: str = None):
         if not identifier_value or not identifier_type:
             return
         val = str(identifier_value).strip()
@@ -589,6 +600,8 @@ class LocalExcelDataProvider(DataProvider):
             df.loc[existing.index[0], "Last_Seen_Date"] = date or datetime.now().strftime("%d-%m-%Y")
             c = int(existing.iloc[0].get("Confidence", 0) or 0) + 1
             df.loc[existing.index[0], "Confidence"] = min(c, 100)
+            if transaction_type:
+                df.loc[existing.index[0], "Transaction_Type"] = transaction_type
         else:
             new_row = pd.DataFrame([{
                 "Member_ID": member_id,
@@ -596,10 +609,70 @@ class LocalExcelDataProvider(DataProvider):
                 "Identifier_Value": val,
                 "Last_Seen_Date": date or datetime.now().strftime("%d-%m-%Y"),
                 "Confidence": 1,
+                "Transaction_Type": transaction_type or "",
             }])
             df = pd.concat([df, new_row], ignore_index=True)
 
         self._write_sheet(df, self.payment_refs_sheet)
+
+    def _migrate_payment_refs_schema(self):
+        try:
+            df = pd.read_excel(self.excel_file, sheet_name=self.payment_refs_sheet)
+        except Exception:
+            return
+        changed = False
+        if "Transaction_Type" not in df.columns:
+            df["Transaction_Type"] = ""
+            changed = True
+        if not changed:
+            return
+        self._write_sheet(df, self.payment_refs_sheet)
+
+    def _clean_payment_refs(self):
+        import re
+        self._migrate_payment_refs_schema()
+        try:
+            df = pd.read_excel(self.excel_file, sheet_name=self.payment_refs_sheet)
+        except Exception:
+            return {}
+        if df.empty:
+            return {"total_before": 0, "removed": 0, "details": {}}
+        before = len(df)
+        removed = {"MOBILE": 0, "PAYEE_NAME": 0, "UPI_ID": 0}
+        mask = pd.Series(True, index=df.index)
+
+        STOP_WORDS = {"MR", "MRS", "MS", "SHRI", "SMT", "DR", "SRI", "M/S", "CMN",
+                      "PAY", "AND", "THE", "FROM", "B", "PAYMENT", "RECEIVED",
+                      "TRANSFER", "NEFT", "RTGS", "IMPS", "CHQ", "CHEQUE",
+                      "BANK", "REFERENCE", "CREDIT", "DEBIT", "BY", "TO"}
+
+        for idx, row in df.iterrows():
+            id_type = str(row.get("Identifier_Type", "") or "")
+            val = str(row.get("Identifier_Value", "") or "").strip()
+
+            if id_type == "MOBILE":
+                if len(val) != 10 or not re.match(r'[6-9]\d{9}', val):
+                    mask.at[idx] = False
+                    removed["MOBILE"] += 1
+
+            elif id_type == "PAYEE_NAME":
+                is_amount = bool(re.match(r'^[\d,]+\.\d{2}$', val))
+                is_ref_code = 5 <= len(val) <= 15 and bool(re.match(r'^[A-Z][A-Za-z0-9]*\d{4,}$', val))
+                is_short_upper = val.isalpha() and val.isupper() and len(val) <= 4
+                is_stop = val.upper() in STOP_WORDS
+                if is_amount or is_ref_code or is_short_upper or is_stop:
+                    mask.at[idx] = False
+                    removed["PAYEE_NAME"] += 1
+
+        df_clean = df[mask].reset_index(drop=True)
+        removed_count = before - len(df_clean)
+        if removed_count > 0:
+            self._write_sheet(df_clean, self.payment_refs_sheet)
+        return {
+            "total_before": before,
+            "removed": removed_count,
+            "details": removed,
+        }
 
     def find_member_by_identifier(self, identifier_value: str) -> Optional[Dict[str, Any]]:
         if not identifier_value:
@@ -919,7 +992,6 @@ class LocalExcelDataProvider(DataProvider):
     # ── Accounts Sheet ─────────────────────────────────────────────────
 
     def add_accounts_entries(self, entries: List[Dict[str, Any]]) -> int:
-        self._ensure_sheet(self.accounts_sheet, self.ACCOUNTS_HEADERS)
         df = pd.read_excel(self.excel_file, sheet_name=self.accounts_sheet)
         max_id = int(df["Entry_ID"].max()) + 1 if not df.empty and "Entry_ID" in df.columns else 1
         new_rows = []
@@ -1009,13 +1081,19 @@ class LocalExcelDataProvider(DataProvider):
             total_deposits = float(sdf["Deposit"].fillna(0).sum())
             total_withdrawals = float(sdf["Withdrawal"].fillna(0).sum())
             mismatches = int((sdf["Balance_Check"].astype(str).str.contains("✗")).sum())
+            opening_val = float(opening) if opening is not None else 0
+            closing_val = float(closing) if closing is not None else 0
+            if opening_val != opening_val:
+                opening_val = 0
+            if closing_val != closing_val:
+                closing_val = 0
             result["statements"].append({
                 "source_file": sf,
                 "first_date": first_date,
                 "last_date": last_date,
                 "entries": len(sdf),
-                "opening_balance": float(opening) if opening else 0,
-                "closing_balance": float(closing) if closing else 0,
+                "opening_balance": opening_val,
+                "closing_balance": closing_val,
                 "total_deposits": total_deposits,
                 "total_withdrawals": total_withdrawals,
                 "mismatches": mismatches,

@@ -327,17 +327,10 @@ class OrchestratorAgent(BaseAgent):
                         "Transaction_Type": txn_type,
                     })
                     # Record identifiers for future matching
-                    txn_id_tokens = re.split(r'[\s/]+', str(txn_id or ""))
-                    TITLE_WORDS = {"MR", "MRS", "MS", "SHRI", "SMT", "DR", "SRI",
-                                   "M/S", "CMN", "PAY", "AND", "THE", "FROM", "B"}
-                    for token in txn_id_tokens:
-                        t = token.strip()
-                        if "@" in t:
-                            self.data_provider.record_payment_reference(member_id, "UPI_ID", t, date)
-                        elif t.isdigit() and len(t) == 10:
-                            self.data_provider.record_payment_reference(member_id, "MOBILE", t, date)
-                        elif len(t) > 3 and not t.isdigit() and t not in TITLE_WORDS:
-                            self.data_provider.record_payment_reference(member_id, "PAYEE_NAME", t, date)
+                    from tools.pdf_parser import _extract_search_tokens
+                    _, identifiers = _extract_search_tokens(str(txn_id or ""), txn_type)
+                    for id_value, id_type in identifiers:
+                        self.data_provider.record_payment_reference(member_id, id_type, id_value, date, transaction_type=txn_type)
 
                 except Exception as e:
                     results.append(f"  ✗ {img_path.name}: Error — {str(e)}")
@@ -443,20 +436,22 @@ class OrchestratorAgent(BaseAgent):
 
             # Record identifiers from payment_details
             if payment_details:
-                tokens = set()
-                for t in re.split(r'[\s/]+', str(payment_details)):
-                    t_clean = t.strip().upper()
-                    if len(t_clean) > 1:
-                        tokens.add(t_clean)
-                TITLE_WORDS = {"MR", "MRS", "MS", "SHRI", "SMT", "DR", "SRI",
-                               "M/S", "CMN", "PAY", "AND", "THE", "FROM", "B"}
-                for token in tokens:
-                    if "@" in str(token):
-                        self.data_provider.record_payment_reference(member_id, "UPI_ID", token, date)
-                    elif token.isdigit() and len(token) == 10:
-                        self.data_provider.record_payment_reference(member_id, "MOBILE", token, date)
-                    elif len(token) > 3 and not token.isdigit() and token not in TITLE_WORDS:
-                        self.data_provider.record_payment_reference(member_id, "PAYEE_NAME", token, date)
+                from tools.pdf_parser import _extract_search_tokens
+                _, identifiers = _extract_search_tokens(str(payment_details), transaction_type, transaction_id)
+                if not identifiers:
+                    STOP_WORDS = {"MR", "MRS", "MS", "SHRI", "SMT", "DR", "SRI", "M/S", "CMN",
+                                  "PAY", "AND", "THE", "FROM", "B", "PAYMENT", "RECEIVED",
+                                  "TRANSFER", "NEFT", "RTGS", "IMPS", "CHQ", "CHEQUE",
+                                  "BANK", "REFERENCE", "CREDIT", "DEBIT", "BY", "TO", "VIA"}
+                    for t in re.split(r'[\s/]+', str(payment_details)):
+                        t_clean = t.strip().upper()
+                        if (len(t_clean) > 2 and t_clean not in STOP_WORDS
+                            and not t_clean.isdigit()
+                            and not (t_clean.isalpha() and t_clean.isupper() and len(t_clean) <= 4)
+                            and not re.match(r'^[\d,]+\.\d{2}$', t_clean)):
+                            identifiers.append((t_clean, "PAYEE_NAME"))
+                for id_value, id_type in identifiers:
+                    self.data_provider.record_payment_reference(member_id, id_type, id_value, date, transaction_type=transaction_type)
 
             return f"Receipt {receipt_id} generated for {member.get('Plot_Owner_Name')} (Plot {member.get('Plot_No')}) for ₹{amount:,.2f}. Ledger updated."
 
@@ -1327,6 +1322,9 @@ class OrchestratorAgent(BaseAgent):
                 # Skip column headers (Date/Id or SI Date/Serial Number formats)
                 if re.match(r'^(Date|Id|SI)\s', line, re.IGNORECASE):
                     continue
+                # Skip page header/footer lines
+                if re.search(r"Page\s+\d+(?:\s+of\s+\d+)?", line, re.IGNORECASE):
+                    continue
                 # Strip leading serial numbers before dates (e.g. "1 02-03-2026 ...")
                 line = re.sub(r'^\d+\s+(?=\d{2}-\d{2}-\d{4})', '', line)
                 # Insert space after DD-MM-YYYY date if followed by non-whitespace
@@ -1444,15 +1442,17 @@ class OrchestratorAgent(BaseAgent):
                 # If we have a previous balance, determine debit/credit by balance movement.
                 # This handles single-column formats (no Dr/Cr on transaction amounts).
                 if prev_balance is not None:
-                    if abs(balance - (prev_balance - txn_amount)) < 0.01:
-                        # Balance decreased by txn_amount → withdrawal
+                    diff_w = abs(balance - (prev_balance - txn_amount))
+                    diff_d = abs(balance - (prev_balance + txn_amount))
+                    if diff_w < diff_d:
+                        # Balance closer to decrease → withdrawal
                         return {
                             "type": "debit",
                             "amount": txn_amount,
                             "balance": balance,
                         }
-                    elif abs(balance - (prev_balance + txn_amount)) < 0.01:
-                        # Balance increased by txn_amount → deposit
+                    elif diff_d < diff_w:
+                        # Balance closer to increase → deposit
                         return {
                             "type": "credit",
                             "amount": txn_amount,
@@ -1514,9 +1514,28 @@ class OrchestratorAgent(BaseAgent):
                     return ref_match.group(1)
                 return ""
 
-            def _extract_search_tokens(particulars, txn_type):
-                """Extract member search tokens from particulars text."""
+            def _extract_search_tokens(particulars, txn_type, txn_id=None):
+                """Extract member search tokens from particulars text. Returns (tokens: set, identifiers: list)"""
                 tokens = set()
+                identifiers = []
+
+                TITLE_WORDS = {"MR", "MRS", "MS", "SHRI", "SMT", "DR", "SRI", "M/S", "CMN",
+                               "PAY", "AND", "THE", "FROM", "B"}
+                STOP_WORDS = TITLE_WORDS | {"PAYMENT", "RECEIVED", "TRANSFER", "NEFT", "RTGS",
+                                            "IMPS", "CHQ", "CHEQUE", "BANK", "REFERENCE",
+                                            "CREDIT", "DEBIT", "BY", "TO", "VIA", "THROUGH"}
+
+                def _should_record_name(token):
+                    t = token.upper()
+                    if len(t) <= 2:
+                        return False
+                    if t in STOP_WORDS:
+                        return False
+                    if t.isalpha() and t.isupper() and len(t) <= 4:
+                        return False
+                    if bool(re.match(r'^[\d,]+\.\d{2}$', t)):
+                        return False
+                    return True
 
                 # UPI: find name after /CR/
                 cr_match = re.search(r'/CR/([^/]+)', particulars)
@@ -1525,7 +1544,10 @@ class OrchestratorAgent(BaseAgent):
                     name_raw = re.sub(r'^(Mr|Mrs|Ms|Shri|Smt|Dr|Sri)\s+', '', name_raw, flags=re.IGNORECASE)
                     for t in re.split(r'[\s.]+', name_raw):
                         if len(t) > 1:
-                            tokens.add(t.upper())
+                            token = t.upper()
+                            tokens.add(token)
+                            if _should_record_name(token):
+                                identifiers.append((token, "PAYEE_NAME"))
 
                 # UPI: extract handle (last segment before amount)
                 if txn_type == "UPI":
@@ -1534,19 +1556,26 @@ class OrchestratorAgent(BaseAgent):
                         last_seg = segments[-1].strip().split()[0]
                         last_seg = re.sub(r'[\s.,]', '', last_seg)
                         if len(last_seg) > 3 and not last_seg.isdigit():
-                            tokens.add(last_seg.upper())
+                            token = last_seg.upper()
+                            tokens.add(token)
+                            identifiers.append((token, "UPI_ID"))
 
                 # NEFT: name between prefix and UTR (strip trailing amounts)
                 if txn_type == "NEFT":
                     after_prefix = re.sub(r'^NEFT:?\s*', '', particulars)
-                    after_amounts = re.sub(r'\s+[\d,]+\.\d{2}\s*(?:Cr)?(?:\s+[\d,]+\.\d{2}\s*(?:Cr)?)?\s*$', '', after_prefix, count=1)
+                    after_amounts = re.sub(r'(?:\s+[\d,]+\.\d{2}\s*(?:Cr)?){1,2}\s*$', '', after_prefix, count=1)
+                    if after_amounts == after_prefix and re.match(r'^[\d,]+\.\d{2}\s*[/\\]?\s*', after_amounts):
+                        after_amounts = re.sub(r'^[\d,]+\.\d{2}\s*[/\\]?\s*', '', after_amounts, count=1)
                     parts = after_amounts.split()
                     if len(parts) >= 2:
                         name_tokens_list = parts[:-1]
                         for t in name_tokens_list:
                             t_clean = re.sub(r'^(Mr|Mrs|Ms|Shri|Smt|Dr|Sri|MRS?)\s+', '', t, flags=re.IGNORECASE)
                             if len(t_clean) > 1:
-                                tokens.add(t_clean.upper())
+                                token = t_clean.upper()
+                                tokens.add(token)
+                                if _should_record_name(token):
+                                    identifiers.append((token, "PAYEE_NAME"))
 
                 # MOBFT: extract name after "from: "
                 mobft_match = re.search(r'from:\s*([A-Za-z\s.]+?)(?:/|\s+\d)', particulars)
@@ -1554,25 +1583,29 @@ class OrchestratorAgent(BaseAgent):
                     name_raw = mobft_match.group(1).strip()
                     for t in re.split(r'[\s.]+', name_raw):
                         if len(t) > 1:
-                            tokens.add(t.upper())
+                            token = t.upper()
+                            tokens.add(token)
+                            if _should_record_name(token):
+                                identifiers.append((token, "PAYEE_NAME"))
 
                 # Email: split firstname.surname@domain
                 email_match = re.search(r'([\w.]+)@', particulars)
                 if email_match:
                     for p in email_match.group(1).split("."):
                         if len(p) > 2:
-                            tokens.add(p.upper())
+                            token = p.upper()
+                            tokens.add(token)
+                            identifiers.append((token, "UPI_ID"))
 
-                # Phone numbers
-                for phone in re.findall(r'(\d{10})', particulars):
+                # Phone numbers (Indian mobile prefix)
+                for phone in re.findall(r'([6-9]\d{9})', particulars):
+                    if txn_id and phone in txn_id:
+                        continue
                     tokens.add(phone)
+                    identifiers.append((phone, "MOBILE"))
 
-                # IMPS: extract name
-                if txn_type == "IMPS":
-                    # IMPS entries have no sender name; phone is extracted by generic regex
-                    pass
-
-                return tokens
+                # IMPS: no meaningful tokens beyond phone
+                return tokens, identifiers
 
             def _ngram_match(a, b, n=5):
                 """Check if any n-gram of a appears as substring in b."""
@@ -1618,7 +1651,7 @@ class OrchestratorAgent(BaseAgent):
 
                 txn_type = _get_txn_type(first_line)
                 txn_id = _extract_txn_id(first_line, txn_type, entry["all_lines"])
-                search_tokens = _extract_search_tokens(first_line, txn_type)
+                search_tokens, search_identifiers = _extract_search_tokens(first_line, txn_type, txn_id)
 
                 # Merge continuation lines into particulars (e.g. UTR/ref number on next line)
                 contin_text = " ".join(l.strip() for l in entry["all_lines"][1:])
@@ -1633,6 +1666,7 @@ class OrchestratorAgent(BaseAgent):
                     "txn_type": txn_type,
                     "txn_id": txn_id,
                     "search_tokens": search_tokens,
+                    "search_identifiers": search_identifiers,
                 })
                 if _entry_balance is not None:
                     prev_balance = _entry_balance
@@ -1696,16 +1730,24 @@ class OrchestratorAgent(BaseAgent):
                         # Surname match (highest priority)
                         name_parts_list = re.split(r'[\s.]+', name)
                         surname = name_parts_list[-1] if name_parts_list else ""
-                        if surname and surname in tokens:
-                            score += 10
-                            reason_parts.append("surname")
-                        elif surname:
-                            # Fuzzy surname: n-gram substring match
-                            for token in tokens:
-                                if len(token) > 2 and len(surname) > 2 and _ngram_match(token, surname):
-                                    score += 7
-                                    reason_parts.append(f"surname_fuzzy:{token}")
-                                    break
+                        if surname and len(surname) > 2:
+                            if surname in tokens:
+                                score += 20
+                                reason_parts.append("surname")
+                            else:
+                                matched = False
+                                for token in tokens:
+                                    if surname in token and len(token) > len(surname):
+                                        score += 15
+                                        reason_parts.append(f"surname_in_{token}")
+                                        matched = True
+                                        break
+                                if not matched:
+                                    for token in tokens:
+                                        if len(token) > 2 and _ngram_match(token, surname):
+                                            score += 15
+                                            reason_parts.append(f"surname_fuzzy:{token}")
+                                            break
 
                         # Any name token match
                         common = tokens & name_tokens
@@ -1965,15 +2007,10 @@ class OrchestratorAgent(BaseAgent):
                                     }))
 
                             # Record known identifiers for future matching
-                            TITLE_WORDS = {"MR", "MRS", "MS", "SHRI", "SMT", "DR", "SRI",
-                                           "M/S", "CMN", "PAY", "AND", "THE", "FROM", "B"}
-                            for token in tokens:
-                                if "@" in str(token):
-                                    self.data_provider.record_payment_reference(mid, "UPI_ID", token, date)
-                                elif token.isdigit() and len(token) == 10:
-                                    self.data_provider.record_payment_reference(mid, "MOBILE", token, date)
-                                elif len(token) > 3 and not token.isdigit() and token not in TITLE_WORDS:
-                                    self.data_provider.record_payment_reference(mid, "PAYEE_NAME", token, date)
+                            identifiers = pentry.get("search_identifiers", [])
+                            txn_type = pentry.get("txn_type", "")
+                            for id_value, id_type in identifiers:
+                                self.data_provider.record_payment_reference(mid, id_type, id_value, date, transaction_type=txn_type)
 
                             results.append({
                                 "date": date,
@@ -2325,16 +2362,23 @@ class OrchestratorAgent(BaseAgent):
                     parsed = json.loads(raw)
                     raw = parsed.get("statement", "")
                     filename = parsed.get("filename", "pasted_text")
+                    format_override = parsed.get("format", "")
                 except (json.JSONDecodeError, TypeError):
                     filename = "pasted_text"
+                    format_override = ""
             else:
                 filename = "pasted_text"
+                format_override = ""
             if not raw:
                 return "Please provide the bank statement text."
 
             lines = [l.rstrip("\r").strip() for l in raw.strip().split("\n") if l.strip()]
+            import importlib
+            import tools.pdf_parser
+            importlib.reload(tools.pdf_parser)
             from tools.pdf_parser import detect_format, clean_entries
-            fmt = detect_format(lines)
+            from tools.pdf_parser import parse_entries_to_accounts as _do_parse
+            fmt = format_override or detect_format(lines)
             cleaned = clean_entries(lines)
             if not cleaned:
                 return "Could not parse any entries. Expected DATE in DD-MM-YYYY format."
@@ -2424,7 +2468,8 @@ class OrchestratorAgent(BaseAgent):
                         generate_receipts (bool, default false).
             Returns summary of matched and unmatched entries."""
             data = _parse_action_input(input_str or "{}")
-            fy = data.get("fy", "") or config.CURRENT_FY
+            settings = self.data_provider.get_settings()
+            fy = data.get("fy", "") or settings.get("Current_FY", "2026-27")
             generate_receipts = str(data.get("generate_receipts", "false")).lower() in ("true", "1", "yes")
             fy_start, fy_end = fy[:4], "20" + fy[5:7]
             from_date = f"01-04-{fy_start}"
@@ -2462,7 +2507,7 @@ class OrchestratorAgent(BaseAgent):
                 txn_id = str(acct_entry.get("Transaction_ID", "") or "")
                 entry_id = int(acct_entry.get("Entry_ID", 0))
 
-                search_tokens = _extract_search_tokens(particulars, txn_type)
+                search_tokens, search_identifiers = _extract_search_tokens(particulars, txn_type, txn_id)
 
                 # Phase 3a: Reference store match
                 ref_match = None
@@ -2514,15 +2559,24 @@ class OrchestratorAgent(BaseAgent):
 
                         name_parts_list = re.split(r'[\s.]+', name)
                         surname = name_parts_list[-1] if name_parts_list else ""
-                        if surname and surname in search_tokens:
-                            score += 10
-                            reason_parts.append("surname")
-                        elif surname:
-                            for token in search_tokens:
-                                if len(token) > 2 and len(surname) > 2 and _ngram_match(token, surname):
-                                    score += 7
-                                    reason_parts.append(f"surname_fuzzy:{token}")
-                                    break
+                        if surname and len(surname) > 2:
+                            if surname in search_tokens:
+                                score += 20
+                                reason_parts.append("surname")
+                            else:
+                                matched = False
+                                for token in search_tokens:
+                                    if surname in token and len(token) > len(surname):
+                                        score += 15
+                                        reason_parts.append(f"surname_in_{token}")
+                                        matched = True
+                                        break
+                                if not matched:
+                                    for token in search_tokens:
+                                        if len(token) > 2 and _ngram_match(token, surname):
+                                            score += 15
+                                            reason_parts.append(f"surname_fuzzy:{token}")
+                                            break
 
                         common = search_tokens & name_tokens
                         if common:
@@ -2643,15 +2697,8 @@ class OrchestratorAgent(BaseAgent):
                                 create_simple_receipt_pdf(spath, sdata)
 
                     # Record identifiers
-                    TITLE_WORDS = {"MR", "MRS", "MS", "SHRI", "SMT", "DR", "SRI",
-                                   "M/S", "CMN", "PAY", "AND", "THE", "FROM", "B"}
-                    for token in search_tokens:
-                        if "@" in str(token):
-                            self.data_provider.record_payment_reference(mid, "UPI_ID", token, date)
-                        elif token.isdigit() and len(token) == 10:
-                            self.data_provider.record_payment_reference(mid, "MOBILE", token, date)
-                        elif len(token) > 3 and not token.isdigit() and token not in TITLE_WORDS:
-                            self.data_provider.record_payment_reference(mid, "PAYEE_NAME", token, date)
+                    for id_value, id_type in search_identifiers:
+                        self.data_provider.record_payment_reference(mid, id_type, id_value, date, transaction_type=txn_type)
 
                     matched_results.append({
                         "date": date,
