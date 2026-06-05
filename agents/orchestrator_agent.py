@@ -2440,13 +2440,38 @@ class OrchestratorAgent(BaseAgent):
                         lines_out.append(f"    ❌ Balance mismatches: {stmt['mismatches']} rows (fix before Ledger creation)")
                     else:
                         lines_out.append(f"    ✓ Balance validated — all rows match")
+            continuity = summary.get("continuity", [])
+            if continuity:
+                lines_out.append("")
+                lines_out.append("📊 Statement Continuity by Financial Year:")
+                for fy in continuity:
+                    fy_lbl = fy["fy"]
+                    fy_yr = 2000 + int(fy_lbl[:2])
+                    fy_range = f"Apr {fy_yr} — Mar {fy_yr+1}"
+                    rollover = fy.get("rollover_from_prev")
+                    files_str = ", ".join(fy["files"])
+                    lines_out.append(f"  FY {fy_lbl} ({fy_range})")
+                    lines_out.append(f"    Opening: ₹{fy['opening_balance']:,.2f} ({fy['opening_date']}) | "
+                                     f"Closing: ₹{fy['closing_balance']:,.2f} ({fy['closing_date']}) "
+                                     f"— {fy['entries']} entries")
+                    lines_out.append(f"    Files: {files_str}")
+                    if rollover:
+                        if rollover["match"]:
+                            lines_out.append(f"    ✅ Rollover from FY {rollover['from_fy']}: "
+                                             f"₹{rollover['from_closing_balance']:,.2f} → ₹{rollover['to_opening_balance']:,.2f}")
+                        else:
+                            lines_out.append(f"    ❌ Gap at FY boundary: FY {rollover['from_fy']} closed "
+                                             f"₹{rollover['from_closing_balance']:,.2f} but FY {fy_lbl} opens "
+                                             f"₹{rollover['to_opening_balance']:,.2f} "
+                                             f"(diff: ₹{rollover['difference']:,.2f})")
+
             gaps = summary.get("gaps", [])
             if gaps:
                 lines_out.append("")
-                lines_out.append("⚠️ Gap report (informational):")
+                lines_out.append("⚠️ Balance mismatches at FY boundaries (missing entries suspected):")
                 for g in gaps:
-                    lines_out.append(f"  • {g['from_file']} closing ₹{g['from_closing']:,.2f} → "
-                                     f"{g['to_file']} opening ₹{g['to_opening']:,.2f} "
+                    lines_out.append(f"  • FY {g['from_fy']} closing ₹{g['expected_closing']:,.2f} → "
+                                     f"FY {g['to_fy']} opening ₹{g['actual_opening']:,.2f} "
                                      f"(diff: ₹{g['difference']:,.2f})")
 
             return "\n".join(lines_out)

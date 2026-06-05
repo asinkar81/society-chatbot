@@ -987,6 +987,136 @@ class TestInvoiceTools(unittest.TestCase):
         self.assertLessEqual(float(entry_no_debit.get("Debit", 0)), 0)
 
 
+class TestAccountsContinuity(unittest.TestCase):
+    """Test FY continuity report in get_accounts_summary"""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.test_file = Path(self.temp_dir.name) / "test_accounts.xlsx"
+        self.provider = LocalExcelDataProvider(self.test_file)
+        self.provider.get_accounts_entries()  # ensures Accounts sheet exists
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_fy_opening_balance_with_nan_fields(self):
+        """Opening balance correctly reverses first entry's Deposit when Withdrawal is NaN"""
+        self.provider.add_accounts_entries([
+            {
+                "Date": "25-03-2023",
+                "Particulars": "Last FY 22-23",
+                "Withdrawal": None,
+                "Deposit": 500.0,
+                "Balance": 187145.10,
+                "Balance_Check": "✓",
+                "Status": "Matched",
+                "Source_File": "test.pdf",
+                "Statement_Seq": 1,
+            },
+            {
+                "Date": "03-04-2023",
+                "Particulars": "First FY 23-24 deposit",
+                "Withdrawal": None,
+                "Deposit": 6000.0,
+                "Balance": 193145.10,
+                "Balance_Check": "✓",
+                "Status": "Matched",
+                "Source_File": "test.pdf",
+                "Statement_Seq": 2,
+            },
+        ])
+
+        summary = self.provider.get_accounts_summary()
+        continuity = summary.get("continuity", [])
+
+        fy_23_24 = next((c for c in continuity if c["fy"] == "23-24"), None)
+        self.assertIsNotNone(fy_23_24,
+            f"Expected FY 23-24 in continuity, got FYs: {[c['fy'] for c in continuity]}")
+
+        expected_opening = 193145.10 - 6000.0  # Balance - Deposit
+        self.assertEqual(fy_23_24["opening_balance"], expected_opening,
+            f"FY 23-24 opening: expected {expected_opening}, got {fy_23_24['opening_balance']}")
+
+        rollover = fy_23_24.get("rollover_from_prev")
+        self.assertIsNotNone(rollover)
+        self.assertTrue(rollover["match"],
+            f"Rollover should match: closing {rollover['from_closing_balance']} → "
+            f"opening {rollover['to_opening_balance']}")
+
+    def test_fy_opening_balance_with_nan_deposit(self):
+        """Opening balance correctly reverses first entry's Withdrawal when Deposit is NaN"""
+        self.provider.add_accounts_entries([
+            {
+                "Date": "30-03-2023",
+                "Particulars": "Last FY 22-23",
+                "Withdrawal": 1000.0,
+                "Deposit": None,
+                "Balance": 50000.0,
+                "Balance_Check": "✓",
+                "Status": "Matched",
+                "Source_File": "test.pdf",
+                "Statement_Seq": 1,
+            },
+            {
+                "Date": "02-04-2023",
+                "Particulars": "First FY 23-24 withdrawal",
+                "Withdrawal": 2000.0,
+                "Deposit": None,
+                "Balance": 48000.0,
+                "Balance_Check": "✓",
+                "Status": "Matched",
+                "Source_File": "test.pdf",
+                "Statement_Seq": 2,
+            },
+        ])
+
+        summary = self.provider.get_accounts_summary()
+        fy_23_24 = next((c for c in summary["continuity"] if c["fy"] == "23-24"), None)
+        self.assertIsNotNone(fy_23_24)
+
+        expected_opening = 48000.0 + 2000.0  # Balance + Withdrawal
+        self.assertEqual(fy_23_24["opening_balance"], expected_opening)
+
+        rollover = fy_23_24["rollover_from_prev"]
+        self.assertTrue(rollover["match"])
+
+    def test_legacy_entries_do_not_affect_fy_bounds(self):
+        """Legacy entries (Balance=None) are excluded from FY opening/closing calculation"""
+        self.provider.add_accounts_entries([
+            {
+                "Date": "01-04-2023",
+                "Particulars": "Legacy entry same FY",
+                "Withdrawal": None,
+                "Deposit": 999.0,
+                "Balance": None,
+                "Balance_Check": "",
+                "Status": "Matched",
+                "Source_File": "Legacy",
+                "Statement_Seq": 999,
+            },
+            {
+                "Date": "03-04-2023",
+                "Particulars": "First statement entry FY 23-24",
+                "Withdrawal": None,
+                "Deposit": 6000.0,
+                "Balance": 193145.10,
+                "Balance_Check": "✓",
+                "Status": "Matched",
+                "Source_File": "real_statement.pdf",
+                "Statement_Seq": 1,
+            },
+        ])
+
+        summary = self.provider.get_accounts_summary()
+        fy_23_24 = next((c for c in summary["continuity"] if c["fy"] == "23-24"), None)
+        self.assertIsNotNone(fy_23_24)
+
+        expected = 193145.10 - 6000.0
+        self.assertEqual(fy_23_24["opening_balance"], expected,
+            f"Legacy entry should not affect opening: expected {expected}, "
+            f"got {fy_23_24['opening_balance']}")
+
+
 def run_tests():
     """Run all tests"""
     print("\n" + "=" * 60)
@@ -1012,6 +1142,7 @@ def run_tests():
     suite.addTests(loader.loadTestsFromTestCase(TestConsolidatedReceiptPDF))
     suite.addTests(loader.loadTestsFromTestCase(TestHelperFunctionsExtended))
     suite.addTests(loader.loadTestsFromTestCase(TestInvoiceTools))
+    suite.addTests(loader.loadTestsFromTestCase(TestAccountsContinuity))
 
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)

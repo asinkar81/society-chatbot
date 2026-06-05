@@ -1056,15 +1056,16 @@ class LocalExcelDataProvider(DataProvider):
         try:
             df = pd.read_excel(self.excel_file, sheet_name=self.accounts_sheet)
         except Exception:
-            return {"statements": [], "gaps": [], "total_entries": 0}
+            return {"statements": [], "continuity": [], "gaps": [], "total_entries": 0}
         if df.empty:
-            return {"statements": [], "gaps": [], "total_entries": 0}
+            return {"statements": [], "continuity": [], "gaps": [], "total_entries": 0}
         result = {
             "total_entries": len(df),
             "by_status": df["Status"].value_counts().to_dict() if "Status" in df.columns else {},
             "balance_ok": int((df["Balance_Check"].astype(str).str.contains("✓")).sum()) if "Balance_Check" in df.columns else 0,
             "balance_mismatch": int((df["Balance_Check"].astype(str).str.contains("✗")).sum()) if "Balance_Check" in df.columns else 0,
             "statements": [],
+            "continuity": [],
             "gaps": [],
         }
         if "Source_File" not in df.columns:
@@ -1098,25 +1099,98 @@ class LocalExcelDataProvider(DataProvider):
                 "total_withdrawals": total_withdrawals,
                 "mismatches": mismatches,
             })
-            file_dates[sf] = first_date
-        sorted_files = sorted(file_dates.keys(), key=lambda f: file_dates[f])
-        for i in range(len(sorted_files) - 1):
-            curr = sorted_files[i]
-            next_f = sorted_files[i + 1]
-            curr_df = df[df["Source_File"] == curr].sort_values("Statement_Seq")
-            next_df = df[df["Source_File"] == next_f].sort_values("Statement_Seq")
-            if curr_df.empty or next_df.empty:
-                continue
-            curr_closing = float(curr_df.iloc[-1].get("Balance", 0) or 0)
-            next_opening = float(next_df.iloc[0].get("Balance", 0) or 0)
-            if abs(curr_closing - next_opening) > 0.01:
-                result["gaps"].append({
-                    "from_file": curr,
-                    "to_file": next_f,
-                    "from_closing": curr_closing,
-                    "to_opening": next_opening,
-                    "difference": round(curr_closing - next_opening, 2),
-                })
+            file_dates[sf] = {"first": first_date, "last": last_date}
+        from datetime import datetime as _dt
+
+        def _fy_sort_key(d_str):
+            try:
+                dt = _dt.strptime(str(d_str).strip(), "%d-%m-%Y")
+            except (ValueError, TypeError):
+                return (9999, "Unknown")
+            if dt.month >= 4:
+                return (dt.year, f"{str(dt.year)[2:]}-{str(dt.year+1)[2:]}")
+            else:
+                return (dt.year - 1, f"{str(dt.year-1)[2:]}-{str(dt.year)[2:]}")
+
+        df2 = df.copy()
+        df2["_fy_key"] = df2["Date"].apply(_fy_sort_key)
+        df2["_fy"] = df2["_fy_key"].apply(lambda x: x[1])
+        df2["_dt"] = pd.to_datetime(df2["Date"], format="%d-%m-%Y", errors="coerce")
+
+        fy_groups = []
+        for fy_key, fy_df in df2.groupby("_fy_key", sort=False):
+            fy_df = fy_df.sort_values(["_dt", "Statement_Seq"])
+            bounds_df = fy_df[fy_df["Source_File"] != "Legacy"]
+            if bounds_df.empty:
+                bounds_df = fy_df
+            first = bounds_df.iloc[0]
+            last = bounds_df.iloc[-1]
+            first_dep = float(first.get("Deposit", 0) or 0)
+            first_wd = float(first.get("Withdrawal", 0) or 0)
+            if first_dep != first_dep:
+                first_dep = 0.0
+            if first_wd != first_wd:
+                first_wd = 0.0
+            bal_first = float(first.get("Balance", 0) or 0)
+            if bal_first != bal_first:
+                bal_first = 0.0
+            opening_bal = bal_first - first_dep + first_wd
+            closing_bal = float(last.get("Balance", 0) or 0)
+            if opening_bal != opening_bal:
+                opening_bal = 0
+            if closing_bal != closing_bal:
+                closing_bal = 0
+            fy_groups.append({
+                "fy": fy_key[1],
+                "fy_start": fy_key[0],
+                "opening_date": str(first.get("Date", "")),
+                "closing_date": str(last.get("Date", "")),
+                "opening_balance": opening_bal,
+                "closing_balance": closing_bal,
+                "entries": len(fy_df),
+                "files": sorted(fy_df["Source_File"].dropna().unique().tolist()),
+            })
+
+        fy_groups.sort(key=lambda x: x["fy_start"])
+
+        continuity = []
+        gaps = []
+        for i, fg in enumerate(fy_groups):
+            rollover = None
+            if i > 0:
+                prev = fy_groups[i - 1]
+                diff = round(prev["closing_balance"] - fg["opening_balance"], 2)
+                is_match = abs(diff) < 0.01
+                rollover = {
+                    "from_fy": prev["fy"],
+                    "from_closing_balance": prev["closing_balance"],
+                    "from_closing_date": prev["closing_date"],
+                    "to_opening_balance": fg["opening_balance"],
+                    "to_opening_date": fg["opening_date"],
+                    "match": is_match,
+                    "difference": diff,
+                }
+                if not is_match:
+                    gaps.append({
+                        "from_fy": prev["fy"],
+                        "to_fy": fg["fy"],
+                        "expected_closing": prev["closing_balance"],
+                        "actual_opening": fg["opening_balance"],
+                        "difference": diff,
+                    })
+            continuity.append({
+                "fy": fg["fy"],
+                "opening_date": fg["opening_date"],
+                "closing_date": fg["closing_date"],
+                "opening_balance": fg["opening_balance"],
+                "closing_balance": fg["closing_balance"],
+                "entries": fg["entries"],
+                "files": fg["files"],
+                "rollover_from_prev": rollover,
+            })
+
+        result["continuity"] = continuity
+        result["gaps"] = gaps
         return result
 
     def clear_accounts(self) -> int:

@@ -829,40 +829,102 @@ def show_dashboard_page():
                         sc[4].metric("Closing", f"₹{stmt['closing_balance']:,.0f}")
                         sc[5].metric("Mismatches", stmt['mismatches'])
 
+                continuity = accts_summary.get("continuity", [])
+                if continuity:
+                    st.subheader("📊 Statement Continuity by Financial Year")
+                    for fy in continuity:
+                        fy_label = fy["fy"]
+                        fy_start_year = 2000 + int(fy_label[:2])
+                        fy_range = f"Apr {fy_start_year} — Mar {fy_start_year + 1}"
+                        rollover = fy.get("rollover_from_prev")
+
+                        lines = [f"**FY {fy_label}** ({fy_range})"]
+                        lines.append(
+                            f"  Opening: ₹{fy['opening_balance']:,.2f} ({fy['opening_date']})"
+                            f" | Closing: ₹{fy['closing_balance']:,.2f} ({fy['closing_date']})"
+                            f" — {fy['entries']} entr{'y' if fy['entries'] == 1 else 'ies'}"
+                        )
+                        lines.append(f"  Files: {', '.join(fy['files'])}")
+
+                        if rollover:
+                            if rollover["match"]:
+                                lines.append(
+                                    f"  ✅ Rollover from FY {rollover['from_fy']}: "
+                                    f"₹{rollover['from_closing_balance']:,.2f} → ₹{rollover['to_opening_balance']:,.2f}"
+                                )
+                            else:
+                                lines.append(
+                                    f"  ❌ Gap detected: FY {rollover['from_fy']} closed at "
+                                    f"₹{rollover['from_closing_balance']:,.2f} but FY {fy['fy']} opens at "
+                                    f"₹{rollover['to_opening_balance']:,.2f} (diff: ₹{rollover['difference']:,.2f})"
+                                )
+
+                        for line in lines:
+                            st.caption(line)
+                        st.caption("")  # spacer
+
                 gaps = accts_summary.get("gaps", [])
                 if gaps:
-                    st.warning("⚠️ Gap report (informational):")
+                    st.warning("⚠️ Balance mismatches at FY boundaries (missing entries suspected):")
                     for g in gaps:
-                        st.caption(f"  • {g['from_file']} closing ₹{g['from_closing']:,.2f} → "
-                                   f"{g['to_file']} opening ₹{g['to_opening']:,.2f} "
-                                   f"(diff: ₹{g['difference']:,.2f})")
+                        st.caption(
+                            f"  • FY {g['from_fy']} closing ₹{g['expected_closing']:,.2f} → "
+                            f"FY {g['to_fy']} opening ₹{g['actual_opening']:,.2f} "
+                            f"(diff: ₹{g['difference']:,.2f})"
+                        )
 
         # ── Accounts Table Viewer ──
         if accts_summary.get("total_entries", 0) > 0:
             with st.expander("📋 View Accounts Entries", expanded=False):
                 accounts_entries = data_provider.get_accounts_entries()
                 if accounts_entries:
-                    ac_filter = st.selectbox("Filter by Status", ["All", "Pending", "Potential Duplicate", "Matched", "Unmatched", "Skipped", "Expensed"], key="ac_filter")
-                    if ac_filter != "All":
-                        accounts_entries = [e for e in accounts_entries if e.get("Status") == ac_filter]
-                    if accounts_entries:
-                        ac_df = []
-                        for e in accounts_entries:
-                            ac_df.append({
-                                "ID": e.get("Entry_ID", ""),
-                                "Date": e.get("Date", ""),
-                                "Particulars": str(e.get("Particulars", "") or "")[:60],
-                                "W/D": f"₹{e['Withdrawal']:,.2f}" if e.get("Withdrawal") else "",
-                                "Dep": f"₹{e['Deposit']:,.2f}" if e.get("Deposit") else "",
-                                "Bal": f"₹{e['Balance']:,.2f}" if e.get("Balance") else "",
-                                "Calc_Bal": f"₹{e['Calculated_Balance']:,.2f}" if e.get("Calculated_Balance") else "",
-                                "Check": e.get("Balance_Check", ""),
-                                "Status": e.get("Status", ""),
-                                "File": e.get("Source_File", ""),
-                                "Txn_ID": str(e.get("Transaction_ID", "") or ""),
-                            })
-                        st.dataframe(ac_df, use_container_width=True, hide_index=True,
-                                     column_order=["ID", "Date", "Particulars", "W/D", "Dep", "Bal", "Calc_Bal", "Check", "Status", "File", "Txn_ID"])
+                    import pandas as _pd
+                    ac_df = _pd.DataFrame(accounts_entries)
+                    ac_df["_dt_sort"] = _pd.to_datetime(ac_df["Date"], format="%d-%m-%Y", errors="coerce")
+
+                    def _fy_label(d):
+                        try:
+                            from datetime import datetime as _dt
+                            dt = _dt.strptime(str(d).strip(), "%d-%m-%Y")
+                            if dt.month >= 4:
+                                return f"{str(dt.year)[2:]}-{str(dt.year+1)[2:]}"
+                            return f"{str(dt.year-1)[2:]}-{str(dt.year)[2:]}"
+                        except Exception:
+                            return "Unknown"
+                    ac_df["FY"] = ac_df["Date"].apply(_fy_label)
+
+                    cols = st.columns(3)
+                    with cols[0]:
+                        fy_options = ["All"] + sorted(ac_df["FY"].unique())
+                        fy_filter = st.selectbox("FY", fy_options, key="ac_fy_filter")
+                    with cols[1]:
+                        sf_options = ["All"] + sorted(ac_df["Source_File"].dropna().unique())
+                        sf_filter = st.selectbox("File", sf_options, key="ac_sf_filter")
+                    with cols[2]:
+                        status_options = ["All", "Pending", "Potential Duplicate", "Matched", "Unmatched", "Skipped", "Expensed"]
+                        status_filter = st.selectbox("Status", status_options, key="ac_status_filter")
+
+                    if fy_filter != "All":
+                        ac_df = ac_df[ac_df["FY"] == fy_filter]
+                    if sf_filter != "All":
+                        ac_df = ac_df[ac_df["Source_File"] == sf_filter]
+                    if status_filter != "All":
+                        ac_df = ac_df[ac_df["Status"] == status_filter]
+
+                    ac_df = ac_df.sort_values("_dt_sort")
+
+                    display_cols = {
+                        "Entry_ID": "ID", "Date": "Date", "Particulars": "Particulars",
+                        "Withdrawal": "W/D", "Deposit": "Dep", "Balance": "Bal",
+                        "Calculated_Balance": "Calc_Bal", "Balance_Check": "Check",
+                        "Status": "Status", "Source_File": "File", "Transaction_ID": "Txn_ID",
+                        "FY": "FY",
+                    }
+                    avail = {k: v for k, v in display_cols.items() if k in ac_df.columns}
+                    view = ac_df[list(avail.keys())].copy()
+                    view["Particulars"] = view["Particulars"].astype(str).str[:60]
+                    view.columns = list(avail.values())
+                    st.dataframe(view, use_container_width=True, hide_index=True)
 
         # ── Create Ledger from Accounts ──
         if pending_count > 0 or unmatched_count > 0:
