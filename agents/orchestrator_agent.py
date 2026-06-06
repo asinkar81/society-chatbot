@@ -2247,10 +2247,11 @@ class OrchestratorAgent(BaseAgent):
                             # ── Auto-split check ──
                             split_group = self.data_provider.get_split_group_for_member(mid)
                             if split_group:
+                                # Remove full-amount entry, replace with per_head for all group members
+                                pending_entries.pop()
                                 split_amt = round(amount / len(split_group), 2)
                                 for smid in split_group:
-                                    if smid == mid:
-                                        continue
+                                    orig_vch = vch_no
                                     svch = self.data_provider.get_next_voucher_number()
                                     sfy = get_fy_from_date(date)
                                     srid = f"{sfy}-{str(svch).zfill(3)}"
@@ -2277,7 +2278,7 @@ class OrchestratorAgent(BaseAgent):
                                         "Vch_No": svch,
                                         "Debit": None,
                                         "Credit": split_amt,
-                                        "Description": f"Split Receipt {srid} (from {receipt_id})",
+                                        "Description": f"Split from #{orig_vch} (src:{mid})",
                                         "Transaction_Type": "SPLIT",
                                         "Transaction_ID": f"SPLIT-{receipt_id}",
                                     }))
@@ -3139,10 +3140,11 @@ class OrchestratorAgent(BaseAgent):
                     if not is_preview:
                         split_group = self.data_provider.get_split_group_for_member(mid)
                         if split_group:
+                            # Remove full-amount entry, replace with per_head for all group members
+                            pending_ledger.pop()
                             split_amt = round(amount / len(split_group), 2)
                             for smid in split_group:
-                                if smid == mid:
-                                    continue
+                                orig_vch = vch_no
                                 svch = self.data_provider.get_next_voucher_number()
                                 sfy = get_fy_from_date(date)
                                 srid = f"{sfy}-{str(svch).zfill(3)}"
@@ -3153,7 +3155,7 @@ class OrchestratorAgent(BaseAgent):
                                     "Vch_No": svch,
                                     "Debit": None,
                                     "Credit": split_amt,
-                                    "Description": f"Split Receipt {srid} (from {receipt_id})",
+                                    "Description": f"Split from #{orig_vch} (src:{mid})",
                                     "Transaction_Type": "SPLIT",
                                     "Transaction_ID": f"SPLIT-{receipt_id}",
                                 }))

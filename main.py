@@ -1837,7 +1837,40 @@ def show_dashboard_page():
                      for s in summary],
                     use_container_width=True,
                 )
-        # ── Single-member view ────────────────────────────────────
+                st.divider()
+                if st.button("🔀 Run Split Rules on All", type="primary", use_container_width=True, key="led_split_all"):
+                    rules = data_provider.get_split_rules()
+                    total_split = 0
+                    for rule in rules:
+                        src_mid = int(rule["Source_Member_ID"])
+                        group = [int(x.strip()) for x in str(rule.get("Members", "")).split(",") if x.strip().isdigit()]
+                        if not group or src_mid not in group:
+                            continue
+                        src_ledger = data_provider.get_member_ledger(src_mid)
+                        unsplit_credits = [e for e in src_ledger
+                                           if _s(e.get("Credit")) > 0
+                                           and str(e.get("Transaction_Type", "")).upper() != "SPLIT"]
+                        for entry in unsplit_credits:
+                            amount = _s(entry.get("Credit"))
+                            date_str = str(entry.get("Date", "") or "")
+                            particulars = str(entry.get("Particulars", "") or "")
+                            orig_vch = int(entry.get("Vch_No", 0))
+                            if data_provider.delete_ledger_entry(src_mid, orig_vch):
+                                per_head = round(amount / len(group), 2)
+                                for gmid in group:
+                                    vch = data_provider.get_next_voucher_number()
+                                    data_provider.add_ledger_entry(gmid, {
+                                        "Date": date_str,
+                                        "Particulars": f"By Split ({particulars[:40]})",
+                                        "Vch_Type": "Journal", "Vch_No": vch,
+                                        "Debit": None, "Credit": per_head,
+                                        "Description": f"Split from #{orig_vch} (src:{src_mid})",
+                                        "Transaction_Type": "SPLIT",
+                                        "Transaction_ID": entry.get("Transaction_ID", ""),
+                                    })
+                                total_split += 1
+                    st.success(f"✅ Applied split rules to {total_split} entries")
+                    st.rerun()
         else:
             led_member = _find_member(led_member_id)
             if led_member:
@@ -1850,7 +1883,8 @@ def show_dashboard_page():
 
                     # ── Batch action toolbar + entries ──
                     with st.form(key="led_batch_form"):
-                        bcols = st.columns([0.7, 2.3, 2])
+                        split_group = data_provider.get_split_group_for_member(led_member_id) if led_member_id else None
+                        bcols = st.columns([0.7, 1.5, 1.5, 1.3])
                         with bcols[0]:
                             sel_all = st.form_submit_button("☑ All", use_container_width=True, key="led_sel_all_btn")
                             sel_none = st.form_submit_button("☐ None", use_container_width=True, key="led_sel_none_btn")
@@ -1858,9 +1892,12 @@ def show_dashboard_page():
                             move_clicked = st.form_submit_button("➡️ Move Selected", type="secondary", use_container_width=True, key="led_batch_move")
                         with bcols[2]:
                             split_clicked = st.form_submit_button("✂️ Split Selected", type="secondary", use_container_width=True, key="led_batch_split")
+                        with bcols[3]:
+                            apply_split = st.form_submit_button("🔀 Apply Rule", type="secondary",
+                                use_container_width=True, key="led_apply_split",
+                                disabled=split_group is None)
 
                         st.divider()
-                        split_group = data_provider.get_split_group_for_member(led_member_id) if led_member_id else None
                         for idx, entry in enumerate(led_entries):
                             ed = str(entry.get("Date", "") or "")
                             ev = entry.get("Vch_No", "")
@@ -2024,6 +2061,40 @@ def show_dashboard_page():
                                 st.rerun()
                             else:
                                 st.warning("Select at least one credit entry to split")
+                        elif apply_split:
+                            if split_group is None:
+                                st.warning("This member has no split rule")
+                            else:
+                                sel_idx = [idx for idx, e in enumerate(led_entries)
+                                           if st.session_state.get(f"led_sel_{idx}", False)]
+                                target = [led_entries[idx] for idx in sel_idx] if sel_idx else led_entries
+                                credits = [e for e in target if _s(e.get("Credit")) > 0
+                                           and str(e.get("Transaction_Type", "")).upper() != "SPLIT"]
+                                if not credits:
+                                    st.warning("No unsplit credit entries to process")
+                                else:
+                                    processed = 0
+                                    for entry in credits:
+                                        amount = _s(entry.get("Credit"))
+                                        date_str = str(entry.get("Date", "") or "")
+                                        particulars = str(entry.get("Particulars", "") or "")
+                                        orig_vch = int(entry.get("Vch_No", 0))
+                                        if data_provider.delete_ledger_entry(led_member_id, orig_vch):
+                                            per_head = round(amount / len(split_group), 2)
+                                            for gmid in split_group:
+                                                vch = data_provider.get_next_voucher_number()
+                                                data_provider.add_ledger_entry(gmid, {
+                                                    "Date": date_str,
+                                                    "Particulars": f"By Split ({particulars[:40]})",
+                                                    "Vch_Type": "Journal", "Vch_No": vch,
+                                                    "Debit": None, "Credit": per_head,
+                                                    "Description": f"Split from #{orig_vch} (src:{led_member_id})",
+                                                    "Transaction_Type": "SPLIT",
+                                                    "Transaction_ID": entry.get("Transaction_ID", ""),
+                                                })
+                                            processed += 1
+                                    st.success(f"✅ Applied split rule to {processed} entries")
+                                    st.rerun()
 
                     st.divider()
 
