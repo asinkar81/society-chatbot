@@ -275,49 +275,63 @@ def _extract_ref_id(desc: str) -> Optional[str]:
 
 
 def _show_suspense_table(entries: List[Dict], dp: LocalExcelDataProvider, all_members: List[Dict]) -> None:
-    """Render a suspense entries table with tag/delete actions."""
+    """Render a suspense entries table with Create/Delete actions."""
     member_opts = {m["ID"]: f"Plot {m.get('Plot_No','?')} — {m.get('Plot_Owner_Name','?')}" for m in all_members}
     for se in entries:
         sid = se["ID"]
+        date_str = str(se.get("Date", "") or "")
+        amount = float(se.get("Amount", 0))
+        particulars = str(se.get("Particulars", "") or "")
+        txn_type = str(se.get("Transaction_Type", "") or "")
         with st.container(border=True):
-            ca, cb, cc, cd = st.columns([1.5, 3, 1.5, 3])
-            ca.markdown(f"**{se.get('Date','')}** — ₹{float(se.get('Amount',0)):>,.2f}")
-            cb.markdown(f"`{str(se.get('Particulars',''))[:80]}`")
-            cc.markdown(f"`{se.get('Transaction_Type','') or '—'}`")
-            with cd:
-                if se.get("Status") == "Pending":
-                    tag_mid = st.selectbox(
-                        "Tag to", options=list(member_opts.keys()),
-                        format_func=lambda x: member_opts.get(x, f"ID {x}"),
-                        key=f"stag_{sid}", label_visibility="collapsed",
-                        placeholder="Select member...",
-                    )
-                    col_x, col_y = st.columns(2)
-                    if col_x.button("✅ Tag", key=f"tag_{sid}", use_container_width=True):
-                        if data_provider.tag_suspense_entry(sid, tag_mid):
-                            st.session_state.bank_stmt_confirmation = f"✅ Tagged suspense entry #{sid} to {member_opts.get(tag_mid, '?')}"
-                            st.rerun()
-                        else:
-                            st.error("Failed to tag entry")
-                    if col_y.button("🗑️", key=f"del_sus_{sid}", use_container_width=True):
-                        if data_provider.delete_suspense_entry(sid):
-                            st.rerun()
-                else:
-                    tagged_to = se.get("Tagged_To")
-                    mname = member_opts.get(int(tagged_to), f"ID {tagged_to}") if tagged_to else "?"
-                    st.caption(f"→ {mname}")
-                    st.caption(f"Tagged: {se.get('Tagged_Date','')}")
-                    if st.button("🗑️", key=f"del_sus_{sid}", use_container_width=True):
-                        if data_provider.delete_suspense_entry(sid):
-                            st.rerun()
+            cols = st.columns([1.5, 3, 1.5, 3])
+            cols[0].markdown(f"**{date_str}** — ₹{amount:>,.2f}")
+            cols[1].markdown(f"`{particulars[:80]}`")
+            cols[2].markdown(f"`{txn_type or '—'}`")
+            with cols[3]:
+                create_mid = st.selectbox(
+                    "Assign to", options=list(member_opts.keys()),
+                    format_func=lambda x: member_opts.get(x, f"ID {x}"),
+                    key=f"sus_pick_{sid}", label_visibility="collapsed",
+                    placeholder="Select plot...",
+                )
+                cc1, cc2 = st.columns(2)
+                if cc1.button("📋 Create", key=f"sus_create_{sid}", use_container_width=True):
+                    if not create_mid:
+                        st.warning("Select a plot first")
+                    else:
+                        vch = dp.get_next_voucher_number()
+                        fy = get_fy_from_date(date_str)
+                        receipt_id = f"{fy}-{str(vch).zfill(3)}"
+                        dp.add_ledger_entry(create_mid, {
+                            "Date": date_str,
+                            "Particulars": f"By {particulars[:60]}",
+                            "Vch_Type": "Journal",
+                            "Vch_No": vch,
+                            "Debit": None,
+                            "Credit": amount,
+                            "Description": f"Receipt {receipt_id} — From Suspense",
+                            "Transaction_Type": txn_type,
+                            "Transaction_ID": str(se.get("Transaction_ID", "") or ""),
+                        })
+                        dp.delete_suspense_entry(sid)
+                        st.success(f"✅ Created ledger entry for {member_opts.get(create_mid, '?')}")
+                        st.rerun()
+                if cc2.button("🗑️", key=f"sus_del_{sid}", use_container_width=True):
+                    dp.delete_suspense_entry(sid)
+                    st.rerun()
 
 
 def _fy_date_range(fy: str) -> tuple:
-    """Convert '24-25' to (from_date, to_date) strings in DD-MM-YYYY format."""
+    """Convert '24-25' or '2024-25' to (from_date, to_date) strings in DD-MM-YYYY format."""
     try:
         parts = fy.split("-")
-        start_yr = int(parts[0]) + 2000
-        end_yr = int(parts[1]) + 2000
+        if len(parts) != 2:
+            return ("", "")
+        start_yr = int(parts[0])
+        if start_yr < 100:
+            start_yr += 2000
+        end_yr = start_yr + 1
         return (f"01-04-{start_yr}", f"31-03-{end_yr}")
     except Exception:
         return ("", "")
@@ -411,11 +425,6 @@ def regenerate_invoice(dp: Any, member_id: int, entry: Dict) -> Optional[str]:
     old_desc = str(entry.get("Description", "") or "")
     ref_id = _extract_ref_id(old_desc)
 
-    # ── Delete old entry + PDF ──
-    if not dp.delete_ledger_entry(member_id, vch_no):
-        return "Failed to delete old entry"
-    _delete_pdf_files(ref_id)
-
     # ── Compute gross charges ──
     member = dp.get_member(member_id)
     settings = dp.get_settings()
@@ -446,8 +455,6 @@ def regenerate_invoice(dp: Any, member_id: int, entry: Dict) -> Optional[str]:
             except ValueError:
                 pass
 
-    total = gross_total - payment_received
-
     # ── Build invoice_data ──
     bill_period = f"{_month_names[period_start.month - 1]}{period_start.year % 100} to {_month_names[period_end.month - 1]}{period_end.year % 100}"
     inv_date = datetime.strptime(invoice_date, "%d-%m-%Y") if invoice_date else datetime.now()
@@ -460,13 +467,14 @@ def regenerate_invoice(dp: Any, member_id: int, entry: Dict) -> Optional[str]:
         f"Repair & Maintenance Fund @ ₹{repair_rate:,.2f}/month × {months} months": repair_amt,
         f"Service Charges @ ₹{service_rate:,.2f}/month × {months} months": service_amt,
         f"Sinking Fund @ ₹{sinking_rate:,.2f}/month × {months} months": sinking_amt,
-        "Interest Penalty Charges": pending_interest,
     }
-    if payment_received > 0:
-        line_items["Payment Received (this period)"] = -payment_received
 
     payment_history = get_payment_history(ledger, invoice_date)
     previous_invoices = get_previous_invoices(ledger, invoice_date)
+
+    prev_outstanding = -compute_outstanding_as_of(ledger, invoice_date)
+    total_line_items = repair_amt + service_amt + sinking_amt
+    total_amount_due = total_line_items + prev_outstanding + pending_interest
 
     invoice_data = {
         "invoice_no": info["invoice_no"],
@@ -478,21 +486,28 @@ def regenerate_invoice(dp: Any, member_id: int, entry: Dict) -> Optional[str]:
         "from_date": info["from_date"],
         "to_date": info["to_date"],
         "number_of_months": months,
-        "payment_received_till_date": payment_received,
-        "outstanding_balance": total,
         "payment_history": payment_history,
         "previous_invoices": previous_invoices,
         "line_items": line_items,
-        "total_amount": total,
-        "amount_in_words": number_to_words_inr(total),
+        "previous_outstanding": prev_outstanding,
+        "interest_penalty": pending_interest,
+        "total_line_items": total_line_items,
+        "total_amount_due": total_amount_due,
+        "amount_in_words": number_to_words_inr(total_amount_due),
     }
 
-    # ── Write PDF (overwrite) ──
+    # ── Write PDF ──
     fy_short = info["fy"][:2]
     invoice_dir = config.INVOICES_DIR / fy_short
     invoice_dir.mkdir(parents=True, exist_ok=True)
     invoice_path = invoice_dir / f"Invoice_{plot_part}_{info['invoice_no']}.pdf"
-    create_simple_invoice_pdf(invoice_path, invoice_data)
+    if not create_simple_invoice_pdf(invoice_path, invoice_data):
+        return f"Failed to generate PDF for invoice {info['invoice_no']}"
+
+    # ── Delete old entry + PDF (only after new PDF is created) ──
+    if not dp.delete_ledger_entry(member_id, vch_no):
+        return f"Regenerated PDF but failed to delete old entry for invoice {info['invoice_no']}"
+    _delete_pdf_files(ref_id)
 
     # ── Create new ledger entry ──
     date_range = f"{info['from_date']} to {info['to_date']}, {months} months"
@@ -502,13 +517,13 @@ def regenerate_invoice(dp: Any, member_id: int, entry: Dict) -> Optional[str]:
         "Particulars": f"To Annual Maintenance Charges ({date_range})",
         "Vch_Type": "Journal",
         "Vch_No": vch_no_new,
-        "Debit": gross_total,
+        "Debit": total_amount_due,
         "Credit": None,
         "Description": f"Invoice {info['invoice_no']} FY {info['fy']} (regenerated)",
         "Transaction_Type": "INVOICE",
     })
 
-    return f"Regenerated invoice {info['invoice_no']} for ₹{total:,.2f} (payment received this period: ₹{payment_received:,.2f})"
+    return f"Regenerated invoice {info['invoice_no']} for ₹{total_amount_due:,.2f}"
 
 
 def delete_invoice(dp: Any, member_id: int, entry: Dict) -> Optional[str]:
@@ -537,14 +552,6 @@ def _rec_select_all_changed():
     val = st.session_state["rec_select_all"]
     for key in list(st.session_state.keys()):
         if key.startswith("rec_sel_") and key != "rec_select_all":
-            st.session_state[key] = val
-
-
-def _led_select_all_changed():
-    """Sync all individual ledger checkboxes when Select All is toggled."""
-    val = st.session_state.get("led_sel_all", False)
-    for key in list(st.session_state.keys()):
-        if key.startswith("led_sel_") and key != "led_sel_all":
             st.session_state[key] = val
 
 
@@ -640,6 +647,15 @@ def _invoice_exists(entry: dict) -> str:
     return "no"
 
 
+def _run_tool(tool_name: str, input_str: str) -> str:
+    """Run an orchestrator tool by name, returning its text output."""
+    for t in orchestrator_agent.tools:
+        if t.name == tool_name:
+            result = t.func(input_str)
+            return str(result) if result else ""
+    return f"Tool '{tool_name}' not found"
+
+
 def show_dashboard_page():
     """Dashboard page"""
     st.title("📊 Dashboard")
@@ -661,8 +677,8 @@ def show_dashboard_page():
         pending = sum(1 for m in members if data_provider.get_current_outstanding(m["ID"]) < 0)
         st.metric("In Demand", pending)
 
-    tab_accounts, tab_expenses, tab_receipts, tab_invoices, tab_ledgers, tab_reports = st.tabs(
-        ["Accounts", "Expenses", "Receipts", "Invoices", "Ledgers", "Reports"]
+    tab_accounts, tab_invoices, tab_ledgers, tab_receipts, tab_expenses, tab_reports = st.tabs(
+        ["Accounts", "Invoices", "Ledgers", "Receipts", "Expenses", "Reports"]
     )
 
     # ═══════════════════════════════════════════════════════════════
@@ -670,90 +686,11 @@ def show_dashboard_page():
     # ═══════════════════════════════════════════════════════════════
     with tab_accounts:
 
-        # ── Manual Payment Entry Form ─────────────────────────────
-        with st.expander("💰 Record Payment", expanded=False):
-            pay_member_id = st.selectbox(
-                "Member *", options=[m["ID"] for m in members],
-                format_func=_member_label, key="pay_member",
-            )
-            pay_col1, pay_col2 = st.columns(2)
-            with pay_col1:
-                pay_date = st.text_input("Date (DD-MM-YYYY)", value="", key="pay_date", placeholder="e.g. 15-05-2026")
-                pay_amount = st.number_input("Amount (₹)", min_value=0.0, step=100.0, key="pay_amount")
-                pay_generate_receipt = st.checkbox("Generate Receipt PDF", value=False, key="pay_gen_rec")
-            with pay_col2:
-                pay_particulars = st.text_input("Particulars", key="pay_particulars", placeholder="e.g. Maintenance payment")
-                pay_txn_type = st.selectbox("Transaction Type", ["NEFT", "UPI", "CHQ", "CASH", "IMPS", "RTGS", "Other"], key="pay_txn_type")
-                pay_txn_id = st.text_input("Transaction ID (optional)", key="pay_txn_id", placeholder="e.g. UTR number")
-
-            if st.button("Save Payment", type="primary", use_container_width=True, key="pay_save"):
-                pay_member = _find_member(pay_member_id)
-                if not pay_date.strip() or not pay_particulars.strip() or pay_amount <= 0 or not pay_member:
-                    st.warning("Date, Particulars, Amount, and Member are required")
-                else:
-                    vch_no = data_provider.get_next_voucher_number()
-                    fy = get_fy_from_date(pay_date.strip())
-                    receipt_id = f"{fy}-{str(vch_no).zfill(3)}"
-                    description = f"RCPT-{receipt_id} — Manual entry ({pay_txn_type})"
-                    if pay_txn_id.strip():
-                        description += f" [{pay_txn_id.strip()}]"
-
-                    data_provider.add_ledger_entry(pay_member_id, {
-                        "Date": pay_date.strip(),
-                        "Particulars": f"By {pay_particulars.strip()[:60]}",
-                        "Vch_Type": "Journal",
-                        "Vch_No": vch_no,
-                        "Debit": None,
-                        "Credit": pay_amount,
-                        "Description": description,
-                        "Transaction_Type": pay_txn_type,
-                        "Transaction_ID": pay_txn_id.strip() or None,
-                    })
-
-                    if pay_generate_receipt:
-                        receipt_dir = config.RECEIPTS_DIR / fy
-                        receipt_dir.mkdir(parents=True, exist_ok=True)
-                        plot_str = str(pay_member.get("Plot_No", "") or "")
-                        plot_part = f"Plot_No_{plot_str.zfill(2)}" if plot_str else "Unknown"
-                        rpath = receipt_dir / f"Receipt_{plot_part}_{receipt_id}.pdf"
-                        receipt_data = {
-                            "receipt_id": receipt_id,
-                            "date": pay_date.strip(),
-                            "member_name": pay_member.get("Plot_Owner_Name", ""),
-                            "plot_no": plot_str,
-                            "amount": pay_amount,
-                            "transaction_id": pay_txn_id.strip() or "N/A",
-                            "transaction_type": pay_txn_type,
-                            "payment_details": clean_payment_details(pay_particulars.strip())[:120],
-                        }
-                        create_simple_receipt_pdf(rpath, receipt_data)
-
-                    st.success(f"✅ Payment of ₹{pay_amount:,.2f} recorded for {pay_member.get('Plot_Owner_Name', '')} → {receipt_id}")
-                    st.rerun()
-
         # ── Accounts-Based Bank Statement Processing ─────────────────
-        st.subheader("🏦 Accounts (New Flow: Parse → Validate → Create Ledger)")
+        st.subheader("🏦 Accounts (Parse → Validate → Create Ledger)")
 
         import hashlib, shutil
         from datetime import datetime
-        from tools.pdf_parser import parse_bank_pdf
-
-        def _run_tool(tool_name: str, input_str: str) -> str:
-            for t in orchestrator_agent.tools:
-                if t.name == tool_name:
-                    result = t.func(input_str)
-                    return str(result) if result else ""
-            return f"Tool '{tool_name}' not found"
-
-        gen_receipts_checkbox = st.checkbox(
-            "📄 Generate Receipt PDFs",
-            value=False, key="ac_gen_receipts",
-            help="Generate receipt PDFs when creating ledger entries.",
-        )
-
-        accts_summary = data_provider.get_accounts_summary()
-        pending_count = len(data_provider.get_accounts_entries(status="Pending"))
-        unmatched_count = len(data_provider.get_accounts_entries(status="Unmatched"))
 
         # ── Statement Upload / Paste ──
         with st.expander("Upload & Parse Bank Statement", expanded=True):
@@ -772,6 +709,7 @@ def show_dashboard_page():
                     with open(save_path, "wb") as f:
                         f.write(pdf_bytes)
                     with st.spinner("Parsing PDF..."):
+                        from tools.pdf_parser import parse_bank_pdf
                         parsed = parse_bank_pdf(str(save_path), password=stmt_password)
                     st.success(f"{parsed['entry_count']} entries (format: {parsed['format']})")
 
@@ -808,70 +746,50 @@ def show_dashboard_page():
                     st.markdown(result)
                     st.rerun()
 
-        # ── Accounts Summary ──
+        # ── Accounts Summary (compact) ──
+        accts_summary = data_provider.get_accounts_summary()
         if accts_summary.get("total_entries", 0) > 0:
-            with st.expander("📊 Accounts Sheet Summary", expanded=True):
-                col1, col2, col3, col4, col5 = st.columns(5)
-                col1.metric("Total Entries", accts_summary["total_entries"])
-                col2.metric("Balance ✓", accts_summary.get("balance_ok", 0))
-                col3.metric("Balance ✗", accts_summary.get("balance_mismatch", 0))
-                col4.metric("Pending", pending_count)
-                col5.metric("Unmatched", unmatched_count)
+            pending_count = len(data_provider.get_accounts_entries(status="Pending"))
+            unmatched_count = len(data_provider.get_accounts_entries(status="Unmatched"))
+            st.subheader("📊 Accounts Sheet Summary")
+            col1, col2, col3, col4, col5 = st.columns(5)
+            col1.metric("Total Entries", accts_summary["total_entries"])
+            col2.metric("Balance ✓", accts_summary.get("balance_ok", 0))
+            col3.metric("Balance ✗", accts_summary.get("balance_mismatch", 0))
+            col4.metric("Pending", pending_count)
+            col5.metric("Unmatched", unmatched_count)
 
-                for stmt in accts_summary.get("statements", []):
-                    with st.container(border=True):
-                        st.markdown(f"**{stmt['source_file']}** — {stmt['first_date']} → {stmt['last_date']}")
-                        sc = st.columns(6)
-                        sc[0].metric("Entries", stmt['entries'])
-                        sc[1].metric("Deposits", f"₹{stmt['total_deposits']:,.0f}")
-                        sc[2].metric("Withdrawals", f"₹{stmt['total_withdrawals']:,.0f}")
-                        sc[3].metric("Opening", f"₹{stmt['opening_balance']:,.0f}")
-                        sc[4].metric("Closing", f"₹{stmt['closing_balance']:,.0f}")
-                        sc[5].metric("Mismatches", stmt['mismatches'])
+            # ── Account Balances by FY ──
+            continuity = accts_summary.get("continuity", [])
+            if continuity:
+                st.subheader("Account Balances by Financial Year")
+                fy_rows = []
+                for fy in continuity:
+                    status_icon = "✅"
+                    rollover = fy.get("rollover_from_prev")
+                    if rollover and not rollover["match"]:
+                        status_icon = "❌"
+                    fy_rows.append({
+                        "FY": fy["fy"],
+                        "Opening": f"₹{fy['opening_balance']:,.2f}",
+                        "Closing": f"₹{fy['closing_balance']:,.2f}",
+                        "Deposits": f"₹{fy.get('total_deposits', 0):,.2f}",
+                        "Withdrawals": f"₹{fy.get('total_withdrawals', 0):,.2f}",
+                        "Entries": fy["entries"],
+                        "Files": ", ".join(fy["files"]),
+                        "Status": status_icon,
+                    })
+                st.dataframe(fy_rows, use_container_width=True, hide_index=True)
 
-                continuity = accts_summary.get("continuity", [])
-                if continuity:
-                    st.subheader("📊 Statement Continuity by Financial Year")
-                    for fy in continuity:
-                        fy_label = fy["fy"]
-                        fy_start_year = 2000 + int(fy_label[:2])
-                        fy_range = f"Apr {fy_start_year} — Mar {fy_start_year + 1}"
-                        rollover = fy.get("rollover_from_prev")
-
-                        lines = [f"**FY {fy_label}** ({fy_range})"]
-                        lines.append(
-                            f"  Opening: ₹{fy['opening_balance']:,.2f} ({fy['opening_date']})"
-                            f" | Closing: ₹{fy['closing_balance']:,.2f} ({fy['closing_date']})"
-                            f" — {fy['entries']} entr{'y' if fy['entries'] == 1 else 'ies'}"
-                        )
-                        lines.append(f"  Files: {', '.join(fy['files'])}")
-
-                        if rollover:
-                            if rollover["match"]:
-                                lines.append(
-                                    f"  ✅ Rollover from FY {rollover['from_fy']}: "
-                                    f"₹{rollover['from_closing_balance']:,.2f} → ₹{rollover['to_opening_balance']:,.2f}"
-                                )
-                            else:
-                                lines.append(
-                                    f"  ❌ Gap detected: FY {rollover['from_fy']} closed at "
-                                    f"₹{rollover['from_closing_balance']:,.2f} but FY {fy['fy']} opens at "
-                                    f"₹{rollover['to_opening_balance']:,.2f} (diff: ₹{rollover['difference']:,.2f})"
-                                )
-
-                        for line in lines:
-                            st.caption(line)
-                        st.caption("")  # spacer
-
-                gaps = accts_summary.get("gaps", [])
-                if gaps:
-                    st.warning("⚠️ Balance mismatches at FY boundaries (missing entries suspected):")
-                    for g in gaps:
-                        st.caption(
-                            f"  • FY {g['from_fy']} closing ₹{g['expected_closing']:,.2f} → "
-                            f"FY {g['to_fy']} opening ₹{g['actual_opening']:,.2f} "
-                            f"(diff: ₹{g['difference']:,.2f})"
-                        )
+            gaps = accts_summary.get("gaps", [])
+            if gaps:
+                st.warning("⚠️ Balance mismatches at FY boundaries:")
+                for g in gaps:
+                    st.caption(
+                        f"  • FY {g['from_fy']} closing ₹{g['expected_closing']:,.2f} → "
+                        f"FY {g['to_fy']} opening ₹{g['actual_opening']:,.2f} "
+                        f"(diff: ₹{g['difference']:,.2f})"
+                    )
 
         # ── Accounts Table Viewer ──
         if accts_summary.get("total_entries", 0) > 0:
@@ -893,7 +811,7 @@ def show_dashboard_page():
                             return "Unknown"
                     ac_df["FY"] = ac_df["Date"].apply(_fy_label)
 
-                    cols = st.columns(3)
+                    cols = st.columns(4)
                     with cols[0]:
                         fy_options = ["All"] + sorted(ac_df["FY"].unique())
                         fy_filter = st.selectbox("FY", fy_options, key="ac_fy_filter")
@@ -903,6 +821,9 @@ def show_dashboard_page():
                     with cols[2]:
                         status_options = ["All", "Pending", "Potential Duplicate", "Matched", "Unmatched", "Skipped", "Expensed"]
                         status_filter = st.selectbox("Status", status_options, key="ac_status_filter")
+                    with cols[3]:
+                        check_options = ["All", "✓ (OK)", "✗ (Mismatch)", "Blank (Not Checked)"]
+                        check_filter = st.selectbox("Check", check_options, key="ac_check_filter")
 
                     if fy_filter != "All":
                         ac_df = ac_df[ac_df["FY"] == fy_filter]
@@ -910,6 +831,14 @@ def show_dashboard_page():
                         ac_df = ac_df[ac_df["Source_File"] == sf_filter]
                     if status_filter != "All":
                         ac_df = ac_df[ac_df["Status"] == status_filter]
+                    if check_filter != "All":
+                        bc = ac_df["Balance_Check"].astype(str)
+                        if check_filter == "✓ (OK)":
+                            ac_df = ac_df[bc.str.contains("✓")]
+                        elif check_filter == "✗ (Mismatch)":
+                            ac_df = ac_df[bc.str.contains("✗")]
+                        elif check_filter == "Blank (Not Checked)":
+                            ac_df = ac_df[bc.str.strip().isin(["", "nan", "None"])]
 
                     ac_df = ac_df.sort_values("_dt_sort")
 
@@ -924,6 +853,9 @@ def show_dashboard_page():
                     view = ac_df[list(avail.keys())].copy()
                     view["Particulars"] = view["Particulars"].astype(str).str[:60]
                     view.columns = list(avail.values())
+                    total_dep = float(ac_df["Deposit"].fillna(0).sum()) if "Deposit" in ac_df.columns else 0
+                    total_wd = float(ac_df["Withdrawal"].fillna(0).sum()) if "Withdrawal" in ac_df.columns else 0
+                    st.caption(f"📊 {len(ac_df)} records  |  Deposits: ₹{total_dep:,.2f}  |  Withdrawals: ₹{total_wd:,.2f}")
                     st.dataframe(view, use_container_width=True, hide_index=True)
 
                 interest_entries = data_provider.get_interest_income()
@@ -939,232 +871,7 @@ def show_dashboard_page():
                         } for e in interest_entries]
                         st.dataframe(ii_df, use_container_width=True, hide_index=True)
 
-        # ── Create Ledger from Accounts ──
-        if pending_count > 0 or unmatched_count > 0:
-            st.divider()
-            st.subheader("📤 Create Ledger from Accounts")
 
-            settings = data_provider.get_settings()
-            current_fy = settings.get("Current_FY", "2026-27")
-            fy_options = [f"{y}-{str(y+1)[2:]}" for y in range(2024, 2028)]
-            selected_fy = st.selectbox("Financial Year", fy_options, index=fy_options.index(current_fy) if current_fy in fy_options else 0, key="ac_fy")
-
-            if st.button("🚀 Create Ledger from Accounts", type="primary", use_container_width=True, key="ac_create_ledger"):
-                result = _run_tool("create_ledger_from_accounts", json.dumps({
-                    "fy": selected_fy,
-                    "generate_receipts": gen_receipts_checkbox,
-                }))
-                data_provider.refresh_reports_sheet()
-                st.markdown(result)
-                st.rerun()
-
-        # ── Unmatched Entries Handler ──
-        unmatched_entries = data_provider.get_accounts_entries(status="Unmatched")
-        if unmatched_entries:
-            st.divider()
-            st.warning(f"⚠️ **{len(unmatched_entries)} unmatched entries need attention**")
-
-            members_list = [
-                {"id": m["ID"], "label": f"Plot {m.get('Plot_No','?')} — {m.get('Plot_Owner_Name','?')}"}
-                for m in members
-            ]
-            all_member_options = [m["label"] for m in members_list]
-            member_id_map = {m["label"]: m["id"] for m in members_list}
-
-            if st.button("📋 Move All Unmatched to Suspense", type="secondary", use_container_width=True, key="ac_move_suspense"):
-                count = 0
-                for u in unmatched_entries:
-                    data_provider.add_suspense_entry({
-                        "Date": u.get("Date", ""),
-                        "Particulars": str(u.get("Particulars", "") or "")[:80],
-                        "Amount": float(u.get("Deposit", 0) or 0),
-                        "Transaction_ID": u.get("Transaction_ID", "") or "",
-                        "Transaction_Type": u.get("Transaction_Type", "") or "",
-                        "Description": f"From Accounts — {str(u.get('Particulars', '') or '')[:60]}",
-                    })
-                    data_provider.update_accounts_entry(u["Entry_ID"], {"Status": "Skipped"})
-                    count += 1
-                st.info(f"Moved {count} entries to suspense")
-                st.rerun()
-
-            with st.form("ac_unmatched_batch"):
-                for u in unmatched_entries:
-                    eid = u["Entry_ID"]
-                    with st.container(border=True):
-                        cols = st.columns([0.3, 1.3, 1.3, 2.5, 1.8, 0.7, 0.7, 0.7, 0.7])
-                        cols[0].checkbox("", key=f"ac_chk_{eid}", label_visibility="collapsed")
-                        cols[1].markdown(f"**{u.get('Date', '')}**")
-                        cols[2].markdown(f"₹{float(u.get('Deposit', 0) or 0):>,.2f}")
-                        cols[3].markdown(f"`{str(u.get('Particulars', '') or '')[:40]}`")
-                        with cols[4]:
-                            st.selectbox("Member", all_member_options, key=f"ac_mem_{eid}", label_visibility="collapsed", placeholder="Select")
-                            st.text_input("Why?", key=f"ac_reason_{eid}", label_visibility="collapsed", placeholder="why this match?")
-                        with cols[5]:
-                            add_btn = st.form_submit_button("Add", key=f"ac_add_{eid}", use_container_width=True)
-                        with cols[6]:
-                            ign_btn = st.form_submit_button("Ignore", key=f"ac_ign_{eid}", use_container_width=True)
-                        with cols[7]:
-                            sus_btn = st.form_submit_button("Suspense", key=f"ac_sus_{eid}", use_container_width=True)
-                        with cols[8]:
-                            inc_btn = st.form_submit_button("📈 Int.", key=f"ac_inc_{eid}", use_container_width=True)
-
-                        if add_btn:
-                            mid = member_id_map.get(st.session_state.get(f"ac_mem_{eid}", ""))
-                            if mid:
-                                fy = get_fy_from_date(str(u.get("Date", "")))
-                                vch_no = data_provider.get_next_voucher_number()
-                                receipt_id = f"{fy}-{str(vch_no).zfill(3)}"
-                                data_provider.add_ledger_entry(mid, {
-                                    "Date": u.get("Date", ""),
-                                    "Particulars": f"By {str(u.get('Particulars', '') or '')[:60]}",
-                                    "Vch_Type": "Journal",
-                                    "Vch_No": vch_no,
-                                    "Debit": None,
-                                    "Credit": float(u.get("Deposit", 0) or 0),
-                                    "Description": f"Receipt {receipt_id} — Manual ({u.get('Transaction_Type', '') or 'N/A'})",
-                                    "Transaction_Type": u.get("Transaction_Type", "") or "",
-                                    "Transaction_ID": u.get("Transaction_ID", "") or "",
-                                })
-                                data_provider.update_accounts_entry(eid, {"Status": "Matched"})
-
-                                # Record identifiers and generate suggestions
-                                from tools.pdf_parser import _extract_search_tokens
-                                reason = st.session_state.get(f"ac_reason_{eid}", "")
-                                txn_type = str(u.get("Transaction_Type", "") or "")
-                                txn_id = str(u.get("Transaction_ID", "") or "")
-                                particulars = str(u.get("Particulars", "") or "")
-                                _, identifiers = _extract_search_tokens(particulars, txn_type, txn_id)
-                                for id_value, id_type in identifiers:
-                                    data_provider.record_payment_reference(mid, id_type, id_value, u.get("Date", ""), transaction_type=txn_type)
-
-                                suggestions = []
-                                for ou in unmatched_entries:
-                                    if ou["Entry_ID"] == eid:
-                                        continue
-                                    if data_provider.find_member_by_identifier(identifiers[0][0]) if identifiers else None:
-                                        suggested_mid = data_provider.find_member_by_identifier(identifiers[0][0])["ID"]
-                                        if suggested_mid == mid:
-                                            suggestions.append({
-                                                "entry_id": ou["Entry_ID"],
-                                                "date": ou.get("Date", ""),
-                                                "amount": float(ou.get("Deposit", 0) or 0),
-                                                "particulars": str(ou.get("Particulars", "") or "")[:60],
-                                                "member_id": mid,
-                                                "reason": f"Auto: shares identifier '{identifiers[0][0]}' with tagged entry #{eid}" + (f" ({reason})" if reason else ""),
-                                            })
-
-                                if suggestions:
-                                    st.session_state.ac_suggestions = suggestions
-                                    st.session_state.ac_suggestions_base_entry = eid
-
-                                st.info(f"Added ₹{float(u.get('Deposit', 0) or 0):>,.2f} to {st.session_state.get(f'ac_mem_{eid}', '')}")
-                                st.rerun()
-                        if ign_btn:
-                            data_provider.update_accounts_entry(eid, {"Status": "Skipped"})
-                            st.rerun()
-                        if sus_btn:
-                            data_provider.add_suspense_entry({
-                                "Date": u.get("Date", ""),
-                                "Particulars": str(u.get("Particulars", "") or "")[:80],
-                                "Amount": float(u.get("Deposit", 0) or 0),
-                                "Transaction_ID": u.get("Transaction_ID", "") or "",
-                                "Transaction_Type": u.get("Transaction_Type", "") or "",
-                                "Description": f"From Accounts (manual) — {str(u.get('Particulars', '') or '')[:60]}",
-                            })
-                            data_provider.update_accounts_entry(eid, {"Status": "Skipped"})
-                            st.rerun()
-                        if inc_btn:
-                            data_provider.add_interest_income({
-                                "Date": u.get("Date", ""),
-                                "Particulars": str(u.get("Particulars", "") or "")[:200],
-                                "Amount": float(u.get("Deposit", 0) or 0),
-                                "Transaction_ID": u.get("Transaction_ID", "") or "",
-                                "Transaction_Type": u.get("Transaction_Type", "") or "",
-                                "Source_File": u.get("Source_File", ""),
-                                "Accounts_Entry_ID": eid,
-                            })
-                            data_provider.update_accounts_entry(eid, {"Status": "Skipped"})
-                            st.info(f"📈 Recorded ₹{float(u.get('Deposit', 0) or 0):>,.2f} as Interest Income")
-                            st.rerun()
-
-                st.divider()
-                if st.form_submit_button("Suspense All Checked", use_container_width=True):
-                    count = 0
-                    for u in unmatched_entries:
-                        eid = u["Entry_ID"]
-                        if st.session_state.get(f"ac_chk_{eid}", False):
-                            data_provider.add_suspense_entry({
-                                "Date": u.get("Date", ""),
-                                "Particulars": str(u.get("Particulars", "") or "")[:80],
-                                "Amount": float(u.get("Deposit", 0) or 0),
-                                "Transaction_ID": u.get("Transaction_ID", "") or "",
-                                "Transaction_Type": u.get("Transaction_Type", "") or "",
-                                "Description": f"From Accounts (batch) — {str(u.get('Particulars', '') or '')[:60]}",
-                            })
-                            data_provider.update_accounts_entry(eid, {"Status": "Skipped"})
-                            count += 1
-                    st.info(f"Moved {count} entries to suspense")
-                    st.rerun()
-
-            # ── Auto-suggestion review ──
-            if "ac_suggestions" in st.session_state and st.session_state.ac_suggestions:
-                st.divider()
-                st.success(f"🔍 **{len(st.session_state.ac_suggestions)} auto-suggested match(es)** from your tagging")
-                for s in st.session_state.ac_suggestions:
-                    scols = st.columns([0.3, 1.3, 1.3, 2.5, 2, 0.7, 0.7])
-                    scols[0].markdown(f"`#{s['entry_id']}`")
-                    scols[1].markdown(f"**{s['date']}**")
-                    scols[2].markdown(f"₹{s['amount']:>,.2f}")
-                    scols[3].markdown(f"`{s['particulars'][:35]}`")
-                    scols[4].markdown(f"→ Plot {next((m['label'] for m in members_list if m['id'] == s['member_id']), '?')}", unsafe_allow_html=False)
-                    base_id = st.session_state.get("ac_suggestions_base_entry", 0)
-                    key_sfx = f"{base_id}_{s['entry_id']}"
-                    if scols[5].button("Confirm", key=f"ac_sug_cfm_{key_sfx}", use_container_width=True):
-                        sug_ledger = data_provider.get_member_ledger(s["member_id"])
-                        sug_fy = get_fy_from_date(s["date"])
-                        sug_vch = data_provider.get_next_voucher_number()
-                        sug_rid = f"{sug_fy}-{str(sug_vch).zfill(3)}"
-                        data_provider.add_ledger_entry(s["member_id"], {
-                            "Date": s["date"],
-                            "Particulars": f"By {s['particulars'][:60]}",
-                            "Vch_Type": "Journal",
-                            "Vch_No": sug_vch,
-                            "Debit": None,
-                            "Credit": s["amount"],
-                            "Description": f"Receipt {sug_rid} — Auto-suggested ({s['reason'][:60]})",
-                            "Transaction_Type": "",
-                            "Transaction_ID": "",
-                        })
-                        data_provider.update_accounts_entry(s["entry_id"], {"Status": "Matched"})
-                        st.session_state.ac_suggestions = [x for x in st.session_state.ac_suggestions if x["entry_id"] != s["entry_id"]]
-                        st.rerun()
-                    if scols[6].button("Skip", key=f"ac_sug_skp_{key_sfx}", use_container_width=True):
-                        st.session_state.ac_suggestions = [x for x in st.session_state.ac_suggestions if x["entry_id"] != s["entry_id"]]
-                        st.rerun()
-                scols2 = st.columns([0.7, 0.7, 4])
-                if scols2[0].button("✅ Confirm All", use_container_width=True, type="primary"):
-                    for s in list(st.session_state.ac_suggestions):
-                        sug_ledger = data_provider.get_member_ledger(s["member_id"])
-                        sug_fy = get_fy_from_date(s["date"])
-                        sug_vch = data_provider.get_next_voucher_number()
-                        sug_rid = f"{sug_fy}-{str(sug_vch).zfill(3)}"
-                        data_provider.add_ledger_entry(s["member_id"], {
-                            "Date": s["date"],
-                            "Particulars": f"By {s['particulars'][:60]}",
-                            "Vch_Type": "Journal",
-                            "Vch_No": sug_vch,
-                            "Debit": None,
-                            "Credit": s["amount"],
-                            "Description": f"Receipt {sug_rid} — Auto-suggested ({s['reason'][:60]})",
-                            "Transaction_Type": "",
-                            "Transaction_ID": "",
-                        })
-                        data_provider.update_accounts_entry(s["entry_id"], {"Status": "Matched"})
-                    st.session_state.ac_suggestions = []
-                    st.rerun()
-                if scols2[1].button("Dismiss All", use_container_width=True):
-                    st.session_state.ac_suggestions = []
-                    st.rerun()
 
         # ── Reprocess / Rebuild from stored PDFs ─────────────────
         if "reprocess_msg" not in st.session_state:
@@ -1193,209 +900,39 @@ def show_dashboard_page():
                             if not fpath.exists():
                                 st.session_state.reprocess_msg = f"❌ File not found: {fname}"
                             else:
-                                import hashlib
                                 import shutil
                                 from datetime import datetime as _dt
-                                from tools.pdf_parser import parse_bank_pdf, extract_text_from_pdf
+                                from tools.pdf_parser import extract_text_from_pdf
 
                                 ts = _dt.now().strftime("%Y%m%d_%H%M%S")
                                 shutil.copy2(config.SOCIETY_DATA_FILE, config.BACKUPS_DIR / f"society_data_{ts}_auto_reprocess.xlsx")
 
-                                deleted = data_provider.clear_auto_ledger_entries()
-                                # Delete old Accounts entries for this statement
                                 old_ac = data_provider.get_accounts_entries(source_file=fname)
                                 if old_ac:
                                     old_ids = [e["Entry_ID"] for e in old_ac]
                                     data_provider.delete_accounts_entries(old_ids)
-                                try:
-                                    parsed = parse_bank_pdf(str(fpath), password=pwd)
-                                except Exception as e:
-                                    st.session_state.reprocess_msg = f"❌ Failed to parse '{fname}': {e}"
-                                    st.rerun()
-                                entries_text = "\n".join(parsed["entries"])
-                                tool_input = json.dumps({
-                                    "statement": entries_text,
-                                    "generate_receipts": False,
-                                    "format": ps.get("Format", parsed["format"]),
-                                    "filename": fname,
-                                })
-                                result = _run_tool("process_bank_statement_pdf", tool_input)
-                                # Also populate Accounts sheet for balance validation
+
                                 raw_pdf_text = extract_text_from_pdf(str(fpath), password=pwd)
-                                ac_input = json.dumps({"statement": raw_pdf_text, "filename": fname, "format": parsed["format"]})
-                                ac_result = _run_tool("parse_statement_to_accounts", ac_input)
-                                # Mark new accounts entries as Matched (already processed by old pipeline)
-                                for ac_e in data_provider.get_accounts_entries(source_file=fname):
-                                    if ac_e.get("Status") == "Pending":
-                                        data_provider.update_accounts_entry(ac_e["Entry_ID"], {"Status": "Matched"})
+                                ac_result = _run_tool("parse_statement_to_accounts", json.dumps({
+                                    "statement": raw_pdf_text, "filename": fname,
+                                }))
                                 data_provider.refresh_reports_sheet()
-                                file_hash = hashlib.sha256(open(fpath, "rb").read()).hexdigest()[:16]
-                                data_provider.record_processed_statement(
-                                    filename=fname,
-                                    date_range=ps.get("Date_Range", ""),
-                                    entry_count=parsed["entry_count"],
-                                    fmt=parsed["format"],
-                                    file_hash=file_hash,
-                                )
                                 st.session_state.reprocess_msg = (
-                                    f"✅ Reprocessed '{fname}' — deleted {deleted} old entries, "
-                                    f"re-processed {parsed['entry_count']} entries.\nAccounts: {ac_result}"
+                                    f"✅ Reprocessed '{fname}' — Accounts re-parsed.\n{ac_result}"
                                 )
                                 st.rerun()
 
             st.divider()
-            if st.button("🔄 Rebuild from All Statements", type="primary", use_container_width=True, key="rebuild_all"):
+            if st.button("🔄 Full Reset & Rebuild from All Statements", type="primary", use_container_width=True, key="rebuild_all"):
                 import shutil
                 from datetime import datetime as _dt
-                from tools.pdf_parser import parse_bank_pdf, extract_text_from_pdf
-                import hashlib
 
                 ts = _dt.now().strftime("%Y%m%d_%H%M%S")
                 shutil.copy2(config.SOCIETY_DATA_FILE, config.BACKUPS_DIR / f"society_data_{ts}_auto_rebuild.xlsx")
-
-                # ── Snapshot existing ledger + suspense before clearing ──
-                legacy_snapshot = data_provider.get_member_ledger_all()
-                legacy_lookup = {}  # (date, amount_rounded) → [(Particulars, Plot_No, Vch_No)]
-                for e in legacy_snapshot:
-                    mid = e.get("Plot_No") or e.get("Member_ID")
-                    if mid is None:
-                        continue
-                    try:
-                        mid_int = int(float(mid))
-                    except (ValueError, TypeError):
-                        continue
-                    d = str(e.get("Date", "") or "")
-                    cr = e.get("Credit") or 0
-                    amt = round(float(cr), 2)
-                    key = (d, amt)
-                    legacy_lookup.setdefault(key, []).append({
-                        "particulars": str(e.get("Particulars", "") or ""),
-                        "plot_no": mid_int,
-                    })
-
-                suspense_lookup = {}  # same key format → {"status", "tagged_to", "particulars"}
-                for se in data_provider.get_suspense_entries():
-                    d = str(se.get("Date", "") or "")
-                    amt = round(float(se.get("Amount", 0) or 0), 2)
-                    key = (d, amt)
-                    suspense_lookup.setdefault(key, []).append({
-                        "status": str(se.get("Status", "") or "").strip(),
-                        "tagged_to": se.get("Tagged_To") or se.get("Member_ID"),
-                        "particulars": str(se.get("Particulars", "") or ""),
-                    })
-
-                def _match_unmatched(u_entry, lookup, source_label):
-                    """Find a match for an unmatched entry in a lookup dict by
-                    (date, amount) then disambiguate by normalized Particulars.
-                    Returns matching entry dict or None."""
-                    key = (u_entry["date"], round(u_entry["amount"], 2))
-                    candidates = lookup.get(key, [])
-                    if not candidates:
-                        return None
-                    if len(candidates) == 1:
-                        return candidates[0]
-                    # Multiple candidates — disambiguate by Particulars
-                    u_norm = _normalize_particulars(u_entry.get("particulars", ""))
-                    for c in candidates:
-                        c_norm = _normalize_particulars(c.get("particulars", ""))
-                        if u_norm and c_norm and (u_norm in c_norm or c_norm in u_norm):
-                            return c
-                    return None
-
-                deleted = data_provider.clear_auto_ledger_entries()
-                proc_list = data_provider.get_processed_statements()
-                total_parsed = 0
-                skipped_from_legacy = 0
-                skipped_from_suspense = 0
-                errors = []
-                for ps in proc_list:
-                    fname = ps.get("Filename", "")
-                    fpath = config.BANK_STATEMENTS_DIR / fname
-                    if not fpath.exists():
-                        errors.append(f"'{fname}' not found")
-                        continue
-                    try:
-                        parsed = parse_bank_pdf(str(fpath), password=pwd)
-                    except Exception as e:
-                        errors.append(f"'{fname}': {e}")
-                        continue
-                    entries_text = "\n".join(parsed["entries"])
-                    tool_input = json.dumps({
-                        "statement": entries_text,
-                        "generate_receipts": False,
-                        "format": ps.get("Format", parsed["format"]),
-                        "filename": fname,
-                    })
-                    result = _run_tool("process_bank_statement_pdf", tool_input)
-                    # Also populate Accounts sheet for balance validation
-                    raw_pdf_text = extract_text_from_pdf(str(fpath), password=pwd)
-                    ac_input = json.dumps({"statement": raw_pdf_text, "filename": fname, "format": ps.get("Format", parsed["format"])})
-                    _run_tool("parse_statement_to_accounts", ac_input)
-                    for ac_e in data_provider.get_accounts_entries(source_file=fname):
-                        if ac_e.get("Status") == "Pending":
-                            data_provider.update_accounts_entry(ac_e["Entry_ID"], {"Status": "Matched"})
-                    file_hash = hashlib.sha256(open(fpath, "rb").read()).hexdigest()[:16]
-                    data_provider.record_processed_statement(
-                        filename=fname,
-                        date_range=ps.get("Date_Range", f"from_{fname.replace('.pdf', '')}"),
-                        entry_count=parsed["entry_count"],
-                        fmt=parsed["format"],
-                        file_hash=file_hash,
-                    )
-                    if isinstance(result, dict):
-                        # Filter unmatched against legacy snapshot + Suspense_Entries
-                        filtered_unmatched = []
-                        for u in result.get("unmatched", []):
-                            # 1) Check legacy snapshot
-                            match = _match_unmatched(u, legacy_lookup, "ledger")
-                            if match:
-                                data_provider.add_ledger_entry(match["plot_no"], {
-                                    "Date": u["date"],
-                                    "Particulars": f"By {u.get('particulars', '')[:60]}",
-                                    "Vch_Type": "Journal",
-                                    "Vch_No": data_provider.get_next_voucher_number(),
-                                    "Debit": None,
-                                    "Credit": u["amount"],
-                                    "Description": "Rebuilt from legacy snapshot",
-                                    "Transaction_Type": u.get("txn_type", ""),
-                                    "Transaction_ID": u.get("txn_id", ""),
-                                })
-                                skipped_from_legacy += 1
-                                continue
-                            # 2) Check Suspense_Entries
-                            match = _match_unmatched(u, suspense_lookup, "suspense")
-                            if match:
-                                if match["status"] == "Tagged" and match.get("tagged_to"):
-                                    data_provider.add_ledger_entry(int(float(match["tagged_to"])), {
-                                        "Date": u["date"],
-                                        "Particulars": f"By {u.get('particulars', '')[:60]}",
-                                        "Vch_Type": "Journal",
-                                        "Vch_No": data_provider.get_next_voucher_number(),
-                                        "Debit": None,
-                                        "Credit": u["amount"],
-                                        "Description": "Rebuilt from suspense tagging",
-                                        "Transaction_Type": u.get("txn_type", ""),
-                                        "Transaction_ID": u.get("txn_id", ""),
-                                    })
-                                # Tagged → recreated; Pending → skip (already in suspense)
-                                skipped_from_suspense += 1
-                                continue
-                            # 3) Genuinely new → keep
-                            filtered_unmatched.append(u)
-                        result["unmatched"] = filtered_unmatched
-                        total_parsed += len(result.get("matched", [])) + len(filtered_unmatched)
+                with st.spinner("Resetting and rebuilding all statements..."):
+                    result = _run_tool("reset_and_rebuild_all", json.dumps({}))
                     data_provider.refresh_reports_sheet()
-                err_msg = f" ⚠️ {len(errors)} errors: {'; '.join(errors[:3])}" if errors else ""
-                skip_msg = []
-                if skipped_from_legacy:
-                    skip_msg.append(f"auto-restored {skipped_from_legacy} from legacy ledger")
-                if skipped_from_suspense:
-                    skip_msg.append(f"skipped {skipped_from_suspense} from suspense")
-                skip_txt = f" ({'; '.join(skip_msg)})" if skip_msg else ""
-                st.session_state.reprocess_msg = (
-                    f"✅ Rebuilt from {len(proc_list)} statements — deleted {deleted} old entries, "
-                    f"re-processed {total_parsed} entries.{skip_txt}{err_msg}"
-                )
+                    st.session_state.reprocess_msg = result
                 st.rerun()
 
     # ═══════════════════════════════════════════════════════════════
@@ -1473,109 +1010,10 @@ def show_dashboard_page():
     # ═══════════════════════════════════════════════════════════════
     with tab_receipts:
 
-        # ── Suspense Entries ──────────────────────────────────────
-        with st.expander("📋 Suspense Entries", expanded=False):
-            suspense_list = data_provider.get_suspense_entries()
-            pending = [s for s in suspense_list if s.get("Status") == "Pending"]
-            tagged = [s for s in suspense_list if s.get("Status") == "Tagged"]
-            if not pending and not tagged:
-                st.info("No suspense entries.")
-            else:
-                tab_pend, tab_tag = st.tabs([f"Pending ({len(pending)})", f"Tagged ({len(tagged)})"])
-                with tab_pend:
-                    if not pending:
-                        st.info("No pending entries.")
-                    else:
-                        _show_suspense_table(pending, data_provider, members)
-                with tab_tag:
-                    if not tagged:
-                        st.info("No tagged entries.")
-                    else:
-                        _show_suspense_table(tagged, data_provider, members)
-                        st.divider()
-                        batch_cols = st.columns(2)
-                        with batch_cols[0]:
-                            if st.button("📐 Run Split Rules on Tagged", type="primary", use_container_width=True, key="sus_split_tagged"):
-                                split_rules = data_provider.get_split_rules()
-                                mid_to_group = {}
-                                for rule in split_rules:
-                                    src_mid = int(rule["Source_Member_ID"])
-                                    members_str = str(rule.get("Members", ""))
-                                    grp = [int(x.strip()) for x in members_str.split(",") if x.strip().isdigit()]
-                                    mid_to_group[src_mid] = grp
-                                tagged_entries = [s for s in suspense_list if s.get("Status") == "Tagged"]
-                                processed = 0
-                                for se in tagged_entries:
-                                    sid = se["ID"]
-                                    tagged_mid = int(se.get("Tagged_To", 0))
-                                    if tagged_mid not in mid_to_group:
-                                        continue
-                                    grp = mid_to_group[tagged_mid]
-                                    per_head = round(float(se.get("Amount", 0)) / len(grp), 2)
-                                    date_str = str(se.get("Date", "") or "")
-                                    particulars = str(se.get("Particulars", "") or "")
-                                    for gmid in grp:
-                                        vch_no = data_provider.get_next_voucher_number()
-                                        data_provider.add_ledger_entry(gmid, {
-                                            "Date": date_str,
-                                            "Particulars": f"By Suspense Split ({particulars[:40]})",
-                                            "Vch_Type": "Journal",
-                                            "Vch_No": vch_no,
-                                            "Debit": None,
-                                            "Credit": per_head,
-                                            "Description": f"Split from suspense #{sid}",
-                                            "Transaction_Type": "SPLIT",
-                                        })
-                                    data_provider.delete_suspense_entry(sid)
-                                    processed += 1
-                                st.success(f"✅ Applied split rules to {processed} tagged entries")
-                                st.rerun()
-                        with batch_cols[1]:
-                            if st.button("🔍 Match Identifiers on Tagged", type="primary", use_container_width=True, key="sus_match_id_tagged"):
-                                identifiers = data_provider.get_all_identifiers()
-                                tagged_entries = [s for s in suspense_list if s.get("Status") == "Tagged"]
-                                processed = 0
-                                for se in tagged_entries:
-                                    sid = se["ID"]
-                                    tagged_mid = int(se.get("Tagged_To", 0))
-                                    particulars = str(se.get("Particulars", "") or "").upper()
-                                    extra = str(se.get("Description", "") or "").upper()
-                                    combined = particulars + " " + extra
-                                    matched_identifiers = [
-                                        idr for idr in identifiers
-                                        if idr.get("Member_ID") == tagged_mid
-                                        and str(idr.get("Identifier_Value", "")).upper() in combined
-                                    ]
-                                    if not matched_identifiers:
-                                        continue
-                                    date_str = str(se.get("Date", "") or "")
-                                    amount = float(se.get("Amount", 0))
-                                    member_data = _find_member(tagged_mid)
-                                    mname = member_data.get("Plot_Owner_Name", "") if member_data else ""
-                                    mplot = str(member_data.get("Plot_No", "") or "") if member_data else ""
-                                    vch_no = data_provider.get_next_voucher_number()
-                                    fy = get_fy_from_date(date_str)
-                                    receipt_id = f"{fy}-{str(vch_no).zfill(3)}"
-                                    data_provider.add_ledger_entry(tagged_mid, {
-                                        "Date": date_str,
-                                        "Particulars": f"By {particulars[:60]}",
-                                        "Vch_Type": "Journal",
-                                        "Vch_No": vch_no,
-                                        "Debit": None,
-                                        "Credit": amount,
-                                        "Description": f"Receipt {receipt_id} — Suspense Identifier Match",
-                                        "Transaction_Type": se.get("Transaction_Type", ""),
-                                        "Transaction_ID": se.get("Transaction_ID", ""),
-                                    })
-                                    data_provider.delete_suspense_entry(sid)
-                                    processed += 1
-                                st.success(f"✅ Matched {processed} tagged entries via identifiers")
-                                st.rerun()
-
         # ── Receipts List ─────────────────────────────────────────
         st.subheader("📄 Receipts")
         rec_fy_options = ["All"] + _get_available_fys(
-            sum((data_provider.get_member_ledger(m["ID"]) for m in members), [])
+            data_provider.get_accounts_entries()
         ) if members else ["All"]
         rec_col1, rec_col2, rec_col3, rec_col4 = st.columns([2, 2, 1.5, 1.5])
         with rec_col1:
@@ -1701,13 +1139,29 @@ def show_dashboard_page():
 
         # ── Generate Invoices ─────────────────────────────────────
         with st.expander("🧾 Generate Invoices", expanded=False):
-            col_d1, col_d2, col_d3 = st.columns(3)
-            with col_d1:
-                from_d = st.text_input("From Date (DD-MM-YYYY)", value="", key="inv_from", placeholder="e.g. 01-04-2026")
-            with col_d2:
-                to_d = st.text_input("To Date (DD-MM-YYYY)", value="", key="inv_to", placeholder="e.g. 31-03-2027")
-            with col_d3:
-                inv_d = st.text_input("Invoice Date (DD-MM-YYYY)", value="", key="inv_date", placeholder="Defaults to today")
+            inv_mode = st.radio("Invoice Mode", ["Financial Year", "Custom Dates"],
+                                horizontal=True, key="inv_mode")
+
+            if inv_mode == "Financial Year":
+                inv_fy_options = _get_available_fys(data_provider.get_accounts_entries())
+                current_fy = get_fy_string()
+                if current_fy not in inv_fy_options:
+                    inv_fy_options.insert(0, current_fy)
+                selected_fy = st.selectbox("Select Financial Year", inv_fy_options, key="inv_fy_select")
+                fy_parts = selected_fy.split("-")
+                fy_start = 2000 + int(fy_parts[0])
+                computed_from = f"01-04-{fy_start}"
+                computed_to = f"31-03-{fy_start + 1}"
+                computed_inv = f"01-04-{fy_start}"
+                st.caption(f"📅 {computed_from} to {computed_to}  |  Invoice Date: {computed_inv}")
+            else:
+                col_d1, col_d2, col_d3 = st.columns(3)
+                with col_d1:
+                    from_d = st.text_input("From Date (DD-MM-YYYY)", value="", key="inv_from", placeholder="e.g. 01-04-2026")
+                with col_d2:
+                    to_d = st.text_input("To Date (DD-MM-YYYY)", value="", key="inv_to", placeholder="e.g. 31-03-2027")
+                with col_d3:
+                    inv_d = st.text_input("Invoice Date (DD-MM-YYYY)", value="", key="inv_date", placeholder="Defaults to today")
 
             all_plots = st.checkbox("All Plots", value=True, key="inv_all_plots")
             if not all_plots:
@@ -1723,12 +1177,16 @@ def show_dashboard_page():
 
             if st.button("Generate Invoices Now", type="primary", use_container_width=True):
                 params = {}
-                if from_d.strip():
-                    params["from_date"] = from_d.strip()
-                if to_d.strip():
-                    params["to_date"] = to_d.strip()
-                if inv_d.strip():
-                    params["invoice_date"] = inv_d.strip()
+                if inv_mode == "Financial Year":
+                    params["fy"] = selected_fy
+                    params["invoice_date"] = computed_inv
+                else:
+                    if from_d.strip():
+                        params["from_date"] = from_d.strip()
+                    if to_d.strip():
+                        params["to_date"] = to_d.strip()
+                    if inv_d.strip():
+                        params["invoice_date"] = inv_d.strip()
                 if selected_plots:
                     params["plots"] = selected_plots
                 invoice_tool = next(
@@ -1761,7 +1219,7 @@ def show_dashboard_page():
         # ── Invoices List ─────────────────────────────────────────
         st.subheader("📑 Invoices")
         inv_fy_options = ["All"] + _get_available_fys(
-            sum((data_provider.get_member_ledger(m["ID"]) for m in members), [])
+            data_provider.get_accounts_entries()
         ) if members else ["All"]
         inv_col1, inv_col2, inv_col3 = st.columns([2, 2, 1.5])
         with inv_col1:
@@ -1884,6 +1342,381 @@ def show_dashboard_page():
     # ═══════════════════════════════════════════════════════════════
     with tab_ledgers:
 
+        # ── Record Payment ─────────────────────────────────────────
+        with st.expander("💰 Record Payment", expanded=False):
+            pay_member_id = st.selectbox(
+                "Member *", options=[m["ID"] for m in members],
+                format_func=_member_label, key="led_pay_member",
+            )
+            pay_col1, pay_col2 = st.columns(2)
+            with pay_col1:
+                pay_date = st.text_input("Date (DD-MM-YYYY)", value="", key="led_pay_date", placeholder="e.g. 15-05-2026")
+                pay_amount = st.number_input("Amount (₹)", min_value=0.0, step=100.0, key="led_pay_amount")
+                pay_generate_receipt = st.checkbox("Generate Receipt PDF", value=False, key="led_pay_gen_rec")
+            with pay_col2:
+                pay_particulars = st.text_input("Particulars", key="led_pay_particulars", placeholder="e.g. Maintenance payment")
+                pay_txn_type = st.selectbox("Transaction Type", ["NEFT", "UPI", "CHQ", "CASH", "IMPS", "RTGS", "Other"], key="led_pay_txn_type")
+                pay_txn_id = st.text_input("Transaction ID (optional)", key="led_pay_txn_id", placeholder="e.g. UTR number")
+
+            if st.button("Save Payment", type="primary", use_container_width=True, key="led_pay_save"):
+                pay_member = _find_member(pay_member_id)
+                if not pay_date.strip() or not pay_particulars.strip() or pay_amount <= 0 or not pay_member:
+                    st.warning("Date, Particulars, Amount, and Member are required")
+                else:
+                    vch_no = data_provider.get_next_voucher_number()
+                    fy = get_fy_from_date(pay_date.strip())
+                    receipt_id = f"{fy}-{str(vch_no).zfill(3)}"
+                    description = f"RCPT-{receipt_id} — Manual entry ({pay_txn_type})"
+                    if pay_txn_id.strip():
+                        description += f" [{pay_txn_id.strip()}]"
+
+                    data_provider.add_ledger_entry(pay_member_id, {
+                        "Date": pay_date.strip(),
+                        "Particulars": f"By {pay_particulars.strip()[:60]}",
+                        "Vch_Type": "Journal",
+                        "Vch_No": vch_no,
+                        "Debit": None,
+                        "Credit": pay_amount,
+                        "Description": description,
+                        "Transaction_Type": pay_txn_type,
+                        "Transaction_ID": pay_txn_id.strip() or None,
+                    })
+
+                    if pay_generate_receipt:
+                        receipt_dir = config.RECEIPTS_DIR / fy
+                        receipt_dir.mkdir(parents=True, exist_ok=True)
+                        plot_str = str(pay_member.get("Plot_No", "") or "")
+                        plot_part = f"Plot_No_{plot_str.zfill(2)}" if plot_str else "Unknown"
+                        rpath = receipt_dir / f"Receipt_{plot_part}_{receipt_id}.pdf"
+                        receipt_data = {
+                            "receipt_id": receipt_id,
+                            "date": pay_date.strip(),
+                            "member_name": pay_member.get("Plot_Owner_Name", ""),
+                            "plot_no": plot_str,
+                            "amount": pay_amount,
+                            "transaction_id": pay_txn_id.strip() or "N/A",
+                            "transaction_type": pay_txn_type,
+                            "payment_details": clean_payment_details(pay_particulars.strip())[:120],
+                        }
+                        create_simple_receipt_pdf(rpath, receipt_data)
+
+                    st.success(f"✅ Payment of ₹{pay_amount:,.2f} recorded for {pay_member.get('Plot_Owner_Name', '')} → {receipt_id}")
+                    st.rerun()
+
+        # ── Create Ledger from Accounts ────────────────────────────
+        all_pending = data_provider.get_accounts_entries(status="Pending") or []
+        all_unmatched = data_provider.get_accounts_entries(status="Unmatched") or []
+        if all_pending or all_unmatched:
+            settings_g = data_provider.get_settings()
+            current_fy_g = settings_g.get("Current_FY", "26-27")
+            if len(current_fy_g) == 7:
+                current_fy_g = current_fy_g[2:]
+            all_accounts_g = data_provider.get_accounts_entries()
+            fy_options_g = _get_available_fys(all_accounts_g) or [current_fy_g]
+            default_fy = fy_options_g[0] if fy_options_g else current_fy_g
+
+            with st.expander("📤 Create Ledger from Accounts", expanded=False):
+                gen_receipts = st.checkbox(
+                    "📄 Generate Receipt PDFs", value=False, key="led_gen_receipts",
+                    help="Generate receipt PDFs when creating ledger entries.",
+                )
+
+                selected_fy = st.selectbox("Financial Year", fy_options_g,
+                    index=fy_options_g.index(default_fy) if default_fy in fy_options_g else 0,
+                    key="led_fy_create")
+
+                # Count pending+unmatched in selected FY
+                def _sortable(dd):
+                    try:
+                        p = dd.split("-")
+                        return f"{p[2]}-{p[1]}-{p[0]}"
+                    except Exception:
+                        return dd
+                f_from, f_to = _fy_date_range(selected_fy)
+                sk = _sortable(f_from) if f_from else ""
+                ek = _sortable(f_to) if f_to else ""
+                fy_pending = sum(1 for e in all_pending
+                    if sk <= _sortable(str(e.get("Date", "") or "")) <= ek)
+                fy_unmatched = sum(1 for e in all_unmatched
+                    if sk <= _sortable(str(e.get("Date", "") or "")) <= ek)
+                fy_pending_amt = sum(
+                    float(e.get("Deposit", 0) or 0) for e in all_pending
+                    if sk <= _sortable(str(e.get("Date", "") or "")) <= ek)
+                fy_unmatched_amt = sum(
+                    float(e.get("Deposit", 0) or 0) for e in all_unmatched
+                    if sk <= _sortable(str(e.get("Date", "") or "")) <= ek)
+
+                st.caption(f"📊 Pending: {fy_pending} (₹{fy_pending_amt:,.2f}) | "
+                           f"Unmatched: {fy_unmatched} (₹{fy_unmatched_amt:,.2f}) | FY {selected_fy}")
+                st.divider()
+
+                # ── Preview & Auto Create buttons ──
+                pcol1, pcol2 = st.columns(2)
+                with pcol1:
+                    preview_clicked = st.button("🔍 Preview Ledger Entries",
+                        type="secondary", use_container_width=True, key="led_preview_btn")
+                with pcol2:
+                    auto_clicked = st.button("⚡ Auto Create Ledger from Accounts",
+                        type="primary", use_container_width=True, key="led_auto_btn")
+
+                # Invalidate preview on FY change
+                if (st.session_state.get("ledger_preview_fy")
+                    and st.session_state.ledger_preview_fy != selected_fy):
+                    st.session_state.ledger_preview_data = None
+                    st.session_state.ledger_preview_fy = None
+
+                if preview_clicked:
+                    with st.spinner("Running preview matching..."):
+                        raw = _run_tool("create_ledger_from_accounts", json.dumps({
+                            "fy": selected_fy, "mode": "preview",
+                        }))
+                        try:
+                            st.session_state.ledger_preview_data = json.loads(raw)
+                            st.session_state.ledger_preview_fy = selected_fy
+                        except Exception:
+                            st.error("Preview failed: " + raw[:500])
+                    st.rerun()
+
+                if auto_clicked:
+                    with st.spinner("Auto-creating ledger entries..."):
+                        result = _run_tool("create_ledger_from_accounts", json.dumps({
+                            "fy": selected_fy, "mode": "create",
+                            "generate_receipts": gen_receipts,
+                        }))
+                        st.session_state.ledger_create_msg = result
+                        data_provider.refresh_reports_sheet()
+                    st.rerun()
+
+                # ── Preview results ──
+                preview_data = st.session_state.get("ledger_preview_data")
+                if preview_data and st.session_state.get("ledger_preview_fy") == selected_fy:
+                    matched = preview_data.get("matched", [])
+                    unmatched = preview_data.get("unmatched", [])
+                    auto_income_ct = preview_data.get("auto_income", 0)
+
+                    # Combine into unified list
+                    all_entries = []
+                    for m in matched:
+                        all_entries.append({
+                            "entry_id": m["entry_id"], "status": "matched",
+                            "date": m.get("date", ""), "amount": m.get("amount", 0),
+                            "particulars": m.get("particulars", ""),
+                            "plot_no": m.get("plot_no", ""), "member_name": m.get("member_name", ""),
+                            "member_id": m.get("member_id"), "reason": m.get("reason", ""),
+                        })
+                    for u in unmatched:
+                        all_entries.append({
+                            "entry_id": u["entry_id"], "status": "unmatched",
+                            "date": u.get("date", ""), "amount": u.get("amount", 0),
+                            "particulars": u.get("particulars", ""),
+                            "plot_no": "", "member_name": "", "member_id": None, "reason": "",
+                        })
+                    all_entries.sort(key=lambda x: x["entry_id"])
+
+                    # Build member label lookup
+                    member_plot_opts = {}
+                    for m in members:
+                        member_plot_opts[m["ID"]] = f"Plot {m.get('Plot_No','?')} — {m.get('Plot_Owner_Name','?')}"
+
+                    # Initialize widget defaults for any missing keys
+                    for e in all_entries:
+                        eid = e["entry_id"]
+                        if f"pv_cb_{eid}" not in st.session_state:
+                            st.session_state[f"pv_cb_{eid}"] = True
+                        if f"pv_plot_{eid}" not in st.session_state:
+                            default = e["member_id"] if e["status"] == "matched" and e["member_id"] else ""
+                            st.session_state[f"pv_plot_{eid}"] = default
+                        if f"pv_idtxt_{eid}" not in st.session_state:
+                            st.session_state[f"pv_idtxt_{eid}"] = ""
+
+                    # ── Preview table + actions in a form (no per-widget refreshes) ──
+                    with st.container(border=True):
+                        pv_msg = st.session_state.pop("pv_result_msg", None)
+                        if pv_msg:
+                            st.success(pv_msg)
+                        st.subheader(f"📋 Preview ({len(all_entries)} entries)")
+
+                        with st.form(key="pv_form"):
+                            # Batch selection buttons
+                            sacol1, sacol2 = st.columns([1, 1])
+                            if sacol1.form_submit_button("☑ All", use_container_width=True):
+                                for e in all_entries:
+                                    st.session_state[f"pv_cb_{e['entry_id']}"] = True
+                                st.rerun()
+                            if sacol2.form_submit_button("☐ None", use_container_width=True):
+                                for e in all_entries:
+                                    st.session_state[f"pv_cb_{e['entry_id']}"] = False
+                                st.rerun()
+
+                            # Column headers
+                            hcols = st.columns([0.5, 0.7, 1.3, 1.3, 2.5, 2.5, 3.5])
+                            hcols[0].caption("")
+                            hcols[1].caption("Status")
+                            hcols[2].caption("Date")
+                            hcols[3].caption("Amount")
+                            hcols[4].caption("Plot / Member")
+                            hcols[5].caption("Known Identifier")
+                            hcols[6].caption("Particulars")
+
+                            # Build shared plot options
+                            plot_opts = {"": "No Match"}
+                            for pid, label in member_plot_opts.items():
+                                plot_opts[pid] = label
+                            plot_keys = list(plot_opts.keys())
+
+                            for e in all_entries:
+                                eid = e["entry_id"]
+                                cols = st.columns([0.5, 0.7, 1.3, 1.3, 2.5, 2.5, 3.5])
+                                cols[0].checkbox("", key=f"pv_cb_{eid}")
+                                cols[1].write("✅" if e["status"] == "matched" else "❌")
+                                cols[2].write(e["date"])
+                                cols[3].write(f"₹{e['amount']:>8,.2f}")
+                                # Plot / Member dropdown for ALL entries
+                                # Use format_func with plot_keys lookup to avoid lambda closure issues
+                                cols[4].selectbox("", plot_keys,
+                                    format_func=lambda x: plot_opts.get(x, "No Match"),
+                                    key=f"pv_plot_{eid}", label_visibility="collapsed")
+                                # Known Identifier
+                                if e["status"] == "matched":
+                                    cols[5].write(e.get("reason", ""))
+                                else:
+                                    cols[5].text_input("", key=f"pv_idtxt_{eid}",
+                                        placeholder="e.g. AJAY", label_visibility="collapsed")
+                                cols[6].write(e["particulars"])
+
+                            if auto_income_ct:
+                                st.info(f"📈 {auto_income_ct} entries will be auto-skipped (Interest Income)")
+
+                            st.divider()
+
+                            # ── Action buttons ──
+                            acol1, acol2, acol3 = st.columns(3)
+                            with acol1:
+                                create_clicked = st.form_submit_button("✅ Create Selected Entries",
+                                    type="primary", use_container_width=True)
+                            with acol2:
+                                suspense_clicked = st.form_submit_button("📋 Send to Suspense",
+                                    use_container_width=True)
+                            with acol3:
+                                cancel_clicked = st.form_submit_button("❌ Cancel",
+                                    use_container_width=True)
+
+                    # ── Process actions (outside form, after submit) ──
+                    if create_clicked:
+                        to_create = []
+                        forced = {}
+                        today_str = datetime.now().strftime("%d-%m-%Y")
+                        for e in all_entries:
+                            if not st.session_state.get(f"pv_cb_{e['entry_id']}", False):
+                                continue
+                            eid = e["entry_id"]
+                            assigned_mid = st.session_state.get(f"pv_plot_{eid}", "")
+                            if not assigned_mid:
+                                continue
+                            member = next((m for m in members if m["ID"] == assigned_mid), None)
+                            if not member:
+                                continue
+                            orig_plot = str(e.get("plot_no", ""))
+                            new_plot = str(member.get("Plot_No", ""))
+                            if new_plot != orig_plot:
+                                forced[str(eid)] = new_plot
+                            to_create.append(eid)
+                            idtxt = (st.session_state.get(f"pv_idtxt_{eid}", "") or "").strip()
+                            if idtxt:
+                                data_provider.add_identifier(assigned_mid, "PAYEE_NAME", idtxt, today_str)
+                        if not to_create:
+                            st.warning("No entries selected with a valid plot assignment.")
+                        else:
+                            with st.spinner("Creating selected ledger entries..."):
+                                payload = {"fy": selected_fy, "mode": "create", "generate_receipts": gen_receipts}
+                                payload["entry_ids"] = to_create
+                                if forced:
+                                    payload["forced_assignments"] = forced
+                                _run_tool("create_ledger_from_accounts", json.dumps(payload))
+                                created_set = set(to_create)
+                                remaining = [e for e in all_entries if e["entry_id"] not in created_set]
+                                for eid in created_set:
+                                    for k in (f"pv_cb_{eid}", f"pv_plot_{eid}", f"pv_idtxt_{eid}"):
+                                        st.session_state.pop(k, None)
+                                msg = f"✅ Created {len(to_create)} entries successfully."
+                                if remaining:
+                                    msg += f" {len(remaining)} entries still in preview."
+                                    st.session_state.ledger_preview_data = {
+                                        "matched": [e for e in remaining if e["status"] == "matched"],
+                                        "unmatched": [e for e in remaining if e["status"] == "unmatched"],
+                                        "auto_income": auto_income_ct,
+                                    }
+                                else:
+                                    st.session_state.ledger_preview_data = None
+                                    st.session_state.ledger_preview_fy = None
+                                st.session_state["pv_result_msg"] = msg
+                                data_provider.refresh_reports_sheet()
+                        st.rerun()
+
+                    if suspense_clicked:
+                        to_suspend = []
+                        for e in all_entries:
+                            if not st.session_state.get(f"pv_cb_{e['entry_id']}", False):
+                                continue
+                            assigned_mid = st.session_state.get(f"pv_plot_{e['entry_id']}", "")
+                            if not assigned_mid:
+                                to_suspend.append(e["entry_id"])
+                        if not to_suspend:
+                            st.warning("No entries selected with 'No Match' plot.")
+                        else:
+                            with st.spinner(f"Moving {len(to_suspend)} entries to Suspense..."):
+                                _run_tool("create_ledger_from_accounts", json.dumps({
+                                    "fy": selected_fy, "mode": "send_to_suspense",
+                                    "entry_ids": to_suspend,
+                                }))
+                                suspended_set = set(to_suspend)
+                                remaining = [e for e in all_entries if e["entry_id"] not in suspended_set]
+                                for eid in suspended_set:
+                                    for k in (f"pv_cb_{eid}", f"pv_plot_{eid}", f"pv_idtxt_{eid}"):
+                                        st.session_state.pop(k, None)
+                                msg = f"✅ Sent {len(to_suspend)} entries to Suspense."
+                                if remaining:
+                                    msg += f" {len(remaining)} entries still in preview."
+                                    st.session_state.ledger_preview_data = {
+                                        "matched": [e for e in remaining if e["status"] == "matched"],
+                                        "unmatched": [e for e in remaining if e["status"] == "unmatched"],
+                                        "auto_income": auto_income_ct,
+                                    }
+                                else:
+                                    st.session_state.ledger_preview_data = None
+                                    st.session_state.ledger_preview_fy = None
+                                st.session_state["pv_result_msg"] = msg
+                                data_provider.refresh_reports_sheet()
+                        st.rerun()
+
+                    if cancel_clicked:
+                        for e in all_entries:
+                            for k in (f"pv_cb_{e['entry_id']}", f"pv_plot_{e['entry_id']}", f"pv_idtxt_{e['entry_id']}"):
+                                st.session_state.pop(k, None)
+                        st.session_state.ledger_preview_data = None
+                        st.session_state.ledger_preview_fy = None
+                        st.rerun()
+
+        # Show result message (preview-based operations)
+        pv_msg = st.session_state.pop("pv_result_msg", None)
+        if pv_msg:
+            st.success(pv_msg)
+        # Show persistent create result message (auto-create)
+        create_msg = st.session_state.get("ledger_create_msg")
+        if create_msg:
+            st.success(create_msg)
+            if st.button("Dismiss", key="led_dismiss_msg"):
+                st.session_state.ledger_create_msg = None
+                st.rerun()
+        with st.expander("📋 Suspense Entries", expanded=False):
+            suspense_list = data_provider.get_suspense_entries()
+            if not suspense_list:
+                st.info("No suspense entries.")
+            else:
+                st.caption(f"{len(suspense_list)} entries awaiting assignment")
+                _show_suspense_table(suspense_list, data_provider, members)
+
+        # ── Ledger Filters ─────────────────────────────────────────
         col_f1, col_f2, col_f3 = st.columns([3, 2, 2])
         with col_f1:
             led_member_id = st.selectbox(
@@ -1896,7 +1729,7 @@ def show_dashboard_page():
         with col_f3:
             led_fy_filter = st.selectbox(
                 "FY", ["All", "Custom"] + _get_available_fys(
-                    sum((data_provider.get_member_ledger(m["ID"]) for m in members), [])
+                    data_provider.get_accounts_entries()
                 ) if members else ["All"],
                 key="led_fy",
             )
@@ -1971,12 +1804,18 @@ def show_dashboard_page():
         # ── All Plots view ────────────────────────────────────────
         if led_member_id == 0:
             summary = []
+            total_entries_ap = 0
+            total_dr_ap = 0.0
+            total_cr_ap = 0.0
             for m in members:
                 mid = m["ID"]
                 ledger = data_provider.get_member_ledger(mid)
                 filtered = _filter_entries(ledger, led_type_filter, led_from_dt, led_to_dt)
+                total_entries_ap += len(filtered)
                 td = _s(sum(float(e.get("Debit") or 0) for e in filtered))
                 tc = _s(sum(float(e.get("Credit") or 0) for e in filtered))
+                total_dr_ap += td
+                total_cr_ap += tc
                 outstanding = data_provider.get_current_outstanding(mid)
                 summary.append({
                     "Plot": m.get("Plot_No", "?"), "Name": m.get("Plot_Owner_Name", "?"),
@@ -1984,6 +1823,12 @@ def show_dashboard_page():
                     "Member_ID": mid, "has_entries": bool(filtered),
                 })
             if summary:
+                plots_with_entries = sum(1 for s in summary if s["has_entries"])
+                st.caption(f"📊 {total_entries_ap} entries  |  "
+                           f"Total Credits: ₹{total_cr_ap:,.2f}  |  "
+                           f"Total Debits: ₹{total_dr_ap:,.2f}  |  "
+                           f"Net: ₹{total_cr_ap - total_dr_ap:,.2f}  |  "
+                           f"{plots_with_entries} plots")
                 st.dataframe(
                     [{"Plot": s["Plot"], "Name": s["Name"],
                       "Debits": f"₹{s['Debits']:,.2f}", "Credits": f"₹{s['Credits']:,.2f}",
@@ -1992,37 +1837,6 @@ def show_dashboard_page():
                      for s in summary],
                     use_container_width=True,
                 )
-                for s in summary:
-                    if not s["has_entries"]:
-                        continue
-                    plot_entries = _filter_entries(
-                        data_provider.get_member_ledger(s["Member_ID"]),
-                        led_type_filter, led_from_dt, led_to_dt,
-                    )
-                    inv_list = [pe for pe in plot_entries if str(pe.get("Transaction_Type", "") or "").upper() == "INVOICE"]
-                    col_a1, col_a2, col_a3 = st.columns([3, 3, 3])
-                    with col_a1:
-                        st.text(f"{s['Plot']}  {s['Name']}")
-                    with col_a2:
-                        if inv_list and st.button(f"🔄 Regen {len(inv_list)} invoice(s)", key=f"led_regen_{s['Member_ID']}"):
-                            rc = 0
-                            for pe in list(inv_list):
-                                if regenerate_invoice(data_provider, s["Member_ID"], pe):
-                                    rc += 1
-                            if rc:
-                                st.success(f"✅ Regenerated {rc} invoice(s) for Plot {s['Plot']}")
-                                st.rerun()
-                    with col_a3:
-                        if st.button(f"🗑️ Delete {len(plot_entries)}", key=f"led_del_{s['Member_ID']}"):
-                            dc = 0
-                            for pe in sorted(plot_entries, key=lambda x: _s(x.get("Vch_No") or 0), reverse=True):
-                                vch = pe.get("Vch_No")
-                                if vch and data_provider.delete_ledger_entry(s["Member_ID"], int(vch)):
-                                    _delete_pdf_files(_extract_ref_id(str(pe.get("Description", ""))))
-                                    dc += 1
-                            st.success(f"✅ Deleted {dc} entries for Plot {s['Plot']}")
-                            st.rerun()
-
         # ── Single-member view ────────────────────────────────────
         else:
             led_member = _find_member(led_member_id)
@@ -2032,21 +1846,17 @@ def show_dashboard_page():
                 if led_entries:
                     total_dr = _s(sum(_s(e.get("Debit")) for e in led_entries))
                     total_cr = _s(sum(_s(e.get("Credit")) for e in led_entries))
-                    st.caption(f"Debits: ₹{total_dr:,.2f}  |  Credits: ₹{total_cr:,.2f}  |  Net: ₹{total_cr - total_dr:,.2f}")
+                    st.caption(f"📊 {len(led_entries)} entries  |  Debits: ₹{total_dr:,.2f}  |  Credits: ₹{total_cr:,.2f}  |  Net: ₹{total_cr - total_dr:,.2f}")
 
-                    # ── Batch action toolbar + entries (wrapped in form for silent checkbox toggle) ──
+                    # ── Batch action toolbar + entries ──
                     with st.form(key="led_batch_form"):
-                        bcols = st.columns([0.6, 2.5, 2, 2, 2, 2])
+                        bcols = st.columns([0.7, 2.3, 2])
                         with bcols[0]:
-                            st.checkbox("☑", key="led_sel_all", label_visibility="collapsed",
-                                         on_change=_led_select_all_changed)
-                        with bcols[2]:
-                            del_clicked = st.form_submit_button("🗑️ Delete Selected", type="secondary", use_container_width=True, key="led_batch_del")
-                        with bcols[3]:
-                            regen_clicked = st.form_submit_button("🔄 Regenerate Selected", type="primary", use_container_width=True, key="led_batch_regen")
-                        with bcols[4]:
+                            sel_all = st.form_submit_button("☑ All", use_container_width=True, key="led_sel_all_btn")
+                            sel_none = st.form_submit_button("☐ None", use_container_width=True, key="led_sel_none_btn")
+                        with bcols[1]:
                             move_clicked = st.form_submit_button("➡️ Move Selected", type="secondary", use_container_width=True, key="led_batch_move")
-                        with bcols[5]:
+                        with bcols[2]:
                             split_clicked = st.form_submit_button("✂️ Split Selected", type="secondary", use_container_width=True, key="led_batch_split")
 
                         st.divider()
@@ -2169,32 +1979,15 @@ def show_dashboard_page():
                                                 st.rerun()
 
                         # ── Process batch actions (only one fires per submit) ──
-                        if del_clicked:
-                            sel_idx = [idx for idx, e in enumerate(led_entries) if st.session_state.get(f"led_sel_{idx}", False)]
-                            if sel_idx:
-                                dc = 0
-                                for idx in sorted(sel_idx, key=lambda i: int(led_entries[i].get("Vch_No") or 0), reverse=True):
-                                    e = led_entries[idx]
-                                    vch = e.get("Vch_No")
-                                    if vch and data_provider.delete_ledger_entry(led_member_id, int(vch)):
-                                        _delete_pdf_files(_extract_ref_id(str(e.get("Description", ""))))
-                                        dc += 1
-                                st.success(f"✅ Deleted {dc} entries")
-                                st.rerun()
-                            else:
-                                st.warning("No entries selected")
-                        elif regen_clicked:
-                            sel_idx = [idx for idx, e in enumerate(led_entries) if st.session_state.get(f"led_sel_{idx}", False)]
-                            if sel_idx:
-                                for idx in sel_idx:
-                                    e = led_entries[idx]
-                                    if str(e.get("Transaction_Type", "") or "").upper() == "INVOICE":
-                                        regenerate_invoice(data_provider, led_member_id, e)
-                                st.success(f"✅ Regenerated invoices")
-                                st.rerun()
-                            else:
-                                st.warning("No entries selected")
-                        elif move_clicked:
+                        if sel_all:
+                            for idx in range(len(led_entries)):
+                                st.session_state[f"led_sel_{idx}"] = True
+                            st.rerun()
+                        if sel_none:
+                            for idx in range(len(led_entries)):
+                                st.session_state[f"led_sel_{idx}"] = False
+                            st.rerun()
+                        if move_clicked:
                             sel_idx = [idx for idx, e in enumerate(led_entries) if st.session_state.get(f"led_sel_{idx}", False)]
                             credits = [led_entries[idx] for idx in sel_idx if _s(led_entries[idx].get("Credit")) > 0]
                             if credits:
@@ -2721,37 +2514,119 @@ def show_settings_page():
 
     with tab4:
         st.subheader("Payment Identifiers")
-        identifiers = data_provider.get_all_identifiers()
-        if identifiers:
-            id_search = st.text_input("Search", key="id_search", placeholder="Filter by value...")
-            id_display = []
+        members_list_id = data_provider.get_all_members()
+        member_opts_id = {m["ID"]: f"Plot {m.get('Plot_No','?')} — {m.get('Plot_Owner_Name','?')}" for m in members_list_id}
+
+        # ── Context filter from Ledger preview ──
+        if st.session_state.get("id_filter_member_ids"):
+            st.info(f"📋 {st.session_state.get('id_filter_reason', 'Filtered from Ledger preview')}")
+            if st.button("Clear Filter", key="id_clear_ctx"):
+                st.session_state.id_filter_member_ids = None
+                st.session_state.id_filter_reason = None
+                st.rerun()
+
+        with st.form(key="id_form"):
+            id_search = st.text_input("🔍 Search", key="id_search_in",
+                                       placeholder="Filter by value or type...")
+            show_deleted = st.checkbox("Show deleted identifiers", key="id_show_deleted")
+            st.divider()
+
+            identifiers = data_provider.get_all_identifiers(include_deleted=show_deleted)
+            id_filtered = []
+            ctx_mids = st.session_state.get("id_filter_member_ids")
             for idr in identifiers:
                 val = str(idr.get("Identifier_Value", "") or "")
-                if id_search and id_search.lower() not in val.lower():
+                id_type = str(idr.get("Identifier_Type", "") or "")
+                mid = idr.get("Member_ID")
+                if ctx_mids and mid not in ctx_mids:
                     continue
-                id_display.append({
-                    "Type": idr.get("Identifier_Type", ""),
-                    "Value": val[:50],
-                    "Member": _member_label(idr.get("Member_ID")),
-                    "Date": idr.get("Date", ""),
-                })
-            if id_display:
-                st.dataframe(id_display, use_container_width=True)
-            else:
-                st.info("No matching identifiers.")
-        else:
-            st.info("No identifiers recorded yet.")
+                if id_search and id_search.lower() not in val.lower() and id_search.lower() not in id_type.lower():
+                    continue
+                id_filtered.append(idr)
 
-        if identifiers:
-            del_id_opts = {f"{i}: {str(idr.get('Identifier_Value', '') or '')[:40]}": i
-                          for i, idr in enumerate(identifiers)}
-            del_id_sel = st.selectbox("Delete Identifier", [""] + list(del_id_opts.keys()),
-                                       key="del_id", format_func=lambda x: "Select..." if not x else x)
-            if del_id_sel and st.button("Delete", key="del_id_btn"):
-                idx = del_id_opts[del_id_sel]
-                data_provider.delete_identifier(idx)
-                st.success("Identifier deleted!")
-                st.rerun()
+            if id_filtered:
+                st.caption(f"📊 {len(id_filtered)} identifiers")
+                # Column headers
+                hcols = st.columns([0.4, 2.5, 1.5, 2.5, 1, 1.2, 0.7, 0.7])
+                hcols[0].caption("#")
+                hcols[1].caption("Member")
+                hcols[2].caption("Type")
+                hcols[3].caption("Value")
+                hcols[4].caption("Conf.")
+                hcols[5].caption("Last Seen")
+                hcols[6].caption("Keep")
+                hcols[7].caption("Delete")
+                for idr in id_filtered:
+                    mid = idr.get("Member_ID")
+                    idr_id = idr.get("ID")
+                    val = str(idr.get("Identifier_Value", "") or "")[:50]
+                    id_type = str(idr.get("Identifier_Type", "") or "")
+                    confidence = idr.get("Confidence", 0)
+                    last_seen = str(idr.get("Last_Seen_Date", "") or "")
+                    is_deleted = str(idr.get("Deleted", "No")) == "Yes"
+
+                    cols = st.columns([0.4, 2.5, 1.5, 2.5, 1, 1.2, 0.7, 0.7])
+                    cols[0].caption(f"#{idr_id}")
+                    cols[1].write(member_opts_id.get(mid, f"ID {mid}"))
+                    cols[2].write(id_type)
+                    cols[3].write(val)
+                    cols[4].write(str(confidence))
+                    cols[5].write(last_seen[:10])
+                    if is_deleted:
+                        cols[6].write("")
+                        cols[7].checkbox("↩️ Restore", key=f"id_restore_{idr_id}")
+                    else:
+                        cols[6].checkbox("✅", value=True, key=f"id_keep_{idr_id}")
+                        cols[7].checkbox("🗑️", key=f"id_del_{idr_id}")
+            else:
+                st.caption("No identifiers match the current filters.")
+
+            st.divider()
+            # ── Add Identifier ──
+            st.subheader("➕ Add Identifier")
+            a_col1, a_col2, a_col3 = st.columns(3)
+            with a_col1:
+                add_mid = st.selectbox("Member", options=list(member_opts_id.keys()),
+                                       format_func=lambda x: member_opts_id.get(x, f"ID {x}"),
+                                       key="id_add_mid")
+            with a_col2:
+                add_type = st.selectbox("Type", ["PAYEE_NAME", "UPI_ID", "MOBILE", "EMAIL", "OTHER"],
+                                        key="id_add_type")
+            with a_col3:
+                add_val = st.text_input("Value", key="id_add_val", placeholder="Identifier value to add")
+
+            submitted = st.form_submit_button("💾 Save Changes", type="primary", use_container_width=True)
+            if submitted:
+                del_count = 0
+                restore_count = 0
+                add_count = 0
+                for idr in identifiers:
+                    idr_id = idr.get("ID")
+                    is_deleted = str(idr.get("Deleted", "No")) == "Yes"
+                    if is_deleted:
+                        if st.session_state.get(f"id_restore_{idr_id}"):
+                            if data_provider.undelete_identifier(idr_id):
+                                restore_count += 1
+                    else:
+                        if st.session_state.get(f"id_del_{idr_id}"):
+                            if data_provider.delete_identifier(idr_id):
+                                del_count += 1
+                if add_val and add_val.strip():
+                    data_provider.add_identifier(add_mid, add_type, add_val.strip())
+                    add_count += 1
+                total = del_count + restore_count + add_count
+                if total:
+                    parts = []
+                    if del_count:
+                        parts.append(f"Deleted {del_count}")
+                    if restore_count:
+                        parts.append(f"Restored {restore_count}")
+                    if add_count:
+                        parts.append(f"Added {add_count}")
+                    st.success(f"✅ {', '.join(parts)}.")
+                    st.rerun()
+                else:
+                    st.info("No changes to save.")
 
     with tab5:
         st.subheader("Split Rules")
@@ -2795,26 +2670,66 @@ def show_settings_page():
             st.info("Processing April 1st entries for all members...")
             st.success("April 1st entries created successfully!")
 
+        st.divider()
+        if st.button("🔄 Full Reset & Rebuild from Bank Statements", type="primary", use_container_width=True):
+            import shutil
+            from datetime import datetime
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            shutil.copy2(config.SOCIETY_DATA_FILE, config.BACKUPS_DIR / f"society_data_{ts}_full_reset.xlsx")
+            with st.spinner("Resetting and rebuilding all financial data from bank statement PDFs..."):
+                result = _run_tool("reset_and_rebuild_all", json.dumps({}))
+                data_provider.refresh_reports_sheet()
+                st.markdown(result)
+            st.rerun()
+
         with st.expander("💾 Data Backups & Restore", expanded=False):
+            backup_comment = st.text_input("Comment (optional)", key="backup_comment",
+                                            placeholder="e.g. before rate update, after cleanup")
+            if st.button("📀 Take Backup Now", type="primary", use_container_width=True, key="backup_now"):
+                import shutil
+                from datetime import datetime
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                comment = (backup_comment or "").strip()
+                suffix = "_manual"
+                if comment:
+                    safe = "".join(c if c.isalnum() or c in " -_" else "_" for c in comment)[:50].strip().replace(" ", "_")
+                    suffix += f"--{safe}" if safe else ""
+                fname = f"society_data_{ts}{suffix}.xlsx"
+                shutil.copy2(config.SOCIETY_DATA_FILE, config.BACKUPS_DIR / fname)
+                data_provider._invalidate_cache()
+                st.success(f"Backup created: {fname}")
+                st.rerun()
             st.markdown("Auto-backups are created before each bank statement processing run.")
             backup_files = sorted(config.BACKUPS_DIR.glob("*.xlsx"), key=lambda p: p.stat().st_mtime, reverse=True)
             if not backup_files:
                 st.info("No backups found.")
             else:
                 import datetime as _dt
-                for bf in backup_files[:10]:
+                for bf in backup_files:
                     mtime = _dt.datetime.fromtimestamp(bf.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
                     size_kb = bf.stat().st_size / 1024
-                    col1, col2, col3 = st.columns([3, 1, 1])
+                    comment_part = ""
+                    name = bf.name
+                    if "--" in name:
+                        comment_part = name.split("--", 1)[1].replace(".xlsx", "").replace("_", " ")
+                    col1, col2, col3, col4 = st.columns([2.5, 0.7, 0.7, 0.7])
                     with col1:
-                        st.write(f"`{bf.name}` ({mtime})")
+                        display = f"`{name}` ({mtime})"
+                        if comment_part:
+                            display += f" — *{comment_part}*"
+                        st.write(display)
                     with col2:
                         st.write(f"{size_kb:.0f} KB")
                     with col3:
                         if st.button("Restore", key=f"restore_{bf.name}"):
+                            import shutil
                             shutil.copy2(bf, config.SOCIETY_DATA_FILE)
                             data_provider._invalidate_cache()
                             st.success(f"Restored from {bf.name}")
+                            st.rerun()
+                    with col4:
+                        if st.button("🗑️", key=f"del_bak_{bf.name}", help="Delete this backup"):
+                            bf.unlink()
                             st.rerun()
 
     with tab7:

@@ -493,3 +493,54 @@ def test_clean_entries_does_not_split_interest_continuation():
     assert "3,056.00 4,07,842.72 Cr" in result[0]
     # Entry 2: Dr. Tran
     assert result[1].startswith("07-04-2026 Dr. Tran")
+
+
+def test_parse_entry_amounts_ignores_preamble_ckyc_amounts():
+    """Preamble text containing CKYC number amounts (52,001.00 52,001.00Cr)
+    appended to the first entry must NOT pollute the amount parse.
+    The real entry has 2,000.00 and 54,001.00Cr."""
+    text = (
+        "04-04-2022 UPIAB/209461454021/CR/Mr RAMES/CBIN/rameshdhebe070 "
+        "2,000.00 54,001.00Cr UNION BANK OF INDIA MUTHA AT AND POST MUTHA, "
+        "TALUKA MULSHI, DIST PUNE PHONE: 020-22964002 TO: DATE: 18-03-2024 "
+        "GAT N 241,274/287/288/289 .,MAUJE JATEDE PUNE-412115 MAHARASHTRA,INDIA "
+        "CUST ID : 900703111 CKYC No : 52,001.00 52,001.00Cr"
+    )
+    result = _parse_entry_amounts(text, "netbanking", None)
+    assert result is not None
+    assert result["withdrawal"] is None, f"Expected None withdrawal, got {result['withdrawal']}"
+    assert result["deposit"] == 2000.0, f"Expected 2000.0 deposit, got {result['deposit']}"
+    assert result["balance"] == 54001.0, f"Expected 54001.0 balance, got {result['balance']}"
+    assert result["entry_type"] == "credit"
+
+
+def test_parse_entry_amounts_preamble_with_prev_balance():
+    """When the polluted first entry has a valid prev_balance, the
+    preamble amounts at the end (187145.10 187145.10Cr) must be ignored.
+    Real amounts: 6,000.00 1,93,145.10Cr. With prev_balance=187145.10:
+    deposit=6000 → balance=193145.10 matches statement."""
+    text = (
+        "03-04-2023 UPIAB/309396270560/CR/SHRIKANT/CNRB/sbhate@ybl/Pay "
+        "6,000.00 1,93,145.10Cr UNION BANK OF INDIA MUTHA AT AND POST MUTHA, "
+        "TALUKA MULSHI, DIST PUNE PHONE: 020-22964002 TO: DATE: 29-06-2024 "
+        "GAT N 241,274/287/288/289 .,MAUJE JATEDE PUNE-412115 MAHARASHTRA,INDIA "
+        "CUST ID : 900703111 CKYC No : 1,87,145.10 1,87,145.10Cr"
+    )
+    prev = 187145.10
+    result = _parse_entry_amounts(text, "printed_printout", prev)
+    assert result is not None
+    assert result["withdrawal"] is None, f"Expected None withdrawal, got {result['withdrawal']}"
+    assert result["deposit"] == 6000.0, f"Expected 6000.0 deposit, got {result['deposit']}"
+    assert result["balance"] == 193145.10, f"Expected 193145.10 balance, got {result['balance']}"
+    assert result["entry_type"] == "credit"
+
+
+def test_parse_entry_amounts_clean_entry_no_preamble():
+    """Entries without preamble should still parse correctly (no regression)."""
+    text = "06-04-2023 SOME NEFT DEPOSIT 5,000.00 50,000.00Cr"
+    prev = 45000.0
+    result = _parse_entry_amounts(text, "netbanking", prev)
+    assert result is not None
+    assert result["withdrawal"] is None
+    assert result["deposit"] == 5000.0
+    assert result["balance"] == 50000.0

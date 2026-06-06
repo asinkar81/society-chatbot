@@ -30,14 +30,14 @@ class LocalExcelDataProvider(DataProvider):
     ]
 
     PAYMENT_REF_HEADERS = [
-        "Member_ID", "Identifier_Type", "Identifier_Value",
+        "ID", "Member_ID", "Identifier_Type", "Identifier_Value",
         "Last_Seen_Date", "Confidence", "Transaction_Type",
+        "Deleted", "Deleted_At",
     ]
 
     SUSPENSE_HEADERS = [
         "ID", "Date", "Particulars", "Amount", "Transaction_ID",
-        "Transaction_Type", "Description", "Entry_Date", "Status",
-        "Tagged_To", "Tagged_Date",
+        "Transaction_Type", "Description", "Entry_Date",
     ]
 
     EXPENSES_HEADERS = [
@@ -312,7 +312,7 @@ class LocalExcelDataProvider(DataProvider):
             ws_settings = wb.create_sheet(self.settings_sheet)
             ws_settings.append(["Key", "Value"])
             for row in [
-                ["Current_FY", "2026-27"],
+                ["Current_FY", "26-27"],
                 ["Repair_Fund_Rate", "100.00"],
                 ["Service_Charges_Rate", "885.00"],
                 ["Sinking_Fund_Rate", "15.00"],
@@ -610,13 +610,17 @@ class LocalExcelDataProvider(DataProvider):
             if transaction_type:
                 df.loc[existing.index[0], "Transaction_Type"] = transaction_type
         else:
+            next_id = int(df["ID"].max()) + 1 if not df.empty and "ID" in df.columns else 1
             new_row = pd.DataFrame([{
+                "ID": next_id,
                 "Member_ID": member_id,
                 "Identifier_Type": identifier_type,
                 "Identifier_Value": val,
                 "Last_Seen_Date": date or datetime.now().strftime("%d-%m-%Y"),
                 "Confidence": 1,
                 "Transaction_Type": transaction_type or "",
+                "Deleted": "No",
+                "Deleted_At": "",
             }])
             df = pd.concat([df, new_row], ignore_index=True)
 
@@ -628,12 +632,24 @@ class LocalExcelDataProvider(DataProvider):
         except Exception:
             return
         changed = False
+        if "ID" not in df.columns:
+            df.insert(0, "ID", range(1, len(df) + 1))
+            changed = True
+        else:
+            df["ID"] = df["ID"].astype(int)
         if "Transaction_Type" not in df.columns:
             df["Transaction_Type"] = ""
             changed = True
-        if not changed:
-            return
-        self._write_sheet(df, self.payment_refs_sheet)
+        if "Deleted" not in df.columns:
+            df["Deleted"] = "No"
+            changed = True
+        if "Deleted_At" not in df.columns:
+            df["Deleted_At"] = ""
+            changed = True
+        if changed:
+            df["Deleted"] = df["Deleted"].astype(str)
+            df["Deleted_At"] = df["Deleted_At"].astype(str)
+            self._write_sheet(df, self.payment_refs_sheet)
 
     def _clean_payment_refs(self):
         import re
@@ -648,10 +664,21 @@ class LocalExcelDataProvider(DataProvider):
         removed = {"MOBILE": 0, "PAYEE_NAME": 0, "UPI_ID": 0}
         mask = pd.Series(True, index=df.index)
 
-        STOP_WORDS = {"MR", "MRS", "MS", "SHRI", "SMT", "DR", "SRI", "M/S", "CMN",
-                      "PAY", "AND", "THE", "FROM", "B", "PAYMENT", "RECEIVED",
-                      "TRANSFER", "NEFT", "RTGS", "IMPS", "CHQ", "CHEQUE",
-                      "BANK", "REFERENCE", "CREDIT", "DEBIT", "BY", "TO"}
+        ID_STOP_WORDS = {
+            "MR", "MRS", "MS", "SHRI", "SMT", "DR", "SRI", "M/S", "CMN",
+            "PAY", "AND", "THE", "FROM", "B", "PAYMENT", "RECEIVED",
+            "TRANSFER", "NEFT", "RTGS", "IMPS", "CHQ", "CHEQUE",
+            "BANK", "REFERENCE", "CREDIT", "DEBIT", "BY", "TO",
+            "NUMBER", "SENDER", "TRANSACTION", "BALANCE", "AMOUNT",
+            "PARTICULARS", "REMARKS", "DETAILS", "NAME", "DATE",
+            "STATUS", "TYPE", "VALUE", "TOTAL", "CHARGES", "FEE", "FEES",
+            "TAX", "GST", "ACCOUNT", "ACCT", "CODE", "INFO",
+            "DESCRIPTION", "PERIOD", "SUMMARY", "DETAIL", "RECORD",
+            "ENTRY", "ITEMS", "CLOSING", "OPENING", "AVAILABLE",
+            "LEDGER", "REF", "UTR", "RRN", "IFSC", "BRANCH", "CARD",
+            "MOBILE", "EMAIL", "PHONE", "ORDER", "INVOICE", "BILL",
+            "VIA", "THROUGH", "PAID", "DUE", "NET", "GROSS",
+        }
 
         for idx, row in df.iterrows():
             id_type = str(row.get("Identifier_Type", "") or "")
@@ -666,8 +693,10 @@ class LocalExcelDataProvider(DataProvider):
                 is_amount = bool(re.match(r'^[\d,]+\.\d{2}$', val))
                 is_ref_code = 5 <= len(val) <= 15 and bool(re.match(r'^[A-Z][A-Za-z0-9]*\d{4,}$', val))
                 is_short_upper = val.isalpha() and val.isupper() and len(val) <= 4
-                is_stop = val.upper() in STOP_WORDS
-                if is_amount or is_ref_code or is_short_upper or is_stop:
+                is_stop = val.upper() in ID_STOP_WORDS
+                is_numeric = bool(re.match(r'^\d+$', val))
+                is_code = bool(re.match(r'^[A-Z0-9]{4,}$', val)) and not bool(re.search(r'[AEIOU]', val))
+                if is_amount or is_ref_code or is_short_upper or is_stop or is_numeric or is_code:
                     mask.at[idx] = False
                     removed["PAYEE_NAME"] += 1
 
@@ -709,13 +738,15 @@ class LocalExcelDataProvider(DataProvider):
         member_refs = df[(df["Member_ID"] == member_id) & (df["Confidence"] >= min_confidence)]
         return member_refs.to_dict("records")
 
-    def get_all_identifiers(self, id_type: Optional[str] = None) -> List[Dict[str, Any]]:
+    def get_all_identifiers(self, id_type: Optional[str] = None, include_deleted: bool = False) -> List[Dict[str, Any]]:
         try:
             df = pd.read_excel(self.excel_file, sheet_name=self.payment_refs_sheet)
         except Exception:
             return []
         if df.empty:
             return []
+        if not include_deleted and "Deleted" in df.columns:
+            df = df[df["Deleted"] != "Yes"]
         if id_type:
             df = df[df["Identifier_Type"] == id_type]
         return df.to_dict("records")
@@ -725,12 +756,33 @@ class LocalExcelDataProvider(DataProvider):
             df = pd.read_excel(self.excel_file, sheet_name=self.payment_refs_sheet)
         except Exception:
             return False
-        if df.empty:
+        if df.empty or "ID" not in df.columns:
             return False
-        before = len(df)
-        df = df.drop(index=ref_id).reset_index(drop=True) if ref_id < len(df) else df
-        if len(df) == before:
+        from datetime import datetime
+        df["Deleted"] = df["Deleted"].astype(str)
+        df["Deleted_At"] = df["Deleted_At"].astype(str)
+        match = df[df["ID"] == ref_id]
+        if match.empty:
             return False
+        df.loc[match.index[0], "Deleted"] = "Yes"
+        df.loc[match.index[0], "Deleted_At"] = datetime.now().strftime("%d-%m-%Y %H:%M")
+        self._write_sheet(df, self.payment_refs_sheet)
+        return True
+
+    def undelete_identifier(self, ref_id: int) -> bool:
+        try:
+            df = pd.read_excel(self.excel_file, sheet_name=self.payment_refs_sheet)
+        except Exception:
+            return False
+        if df.empty or "ID" not in df.columns:
+            return False
+        df["Deleted"] = df["Deleted"].astype(str)
+        df["Deleted_At"] = df["Deleted_At"].astype(str)
+        match = df[df["ID"] == ref_id]
+        if match.empty:
+            return False
+        df.loc[match.index[0], "Deleted"] = "No"
+        df.loc[match.index[0], "Deleted_At"] = ""
         self._write_sheet(df, self.payment_refs_sheet)
         return True
 
@@ -750,9 +802,6 @@ class LocalExcelDataProvider(DataProvider):
         new_id = int(df["ID"].max()) + 1 if not df.empty and "ID" in df.columns else 1
         entry["ID"] = new_id
         entry["Entry_Date"] = entry.get("Entry_Date", datetime.now().strftime("%d-%m-%Y %H:%M"))
-        entry["Status"] = entry.get("Status", "Pending")
-        entry["Tagged_To"] = entry.get("Tagged_To", None)
-        entry["Tagged_Date"] = entry.get("Tagged_Date", None)
         row = pd.DataFrame([{h: entry.get(h) for h in self.SUSPENSE_HEADERS}])
         if df.empty:
             df = row
@@ -761,7 +810,7 @@ class LocalExcelDataProvider(DataProvider):
         self._write_sheet(df, self.suspense_sheet)
         return new_id
 
-    def get_suspense_entries(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
+    def get_suspense_entries(self) -> List[Dict[str, Any]]:
         self._ensure_suspense_sheet_exists()
         try:
             df = pd.read_excel(self.excel_file, sheet_name=self.suspense_sheet)
@@ -769,28 +818,7 @@ class LocalExcelDataProvider(DataProvider):
             return []
         if df.empty:
             return []
-        if status:
-            df = df[df["Status"] == status]
         return df.to_dict("records")
-
-    def tag_suspense_entry(self, entry_id: int, member_id: int) -> bool:
-        try:
-            df = pd.read_excel(self.excel_file, sheet_name=self.suspense_sheet)
-        except Exception:
-            return False
-        if df.empty or "ID" not in df.columns:
-            return False
-        idx = df[df["ID"] == entry_id].index
-        if idx.empty:
-            return False
-        for col in ["Status", "Tagged_To", "Tagged_Date"]:
-            if col in df.columns and df[col].dtype.kind in ("i", "f"):
-                df[col] = df[col].astype(object)
-        df.loc[idx, "Status"] = "Tagged"
-        df.loc[idx, "Tagged_To"] = member_id
-        df.loc[idx, "Tagged_Date"] = datetime.now().strftime("%d-%m-%Y %H:%M")
-        self._write_sheet(df, self.suspense_sheet)
-        return True
 
     def delete_suspense_entry(self, entry_id: int) -> bool:
         try:
@@ -1187,6 +1215,8 @@ class LocalExcelDataProvider(DataProvider):
                 "opening_balance": opening_bal,
                 "closing_balance": closing_bal,
                 "entries": len(fy_df),
+                "total_deposits": float(fy_df["Deposit"].fillna(0).sum()),
+                "total_withdrawals": float(fy_df["Withdrawal"].fillna(0).sum()),
                 "files": sorted(fy_df["Source_File"].dropna().unique().tolist()),
             })
 
@@ -1223,6 +1253,8 @@ class LocalExcelDataProvider(DataProvider):
                 "closing_date": fg["closing_date"],
                 "opening_balance": fg["opening_balance"],
                 "closing_balance": fg["closing_balance"],
+                "total_deposits": fg.get("total_deposits", 0),
+                "total_withdrawals": fg.get("total_withdrawals", 0),
                 "entries": fg["entries"],
                 "files": fg["files"],
                 "rollover_from_prev": rollover,
@@ -1238,6 +1270,57 @@ class LocalExcelDataProvider(DataProvider):
         if count:
             self._write_sheet(df.iloc[:0], self.accounts_sheet)
         return count
+
+    def clear_all_auto_data(self) -> dict:
+        """Clear all auto-generated sheets for full reset.
+        Preserves: Members, Settings, Expense_Categories, Split_Rules, Payment_References.
+        Returns dict of {sheet_name: count_deleted}."""
+        cleared = {}
+        try:
+            df = pd.read_excel(self.excel_file, sheet_name=self.accounts_sheet)
+            cleared["Accounts"] = len(df)
+            self._write_sheet(df.iloc[:0], self.accounts_sheet)
+        except Exception:
+            cleared["Accounts"] = 0
+
+        try:
+            df = pd.read_excel(self.excel_file, sheet_name=self.ledger_sheet)
+            cleared["Ledger"] = len(df)
+            self._write_sheet(df.iloc[:0], self.ledger_sheet)
+        except Exception:
+            cleared["Ledger"] = 0
+
+        try:
+            df = pd.read_excel(self.excel_file, sheet_name=self.expenses_sheet)
+            cleared["Expenses"] = len(df)
+            self._write_sheet(df.iloc[:0], self.expenses_sheet)
+        except Exception:
+            cleared["Expenses"] = 0
+
+        try:
+            df = pd.read_excel(self.excel_file, sheet_name=self.interest_income_sheet)
+            cleared["Interest_Income"] = len(df)
+            self._write_sheet(df.iloc[:0], self.interest_income_sheet)
+        except Exception:
+            cleared["Interest_Income"] = 0
+
+        try:
+            df = pd.read_excel(self.excel_file, sheet_name=self.suspense_sheet)
+            cleared["Suspense_Entries"] = len(df)
+            self._write_sheet(df.iloc[:0], self.suspense_sheet)
+        except Exception:
+            cleared["Suspense_Entries"] = 0
+
+        for sname in ["Reports", "Processed_Statements"]:
+            try:
+                df = pd.read_excel(self.excel_file, sheet_name=sname)
+                cleared[sname] = len(df)
+                self._write_sheet(df.iloc[:0], sname)
+            except Exception:
+                cleared[sname] = 0
+
+        self._invalidate_cache()
+        return cleared
 
     def migrate_accounts_from_ledger(self) -> int:
         if not self.accounts_sheet:

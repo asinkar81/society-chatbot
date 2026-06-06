@@ -185,6 +185,8 @@ class BaseAgent(ABC):
             tools=self.tools,
             verbose=True,
             handle_parsing_errors=True,
+            max_iterations=30,
+            max_execution_time=120,
         )
 
     def run(self, input_text: str) -> str:

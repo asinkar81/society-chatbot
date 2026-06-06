@@ -104,13 +104,8 @@ class DataProvider(ABC):
         pass
 
     @abstractmethod
-    def get_suspense_entries(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Fetch all suspense entries, optionally filtered by status (Pending/Tagged)."""
-        pass
-
-    @abstractmethod
-    def tag_suspense_entry(self, entry_id: int, member_id: int) -> bool:
-        """Tag a suspense entry to a member. Sets status to Tagged + records date."""
+    def get_suspense_entries(self) -> List[Dict[str, Any]]:
+        """Fetch all suspense entries."""
         pass
 
     @abstractmethod

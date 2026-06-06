@@ -61,6 +61,7 @@ class InvoiceAgent(BaseAgent):
             outstanding = self.data_provider.get_current_outstanding(member_id)
 
             total = repair_amount + service_amount + sinking_amount + pending_interest
+            total_amount_due = total - outstanding
 
             return {
                 "member_id": member_id,
@@ -70,6 +71,7 @@ class InvoiceAgent(BaseAgent):
                 "sinking_amount": sinking_amount,
                 "interest_amount": pending_interest,
                 "total_amount": total,
+                "total_amount_due": total_amount_due,
                 "outstanding": outstanding,
             }
 
@@ -104,7 +106,8 @@ class InvoiceAgent(BaseAgent):
                     "Interest Penalty Charges": calc["interest_amount"],
                 },
                 "total_amount": calc["total_amount"],
-                "amount_in_words": number_to_words_inr(calc["total_amount"]),
+                "total_amount_due": calc["total_amount_due"],
+                "amount_in_words": number_to_words_inr(calc["total_amount_due"]),
             }
 
             # Generate PDF

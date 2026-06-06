@@ -197,7 +197,18 @@ def _extract_search_tokens(particulars: str, txn_type: str, txn_id: str = None) 
                    "PAY", "AND", "THE", "FROM", "B"}
     STOP_WORDS = TITLE_WORDS | {"PAYMENT", "RECEIVED", "TRANSFER", "NEFT", "RTGS",
                                 "IMPS", "CHQ", "CHEQUE", "BANK", "REFERENCE",
-                                "CREDIT", "DEBIT", "BY", "TO", "VIA", "THROUGH"}
+                                "CREDIT", "DEBIT", "BY", "TO", "VIA", "THROUGH",
+                                "NUMBER", "SENDER", "TRANSACTION", "BALANCE", "AMOUNT",
+                                "PARTICULARS", "REMARKS", "DETAILS", "NAME", "DATE",
+                                "STATUS", "TYPE", "VALUE", "TOTAL", "CHARGES", "FEE", "FEES",
+                                "TAX", "GST", "ACCOUNT", "ACCT", "CODE", "INFO",
+                                "DESCRIPTION", "PERIOD", "SUMMARY", "DETAIL", "RECORD",
+                                "ENTRY", "ITEMS", "CLOSING", "OPENING", "AVAILABLE",
+                                "LEDGER", "REF", "UTR", "RRN", "IFSC", "BRANCH", "CARD",
+                                 "MOBILE", "EMAIL", "PHONE", "ORDER", "INVOICE", "BILL",
+                                 "PAID", "DUE", "NET", "GROSS",
+                                 "BAL", "TXN",
+                                 }
 
     def should_record_name(token: str) -> bool:
         t = token.upper()
@@ -205,9 +216,13 @@ def _extract_search_tokens(particulars: str, txn_type: str, txn_id: str = None) 
             return False
         if t in STOP_WORDS:
             return False
-        if t.isalpha() and t.isupper() and len(t) <= 4:
+        if re.search(r'\d+[.,]\d{2}', t):
             return False
         if bool(re.match(r'^[\d,]+\.\d{2}$', t)):
+            return False
+        if re.match(r'^\d+$', t):
+            return False
+        if re.match(r'^[A-Z0-9]{4,}$', t) and not re.search(r'[AEIOU]', t):
             return False
         return True
 
@@ -266,6 +281,17 @@ def _extract_search_tokens(particulars: str, txn_type: str, txn_id: str = None) 
                 tokens.add(token)
                 identifiers.append((token, "UPI_ID"))
 
+    # IMPS: extract name between "/" and "IMPS" (e.g. "KMB / AJAY IMPSAB/...")
+    imps_match = re.search(r'/\s*([A-Za-z]+)\s+IMPS', particulars)
+    if imps_match:
+        name_raw = imps_match.group(1).strip()
+        for t in re.split(r'[\s.]+', name_raw):
+            if len(t) > 1:
+                token = t.upper()
+                tokens.add(token)
+                if should_record_name(token):
+                    identifiers.append((token, "PAYEE_NAME"))
+
     for phone in re.findall(r'([6-9]\d{9})', particulars):
         if txn_id and phone in txn_id:
             continue
@@ -279,6 +305,17 @@ def _parse_entry_amounts(particulars: str, fmt: str, prev_balance: Optional[floa
     amounts = list(re.finditer(r'([\d,]+\.\d{2})\s*(Cr|Dr)?', particulars, re.IGNORECASE))
     if not amounts:
         return None
+    # Group amounts by proximity to isolate real entry amounts from preamble
+    groups = []
+    cur = [amounts[0]]
+    for i in range(1, len(amounts)):
+        if amounts[i].start() - amounts[i - 1].end() > 30:
+            groups.append(cur)
+            cur = [amounts[i]]
+        else:
+            cur.append(amounts[i])
+    groups.append(cur)
+    amounts = groups[0]
     n = len(amounts)
     balance = float(amounts[-1].group(1).replace(",", ""))
     if n == 1:

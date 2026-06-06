@@ -141,12 +141,28 @@ def create_simple_invoice_pdf(pdf_path: Path, invoice_data: Dict[str, Any]) -> b
         # Line items table
         data = [["Description", "Amount (₹)"]]
         line_items = invoice_data.get("line_items", {})
-        total = 0
+        charges_total = 0
         for desc, amount in line_items.items():
             data.append([desc, f"{amount:,.2f}"])
-            total += amount
+            charges_total += amount
 
-        data.append(["TOTAL", f"{total:,.2f}"])
+        data.append(["TOTAL", f"{charges_total:,.2f}"])
+
+        prev_out = invoice_data.get("previous_outstanding", None)
+        if prev_out is not None:
+            if prev_out >= 0:
+                data.append(["Add: Previous Outstanding", f"{prev_out:,.2f}"])
+            else:
+                data.append(["Less: Credit Balance B/F", f"{prev_out:,.2f}"])
+        else:
+            data.append(["Previous Outstanding", "0.00"])
+
+        int_penalty = invoice_data.get("interest_penalty", 0) or 0
+        if int_penalty > 0:
+            data.append(["Interest Penalty Charges", f"{int_penalty:,.2f}"])
+
+        total_due = invoice_data.get("total_amount_due", charges_total)
+        data.append(["TOTAL AMOUNT DUE", f"{total_due:,.2f}"])
 
         table = Table(data, colWidths=[4.5 * inch, 1.5 * inch])
         table.setStyle(
@@ -169,13 +185,10 @@ def create_simple_invoice_pdf(pdf_path: Path, invoice_data: Dict[str, Any]) -> b
         elements.append(Spacer(1, 0.2 * inch))
 
         # Amount in words
-        amount_words = invoice_data.get("amount_in_words", f"₹{total:,.2f}")
+        total_due = invoice_data.get("total_amount_due", 0)
+        amount_words = invoice_data.get("amount_in_words", f"₹{total_due:,.2f}")
         elements.append(Paragraph(f"Amount: {amount_words}", normal_style))
         elements.append(Spacer(1, 0.15 * inch))
-
-        # Payment summary
-        outstanding = invoice_data.get("outstanding_balance", total)
-        elements.append(Paragraph(f"Outstanding Balance: ₹ {outstanding:,.2f}", normal_style))
 
         # Payment History table
         payment_history = invoice_data.get("payment_history", [])

@@ -27,8 +27,12 @@ from utils.converters import get_fy_from_date, get_fy_string
 def _fy_date_range(fy: str) -> tuple:
     try:
         parts = fy.split("-")
-        start_yr = int(parts[0]) + 2000
-        end_yr = int(parts[1]) + 2000
+        if len(parts) != 2:
+            return ("", "")
+        start_yr = int(parts[0])
+        if start_yr < 100:
+            start_yr += 2000
+        end_yr = start_yr + 1
         return (f"01-04-{start_yr}", f"31-03-{end_yr}")
     except Exception:
         return ("", "")
@@ -168,8 +172,8 @@ class TestSuspenseEntries(unittest.TestCase):
         self.assertEqual(entries, [])
         print("  ✓ get_suspense_entries returns empty list when none exist")
 
-    def test_get_suspense_entries_pending(self):
-        """Test getting pending suspense entries"""
+    def test_get_suspense_entries(self):
+        """Test getting suspense entries"""
         self.provider.add_suspense_entry({
             "Date": "15-06-2026",
             "Particulars": "Test payment",
@@ -178,33 +182,9 @@ class TestSuspenseEntries(unittest.TestCase):
             "Transaction_Type": "NEFT",
             "Description": "From bank statement",
         })
-        entries = self.provider.get_suspense_entries(status="Pending")
+        entries = self.provider.get_suspense_entries()
         self.assertEqual(len(entries), 1)
-        self.assertEqual(entries[0]["Status"], "Pending")
-        print("  ✓ get_suspense_entries returns pending entries")
-
-    def test_tag_suspense_entry(self):
-        """Test tagging a suspense entry to a member"""
-        eid = self.provider.add_suspense_entry({
-            "Date": "15-06-2026",
-            "Particulars": "Test payment",
-            "Amount": 5000.00,
-            "Transaction_ID": "TXN001",
-            "Transaction_Type": "NEFT",
-            "Description": "From bank statement",
-        })
-        success = self.provider.tag_suspense_entry(eid, self.member_id)
-        self.assertTrue(success)
-        entries = self.provider.get_suspense_entries(status="Tagged")
-        self.assertEqual(len(entries), 1)
-        self.assertEqual(entries[0]["Tagged_To"], self.member_id)
-        print("  ✓ tag_suspense_entry sets status to Tagged")
-
-    def test_tag_suspense_entry_invalid_id(self):
-        """Test tagging non-existent entry returns False"""
-        success = self.provider.tag_suspense_entry(99999, self.member_id)
-        self.assertFalse(success)
-        print("  ✓ tag_suspense_entry with invalid ID returns False")
+        print("  ✓ get_suspense_entries returns entries")
 
     def test_delete_suspense_entry(self):
         """Test deleting a suspense entry"""
@@ -226,7 +206,7 @@ class TestSuspenseEntries(unittest.TestCase):
         print("  ✓ delete_suspense_entry with invalid ID returns False")
 
     def test_suspense_roundtrip(self):
-        """Full roundtrip: add → list pending → tag → list tagged → delete all"""
+        """Full roundtrip: add → list → delete all"""
         ids = []
         for i in range(3):
             eid = self.provider.add_suspense_entry({
@@ -235,16 +215,12 @@ class TestSuspenseEntries(unittest.TestCase):
                 "Amount": (i + 1) * 1000.0,
             })
             ids.append(eid)
-        self.assertEqual(len(self.provider.get_suspense_entries(status="Pending")), 3)
-        # Tag one
-        self.provider.tag_suspense_entry(ids[0], self.member_id)
-        self.assertEqual(len(self.provider.get_suspense_entries(status="Pending")), 2)
-        self.assertEqual(len(self.provider.get_suspense_entries(status="Tagged")), 1)
+        self.assertEqual(len(self.provider.get_suspense_entries()), 3)
         # Delete all
         for eid in ids:
             self.provider.delete_suspense_entry(eid)
         self.assertEqual(len(self.provider.get_suspense_entries()), 0)
-        print("  ✓ Suspense roundtrip (add→tag→delete) succeeded")
+        print("  ✓ Suspense roundtrip (add→delete) succeeded")
 
 
 class TestLedgerDelete(unittest.TestCase):
@@ -520,6 +496,67 @@ class TestHelperFunctions(unittest.TestCase):
         self.assertEqual(len(result), 2)
         print("  ✓ _filter_entries with no date range returns all")
 
+    def test_sortable_date_conversion(self):
+        """_sortable converts DD-MM-YYYY to YYYY-MM-DD for correct string comparison"""
+        def _sortable(dd):
+            try:
+                p = dd.split("-")
+                return f"{p[2]}-{p[1]}-{p[0]}"
+            except Exception:
+                return dd
+        # Jan 2027 should sort AFTER Apr 2026 when converted
+        jan = _sortable("01-01-2027")   # "2027-01-01"
+        apr = _sortable("01-04-2026")   # "2026-04-01"
+        self.assertTrue(jan > apr,
+                        f"Expected Jan 2027 > Apr 2026, got {jan} <= {apr}")
+        # Mar 2027 should sort BEFORE Apr 2026 (within same FY, both in range)
+        mar = _sortable("31-03-2027")   # "2027-03-31"
+        self.assertTrue(mar > apr,
+                        f"Expected Mar 2027 > Apr 2026, got {mar} <= {apr}")
+        self.assertTrue(mar > jan,
+                        f"Expected Mar 2027 > Jan 2027, got {mar} <= {jan}")
+        print("  ✓ _sortable converts DD-MM-YYYY to sortable YYYY-MM-DD")
+
+    def test_fy_filter_with_cross_year_dates(self):
+        """FY filtering using _sortable includes Jan-Mar dates in correct FY"""
+        def _sortable(dd):
+            try:
+                p = dd.split("-")
+                return f"{p[2]}-{p[1]}-{p[0]}"
+            except Exception:
+                return dd
+        from_date = "01-04-2026"  # FY 26-27 start
+        to_date = "31-03-2027"    # FY 26-27 end
+        sk = _sortable(from_date) if from_date else ""  # "2026-04-01"
+        ek = _sortable(to_date) if to_date else ""      # "2027-03-31"
+        entries = [
+            {"Date": "01-01-2027"},  # Jan 2027 — should be in FY 26-27
+            {"Date": "15-06-2026"},  # Jun 2026 — should be in FY 26-27
+            {"Date": "01-04-2026"},  # Apr 2026 — boundary, should be in
+            {"Date": "31-03-2027"},  # Mar 2027 — boundary, should be in
+            {"Date": "01-04-2025"},  # Apr 2025 — should NOT be in FY 26-27
+            {"Date": "01-08-2027"},  # Aug 2027 — should NOT be in FY 26-27
+        ]
+        filtered = [e for e in entries
+                    if sk <= _sortable(str(e.get("Date", "") or "")) <= ek]
+        self.assertEqual(len(filtered), 4,
+                         f"Expected 4 entries in FY 26-27, got {len(filtered)}: "
+                         f"{[e['Date'] for e in filtered]}")
+        filtered_dates = [e["Date"] for e in filtered]
+        self.assertIn("01-01-2027", filtered_dates,
+                      "Jan 2027 should be in FY 26-27")
+        self.assertIn("15-06-2026", filtered_dates,
+                      "Jun 2026 should be in FY 26-27")
+        self.assertIn("01-04-2026", filtered_dates,
+                      "Apr 2026 boundary should be in FY 26-27")
+        self.assertIn("31-03-2027", filtered_dates,
+                      "Mar 2027 boundary should be in FY 26-27")
+        self.assertNotIn("01-04-2025", filtered_dates,
+                         "Apr 2025 should NOT be in FY 26-27")
+        self.assertNotIn("01-08-2027", filtered_dates,
+                         "Aug 2027 should NOT be in FY 26-27")
+        print("  ✓ FY filter with _sortable correctly includes/excludes cross-year dates")
+
     def test_extract_ref_id_receipt(self):
         """Test extracting receipt ID from description"""
         desc = "Receipt 26-27-297 — Manual Bank Statement (NEFT)"
@@ -737,14 +774,14 @@ class TestIdentifiers(unittest.TestCase):
 
     def test_delete_identifier(self):
         self.provider.record_payment_reference(1, "MOBILE", "9876543210", "01-06-2026")
-        ids = self.provider.get_all_identifiers()
+        ids = self.provider.get_all_identifiers(include_deleted=True)
         before = len(ids)
         self.assertGreater(before, 0, "No identifiers recorded")
-        idx = next(i for i, idr in enumerate(ids) if str(idr.get("Identifier_Value", "")) == "9876543210")
-        self.provider.delete_identifier(idx)
+        target = next(idr for idr in ids if str(idr.get("Identifier_Value", "")) == "9876543210")
+        self.provider.delete_identifier(target["ID"])
         after = len(self.provider.get_all_identifiers())
         self.assertEqual(after, before - 1)
-        print("  ✓ delete_identifier removes by index")
+        print("  ✓ delete_identifier removes by ID")
 
     def test_identifier_type_filter(self):
         self.provider.record_payment_reference(1, "UPI_ID", "a@b", "01-06-2026")
@@ -933,6 +970,7 @@ class TestHelperFunctionsExtended(unittest.TestCase):
     def test_fy_date_range(self):
         from agents.orchestrator_agent import _fy_date_range
         self.assertEqual(_fy_date_range("2025-26"), ("01-04-2025", "31-03-2026"))
+        self.assertEqual(_fy_date_range("25-26"), ("01-04-2025", "31-03-2026"))
         self.assertEqual(_fy_date_range("invalid"), ("", ""))
 
     def test_receipt_exists(self):
@@ -985,6 +1023,73 @@ class TestInvoiceTools(unittest.TestCase):
         # Test the logic inline instead
         self.assertGreater(float(entry_debit.get("Debit", 0)), 0)
         self.assertLessEqual(float(entry_no_debit.get("Debit", 0)), 0)
+
+
+class TestSearchTokenExtraction(unittest.TestCase):
+    """Test _extract_search_tokens: IMPS, UPI /CR/, short uppercase names, amount filtering"""
+
+    def setUp(self):
+        from tools.pdf_parser import _extract_search_tokens
+        self._extract = _extract_search_tokens
+
+    def test_imps_extracts_ajay(self):
+        """IMPS transaction extracts 'AJAY' into search tokens"""
+        tokens, ids = self._extract(
+            "S72544436 KMB / AJAY IMPSAB/209013832071/UBIN0 3,000.00 39,001.00CR",
+            "IMPS", "S72544436"
+        )
+        self.assertIn("AJAY", tokens)
+        print("  ✓ IMPS extraction finds 'AJAY'")
+
+    def test_imps_records_ajay_identifier(self):
+        """IMPS transaction records 'AJAY' as a PAYEE_NAME identifier"""
+        tokens, ids = self._extract(
+            "S72544436 KMB / AJAY IMPSAB/209013832071/UBIN0 3,000.00 39,001.00CR",
+            "IMPS", "S72544436"
+        )
+        self.assertIn(("AJAY", "PAYEE_NAME"), ids)
+        print("  ✓ IMPS extraction records 'AJAY' as PAYEE_NAME identifier")
+
+    def test_cr_short_name_shw(self):
+        """UPI /CR/SHW extracts 'SHW' into tokens (was blocked by ≤4 filter)"""
+        tokens, ids = self._extract(
+            "S55292771 6bab9U3 UPIAB/208924275876/CR/SHW 4,000.00 7,001.00CR",
+            "UPI", "S55292771"
+        )
+        self.assertIn("SHW", tokens)
+        print("  ✓ /CR/SHW extraction finds 'SHW' (≤4 filter removed)")
+
+    def test_cr_short_name_fut(self):
+        """UPI /CR/FUT extracts 'FUT' into tokens (was blocked by ≤4 filter)"""
+        tokens, ids = self._extract(
+            "S56342541 404c1U3 UPIAB/208942028183/CR/FUT 3,000.00 10,001.00CR",
+            "UPI", "S56342541"
+        )
+        self.assertIn("FUT", tokens)
+        print("  ✓ /CR/FUT extraction finds 'FUT' (≤4 filter removed)")
+
+    def test_cr_no_amount_tokens_in_identifiers(self):
+        """UPI /CR/ extraction does NOT record trailing amount tokens as identifiers"""
+        tokens, ids = self._extract(
+            "S55292771 6bab9U3 UPIAB/208924275876/CR/SHW 4,000.00 7,001.00CR",
+            "UPI", "S55292771"
+        )
+        id_values = {v for v, t in ids}
+        self.assertNotIn("7,001.00CR", id_values,
+                         "Trailing amount token should be filtered out")
+        self.assertNotIn("4,000.00", id_values,
+                         "Pure amount token should be filtered out")
+        print("  ✓ /CR/ extraction does not record amount tokens as identifiers")
+
+    def test_short_names_recorded_as_identifiers(self):
+        """Short uppercase names (≤4) are now recorded as PAYEE_NAME identifiers"""
+        tokens, ids = self._extract(
+            "S55292771 6bab9U3 UPIAB/208924275876/CR/SHW 4,000.00 7,001.00CR",
+            "UPI", "S55292771"
+        )
+        self.assertIn(("SHW", "PAYEE_NAME"), ids,
+                      "SHW should be a PAYEE_NAME identifier now (≤4 filter removed)")
+        print("  ✓ Short uppercase names recorded as identifiers (≤4 filter removed)")
 
 
 class TestAccountsContinuity(unittest.TestCase):
@@ -1149,6 +1254,116 @@ class TestAccountsContinuity(unittest.TestCase):
         self.assertEqual(filtered[0]["Amount"], 1000.0)
 
 
+class TestLedgerFromAccountsIntegration(unittest.TestCase):
+    """Integration test: create_ledger_from_accounts full flow through the agent tool"""
+
+    def setUp(self):
+        from file_storage.local_storage import LocalFileStorage
+        from agents.orchestrator_agent import OrchestratorAgent
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.test_file = Path(self.temp_dir.name) / "test_ledger_int.xlsx"
+        self.provider = LocalExcelDataProvider(self.test_file)
+        self.storage = LocalFileStorage(Path(self.temp_dir.name))
+        self.agent = OrchestratorAgent(self.provider, self.storage)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def _get_tool(self, name):
+        for t in self.agent.tools:
+            if t.name == name:
+                return t
+        return None
+
+    def _add_member(self, plot_no, name):
+        return self.provider.add_member({
+            "Plot_No": plot_no,
+            "Plot_Owner_Name": name,
+            "Email": "",
+            "Phone": "",
+            "Current_Outstanding": 0,
+            "Pending_Interest": 0,
+        })
+
+    def _add_accounts_entry(self, date, particulars, deposit, txn_type, txn_id, status="Pending"):
+        self.provider.add_accounts_entries([{
+            "Date": date,
+            "Particulars": particulars,
+            "Withdrawal": None,
+            "Deposit": deposit,
+            "Balance": deposit + 1000.0,
+            "Transaction_Type": txn_type,
+            "Transaction_ID": txn_id,
+            "Source_File": "integration_test.pdf",
+            "Statement_Seq": 1,
+            "Status": status,
+        }])
+
+    def test_preview_matches_ajay_by_exact_name(self):
+        """IMPS entry with 'AJAY' matches Ajay Radhakrishnan via exact name token"""
+        self._add_member("37", "Ajay Radhakrishnan")
+        self._add_accounts_entry(
+            date="15-01-2027",
+            particulars="S72544436 KMB / AJAY IMPSAB/209013832071/UBIN0 3,000.00 39,001.00CR",
+            deposit=3000.0,
+            txn_type="IMPS",
+            txn_id="209013832071",
+        )
+        import json
+        tool = self._get_tool("create_ledger_from_accounts")
+        self.assertIsNotNone(tool, "create_ledger_from_accounts tool not registered")
+        result = tool.func(json.dumps({"fy": "26-27", "mode": "preview"}))
+        data = json.loads(result)
+        matched = data.get("matched", [])
+        self.assertEqual(len(matched), 1,
+                         f"Expected 1 matched entry, got {len(matched)}: {matched}")
+        self.assertEqual(matched[0]["member_name"], "Ajay Radhakrishnan")
+        self.assertEqual(matched[0]["amount"], 3000.0)
+        print("  ✓ Integration: AJAY IMPS matches Ajay Radhakrishnan via exact name token")
+
+    def test_preview_matches_shw_by_substring(self):
+        """UPI /CR/SHW matches Shweta Shete via substring matching"""
+        self._add_member("15", "Shweta Shete")
+        self._add_accounts_entry(
+            date="15-01-2027",
+            particulars="S55292771 6bab9U3 UPIAB/208924275876/CR/SHW 4,000.00 7,001.00CR",
+            deposit=4000.0,
+            txn_type="UPI",
+            txn_id="208924275876",
+        )
+        import json
+        tool = self._get_tool("create_ledger_from_accounts")
+        self.assertIsNotNone(tool)
+        result = tool.func(json.dumps({"fy": "26-27", "mode": "preview"}))
+        data = json.loads(result)
+        matched = data.get("matched", [])
+        self.assertEqual(len(matched), 1,
+                         f"Expected 1 matched entry, got {len(matched)}: "
+                         f"unmatched={len(data.get('unmatched', []))}")
+        self.assertEqual(matched[0]["member_name"], "Shweta Shete")
+        self.assertIn("name_sub", matched[0].get("reason", ""),
+                      f"Expected substring match reason, got: {matched[0].get('reason')}")
+        print("  ✓ Integration: SHW matches Shweta Shete via substring")
+
+    def test_continuity_has_deposits_withdrawals(self):
+        """Accounts continuity includes total_deposits and total_withdrawals"""
+        self._add_member("1", "Test Member")
+        self._add_accounts_entry(
+            date="15-06-2026",
+            particulars="Test deposit",
+            deposit=5000.0,
+            txn_type="NEFT",
+            txn_id="TST123",
+        )
+        summary = self.provider.get_accounts_summary()
+        continuity = summary.get("continuity", [])
+        self.assertGreater(len(continuity), 0)
+        fy = continuity[0]
+        self.assertEqual(fy["total_deposits"], 5000.0)
+        self.assertEqual(fy["total_withdrawals"], 0.0)
+        print("  ✓ continuity has total_deposits and total_withdrawals")
+
+
 def run_tests():
     """Run all tests"""
     print("\n" + "=" * 60)
@@ -1174,6 +1389,8 @@ def run_tests():
     suite.addTests(loader.loadTestsFromTestCase(TestConsolidatedReceiptPDF))
     suite.addTests(loader.loadTestsFromTestCase(TestHelperFunctionsExtended))
     suite.addTests(loader.loadTestsFromTestCase(TestInvoiceTools))
+    suite.addTests(loader.loadTestsFromTestCase(TestSearchTokenExtraction))
+    suite.addTests(loader.loadTestsFromTestCase(TestLedgerFromAccountsIntegration))
     suite.addTests(loader.loadTestsFromTestCase(TestAccountsContinuity))
 
     runner = unittest.TextTestRunner(verbosity=2)
