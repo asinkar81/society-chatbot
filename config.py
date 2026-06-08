@@ -67,6 +67,7 @@ ALLOWED_UPLOAD_TYPES = {".jpg", ".jpeg", ".png", ".pdf", ".heic", ".webp"}
 # Bank statement storage
 BANK_STATEMENTS_DIR = DATA_DIR / "bank_statements"
 BACKUPS_DIR = DATA_DIR / "backups"
+STAGING_DIR = DATA_DIR / "staging"
 MAX_BACKUPS = 10
 BANK_STMT_PASSWORD = os.getenv("BANK_STMT_PASSWORD", "")
 
@@ -84,6 +85,7 @@ UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 BILLS_DIR.mkdir(parents=True, exist_ok=True)
 BANK_STATEMENTS_DIR.mkdir(exist_ok=True)
 BACKUPS_DIR.mkdir(exist_ok=True)
+STAGING_DIR.mkdir(parents=True, exist_ok=True)
 
 # LLM settings
 LLM_TEMPERATURE = 0.7
