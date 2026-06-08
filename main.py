@@ -1448,7 +1448,7 @@ def show_dashboard_page():
                                     refs = ";".join([pdf_path.name]) if pdf_path and pdf_path.exists() else ""
                                     inv_member_id = e["_mid"]
                                     inv_ledger = data_provider.get_member_ledger(inv_member_id)
-                                    fy_start = f"01-04-20{fy[:2]}"
+                                    fy_start = f"31-03-20{fy[:2]}"
                                     inv_prev_outstanding = max(0, -compute_outstanding_as_of(inv_ledger, fy_start))
                                     inv_entries_fy = [x for x in inv_ledger if get_fy_from_date(str(x.get("Date", ""))) == fy]
                                     inv_total_demand = sum(float(x.get("Debit", 0)) for x in inv_entries_fy
@@ -1515,7 +1515,7 @@ def show_dashboard_page():
                             pdf_path_wa = _get_pdf_path(config.INVOICES_DIR, ref_id_wa) if ref_id_wa else None
                             pdf_names = [pdf_path_wa.name] if pdf_path_wa and pdf_path_wa.exists() else []
                             inv_ledger = data_provider.get_member_ledger(e["_mid"])
-                            fy_start = f"01-04-20{fy[:2]}"
+                            fy_start = f"31-03-20{fy[:2]}"
                             inv_prev_outstanding = max(0, -compute_outstanding_as_of(inv_ledger, fy_start))
                             inv_entries_fy = [x for x in inv_ledger if get_fy_from_date(str(x.get("Date", ""))) == fy]
                             inv_total_demand = sum(float(x.get("Debit", 0)) for x in inv_entries_fy
@@ -3355,7 +3355,7 @@ def show_settings_page():
                 summary = None
                 if template_key in ("invoice", "statement") and share_fy not in ("All", "Custom") and share_fy:
                     fy_s = share_fy[:2]
-                    fy_start = f"01-04-20{fy_s}"
+                    fy_start = f"31-03-20{fy_s}"
                     share_prev_outstanding = max(0, -compute_outstanding_as_of(led, fy_start))
                     share_entries_fy = [x for x in led if get_fy_from_date(str(x.get("Date", ""))) == share_fy]
                     share_total_demand = sum(float(x.get("Debit", 0)) for x in share_entries_fy

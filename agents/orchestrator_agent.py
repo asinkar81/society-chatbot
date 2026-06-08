@@ -3405,7 +3405,7 @@ class OrchestratorAgent(BaseAgent):
             if not fy:
                 fy = get_fy_from_date(datetime.now().strftime("%d-%m-%Y"))
             ledger = self.data_provider.get_member_ledger(member["ID"])
-            fy_start = f"01-04-20{fy[:2]}"
+            fy_start = f"31-03-20{fy[:2]}"
             prev_outstanding = max(0, -compute_outstanding_as_of(ledger, fy_start))
             fy_entries = [x for x in ledger if get_fy_from_date(str(x.get("Date", ""))) == fy]
             total_demand = sum(float(x.get("Debit", 0) or 0) for x in fy_entries
