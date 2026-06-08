@@ -85,7 +85,7 @@ def test_build_wa_link():
     phone = "9876543210"
     text = "Hello World"
     link = build_wa_link(phone, text)
-    assert link.startswith("https://wa.me/919876543210?text=")
+    assert link.startswith("whatsapp://send?phone=919876543210&text=")
     assert "Hello%20World" in link
 
 

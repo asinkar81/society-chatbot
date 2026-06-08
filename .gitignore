@@ -31,6 +31,9 @@ build/
 data/invoices/
 data/receipts/
 data/ledgers/
+data/bank_statements/
+data/staging/
+data/uploads/
 *.xlsx
 *.csv
 

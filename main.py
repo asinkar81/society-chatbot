@@ -1214,7 +1214,12 @@ def show_dashboard_page():
                             )
                             wa_link = build_wa_link(wa_phone, msg)
                             copy_to_clipboard(msg)
-                            st.info("📋 Message copied! Open WhatsApp Web and send.")
+                            if pdf_path_wa and pdf_path_wa.exists():
+                                staging_d = config.STAGING_DIR / "whatsapp" / datetime.now().strftime("%Y%m%d_%H%M%S")
+                                staging_d.mkdir(parents=True, exist_ok=True)
+                                import shutil
+                                shutil.copy2(pdf_path_wa, staging_d)
+                                subprocess.run(["open", str(staging_d)])
                             st.markdown(f'<a href="{wa_link}" target="_blank">🔗 Open WhatsApp</a>',
                                         unsafe_allow_html=True)
                             refs = ";".join(pdf_names)
@@ -1539,7 +1544,12 @@ def show_dashboard_page():
                             )
                             wa_link = build_wa_link(wa_phone, msg)
                             copy_to_clipboard(msg)
-                            st.info("📋 Message copied! Open WhatsApp Web and send.")
+                            if pdf_path_wa and pdf_path_wa.exists():
+                                staging_d = config.STAGING_DIR / "whatsapp" / datetime.now().strftime("%Y%m%d_%H%M%S")
+                                staging_d.mkdir(parents=True, exist_ok=True)
+                                import shutil
+                                shutil.copy2(pdf_path_wa, staging_d)
+                                subprocess.run(["open", str(staging_d)])
                             st.markdown(f'<a href="{wa_link}" target="_blank">🔗 Open WhatsApp</a>',
                                         unsafe_allow_html=True)
                             refs = ";".join(pdf_names)
@@ -3466,11 +3476,15 @@ def show_settings_page():
                 if st.button("💬 Send via WhatsApp", use_container_width=True,
                              disabled=not wa_sel):
                     from utils.whatsapp import build_wa_message, build_wa_link, copy_to_clipboard
-                    staging_folder = config.STAGING_DIR / "whatsapp" / datetime.now().strftime("%Y%m%d_%H%M%S")
-                    staging_folder.mkdir(parents=True, exist_ok=True)
+                    parent_folder = config.STAGING_DIR / "whatsapp" / datetime.now().strftime("%Y%m%d_%H%M%S")
+                    parent_folder.mkdir(parents=True, exist_ok=True)
                     wa_processed = 0
                     for sd in wa_sel:
                         wa_processed += 1
+                        plot_slug = str(sd.get("plot", "?")).replace(" ", "_")
+                        name_slug = str(sd.get("name", "?")).replace(" ", "_")
+                        member_folder = parent_folder / f"plot_{plot_slug}_{name_slug}"
+                        member_folder.mkdir(parents=True, exist_ok=True)
                         pdfs = []
                         for e in sd["entries"]:
                             is_credit = e.get("Credit", 0)
@@ -3490,7 +3504,7 @@ def show_settings_page():
                             if p and p.exists():
                                 pdfs.append(p)
                                 import shutil
-                                shutil.copy2(p, staging_folder)
+                                shutil.copy2(p, member_folder)
                         pdf_names = [p.name for p in pdfs]
                         entries_for_body = []
                         for e in sd["entries"]:
@@ -3530,16 +3544,18 @@ def show_settings_page():
                                 st.markdown(f'<a href="{wa_link}" target="_blank">🔗 Open WhatsApp</a>',
                                             unsafe_allow_html=True)
                             with cc:
-                                st.markdown(f"[📂 Open Staging Folder]({staging_folder.as_uri()})")
+                                if st.button("📂 Open", key=f"wa_folder_{sd['mid']}"):
+                                    import subprocess
+                                    subprocess.run(["open", str(member_folder)])
                             if pdfs:
-                                st.caption(f"{len(pdfs)} PDF(s) staged in folder:")
+                                st.caption(f"{len(pdfs)} PDF(s) in folder:")
                                 for pn in pdf_names:
                                     st.text(pn)
                     if wa_processed:
-                        st.info(f"✅ {wa_processed} message(s) ready. Open WhatsApp Web, paste message, drag PDFs from staging folder.")
-                        if st.button("📂 Open Staging Folder", key="wa_open_staging"):
+                        st.info(f"✅ {wa_processed} message(s) ready with individual folders. Open All PDFs button available below.")
+                        if st.button("📂 Open All PDFs", key="wa_open_staging"):
                             import subprocess
-                            subprocess.run(["open", str(staging_folder)])
+                            subprocess.run(["open", str(parent_folder)])
             else:
                 st.info("No entries found for the selected criteria.")
 

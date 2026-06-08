@@ -80,7 +80,7 @@ def build_wa_link(phone: str, text: str, country_code: str = "91") -> str:
     else:
         full = country_code + digits.lstrip("0")
     encoded = urllib.parse.quote(text)
-    return f"https://wa.me/{full}?text={encoded}"
+    return f"whatsapp://send?phone={full}&text={encoded}"
 
 
 def copy_to_clipboard(text: str) -> bool:
