@@ -3353,7 +3353,7 @@ def show_settings_page():
                 raw_wa = m.get("WhatsApp_No")
                 wa_phone = "" if (raw_wa is None or (isinstance(raw_wa, float) and pd.isna(raw_wa))) else str(raw_wa).strip()
                 summary = None
-                if template_key in ("invoice", "statement") and share_fy not in ("All", "Custom") and share_fy:
+                if template_key in ("invoice", "statement", "reminder") and share_fy not in ("All", "Custom") and share_fy:
                     fy_s = share_fy[:2]
                     fy_start = f"31-03-20{fy_s}"
                     share_prev_outstanding = max(0, -compute_outstanding_as_of(led, fy_start))
