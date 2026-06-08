@@ -34,8 +34,8 @@ def build_wa_message(
     entries: Optional[List[dict]] = None,
     pdf_names: Optional[List[str]] = None,
 ) -> str:
-    plot = member.get("Plot_No", "")
-    name = member.get("Plot_Owner_Name", "")
+    plot = member.get("Plot_No", "") or member.get("plot", "")
+    name = member.get("Plot_Owner_Name", "") or member.get("name", "")
 
     lines = [
         "Weekend Ville Society",
