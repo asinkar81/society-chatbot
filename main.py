@@ -3394,7 +3394,10 @@ def show_settings_page():
                 for sd in share_data:
                     if sd["email"] or sd["wa_phone"]:
                         share_opts[f"Plot {sd['plot']} — {sd['name']}"] = sd
-                sel_labels = st.multiselect("Recipients", list(share_opts.keys()), key="share_sel")
+                wa_only = st.checkbox("Show only WhatsApp-only (no email)", key="wa_only_filter")
+                filtered_opts = {k: v for k, v in share_opts.items()
+                                if not wa_only or (v["wa_phone"] and not v["email"])}
+                sel_labels = st.multiselect("Recipients", list(filtered_opts.keys()), key="share_sel")
                 sel_items = [share_opts[l] for l in sel_labels] if sel_labels else []
 
                 if sel_items and any(sd["last_sent"] for sd in sel_items):
