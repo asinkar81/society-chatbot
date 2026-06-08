@@ -3198,8 +3198,8 @@ def show_settings_page():
         st.divider()
         if st.button("🔄 Full Reset & Rebuild from Bank Statements", type="primary", use_container_width=True):
             import shutil
-            from datetime import datetime
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            from datetime import datetime as _dt_now
+            ts = _dt_now.now().strftime("%Y%m%d_%H%M%S")
             shutil.copy2(config.SOCIETY_DATA_FILE, config.BACKUPS_DIR / f"society_data_{ts}_full_reset.xlsx")
             with st.spinner("Resetting and rebuilding all financial data from bank statement PDFs..."):
                 result = _run_tool("reset_and_rebuild_all", json.dumps({}))
@@ -3212,8 +3212,8 @@ def show_settings_page():
                                             placeholder="e.g. before rate update, after cleanup")
             if st.button("📀 Take Backup Now", type="primary", use_container_width=True, key="backup_now"):
                 import shutil
-                from datetime import datetime
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                from datetime import datetime as _dt_now
+                ts = _dt_now.now().strftime("%Y%m%d_%H%M%S")
                 comment = (backup_comment or "").strip()
                 suffix = "_manual"
                 if comment:
