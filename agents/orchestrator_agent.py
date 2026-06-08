@@ -18,6 +18,7 @@ from utils.converters import (
     compute_outstanding_as_of, get_payment_history, get_previous_invoices,
     number_to_words_inr, clean_payment_details,
 )
+from utils.matching import score_member_match
 import config
 
 
@@ -171,7 +172,7 @@ def _find_members_by_name(members: list, name: str) -> list:
 ORCHESTRATOR_SYSTEM_PROMPT = """You are the Society Management Orchestrator Agent. You handle ALL society tasks (member lookup, payments, receipts, ledgers, invoices, bank statement processing, admin).
 
 IMPORTANT RULES:
-1. ALWAYS call get_member_details FIRST to resolve a plot number or name to a member_id.
+1. When the user provides a plot_no or name explicitly, pass it directly to the tool — do NOT call get_member_details first. The tools handle member resolution internally. Only call get_member_details if you need to DISPLAY member info (e.g. show outstanding balance) before taking an action.
 2. For invoices, ALWAYS ask the user for from_date and to_date if not provided. Calculate months from the date range.
 3. For bank statements: ALWAYS use the process_bank_statement_pdf tool.
    The PDF has already been uploaded, parsed, and its entries cleaned by the UI.
@@ -185,7 +186,8 @@ IMPORTANT RULES:
    b) Match entries by Transaction_ID to identify existing splits.
    c) For non-split entries: use update_ledger_entry to reduce the original credit/debit, then call add_ledger_entry or generate_receipt to create the matching entry for the other member.
    d) Outstanding balances are auto-updated at each step — no manual recalculation needed.
-7. For manual/cash entries that don't need a PDF document, use add_ledger_entry.
+7. For manual/cash entries that don't need a PDF document, use add_ledger_entry for a single entry or record_manual_payments for a BATCH list.
+   Pass plot_no (or plots for equal split) directly — do NOT resolve to member_id first.
    Set entry_type="CREDIT" for payments received, entry_type="DEBIT" for charges/expenses.
    Use generate_receipt instead only when the user asks for a receipt PDF or when the entry comes from a bank statement.
    For BATCH processing of a LIST of payments (e.g. "these 14 people paid for Shivaji's salary"),
@@ -874,7 +876,9 @@ class OrchestratorAgent(BaseAgent):
                 "Transaction_Type": transaction_type.upper() if transaction_type else "MANUAL",
                 "Transaction_ID": transaction_id or None,
             }
-            self.data_provider.add_ledger_entry(member_id, entry)
+            ok = self.data_provider.add_ledger_entry(member_id, entry)
+            if not ok:
+                return f"❌ Write failed — close Excel if open and retry."
 
             member = self.data_provider.get_member(member_id)
             name = member.get("Plot_Owner_Name", f"Member {member_id}") if member else f"Member {member_id}"
@@ -932,15 +936,22 @@ class OrchestratorAgent(BaseAgent):
                     continue
 
                 target_plots = []
-                if plots:
+                raw_mid = entry.get("member_id")
+                if raw_mid is not None:
+                    try:
+                        m = self.data_provider.get_member(int(raw_mid))
+                        if m:
+                            target_plots = [str(m["Plot_No"])]
+                    except (ValueError, TypeError):
+                        pass
+                if not target_plots and plots:
                     target_plots = [str(p).strip() for p in plots]
-                elif plot_no:
+                if not target_plots and plot_no:
                     target_plots = [plot_no]
-                elif name:
+                if not target_plots and name:
                     members_found = _find_members_by_name(all_members, name)
                     if members_found:
                         target_plots = [str(m["Plot_No"]) for m in members_found]
-                        # only the first match if it's a high-scoring exact name
                         if len(target_plots) > 1:
                             best = members_found[0]
                             if best.get("Plot_Owner_Name", "").lower().strip() == name.lower().strip():
@@ -976,7 +987,7 @@ class OrchestratorAgent(BaseAgent):
                         continue
 
                     vch_no = self.data_provider.get_next_voucher_number()
-                    self.data_provider.add_ledger_entry(mid, {
+                    ok = self.data_provider.add_ledger_entry(mid, {
                         "Date": date,
                         "Particulars": f"By {full_particulars[:60]}",
                         "Vch_Type": "Journal",
@@ -986,14 +997,20 @@ class OrchestratorAgent(BaseAgent):
                         "Description": full_particulars,
                         "Transaction_Type": "MANUAL",
                     })
-                    results.append(f"  #{idx+1} Plot {p}: ₹{split_amount:,.2f} (Vch_No {vch_no})")
-                    created_here += 1
-                    total_created += 1
+                    if ok:
+                        results.append(f"  #{idx+1} Plot {p}: ₹{split_amount:,.2f} (Vch_No {vch_no})")
+                        created_here += 1
+                        total_created += 1
+                    else:
+                        results.append(f"  #{idx+1} Plot {p}: write failed — close Excel and retry")
+                        total_failed += 1
 
                 if created_here == 0:
                     total_failed += 1
 
             summary = f"✅ {total_created} created, {total_skipped} skipped, {total_failed} failed."
+            if total_failed > 0 and total_created == 0:
+                summary += " ⚠️ Close Excel if open and retry."
             return summary + "\n" + "\n".join(results)
 
         # ── Invoice tools ─────────────────────────────────────────────
@@ -1158,9 +1175,9 @@ class OrchestratorAgent(BaseAgent):
                 "Particulars": f"To Annual Maintenance Charges ({date_range})",
                 "Vch_Type": "Journal",
                 "Vch_No": vch_no,
-                "Debit": total_amount_due,
+                "Debit": total_line_items,
                 "Credit": None,
-                "Description": f"Invoice {invoice_no} FY {fy_str}",
+                "Description": f"Invoice {invoice_no} FY {fy_str} (Demand: ₹{total_amount_due:,.2f})",
                 "Transaction_Type": "INVOICE",
             })
             o = self.data_provider.get_current_outstanding(member_id)
@@ -1264,9 +1281,9 @@ class OrchestratorAgent(BaseAgent):
                     "Particulars": particulars,
                     "Vch_Type": "Journal",
                     "Vch_No": vch_no,
-                    "Debit": total_amount_due,
+                    "Debit": total_line_items,
                     "Credit": None,
-                    "Description": description,
+                    "Description": f"Invoice {invoice_no} FY {fy_str} (Demand: ₹{total_amount_due:,.2f})",
                     "Transaction_Type": "INVOICE",
                 })
                 target_member = self.data_provider.get_member(new_member_id)
@@ -1274,8 +1291,10 @@ class OrchestratorAgent(BaseAgent):
             else:
                 target_member = self.data_provider.get_member(member_id)
                 if target_member:
+                    new_desc = f"Invoice {invoice_no} FY {fy_str} (Demand: ₹{total_amount_due:,.2f})"
                     self.data_provider.update_ledger_entry(member_id, vch_no, {
-                        "Debit": total_amount_due,
+                        "Debit": total_line_items,
+                        "Description": new_desc,
                     })
 
             if not target_member:
@@ -1494,9 +1513,9 @@ class OrchestratorAgent(BaseAgent):
                     "Particulars": f"To Annual Maintenance Charges ({date_range})",
                     "Vch_Type": "Journal",
                     "Vch_No": vch_no,
-                    "Debit": total_amount_due,
+                    "Debit": total_line_items,
                     "Credit": None,
-                    "Description": f"Invoice {invoice_no} FY {fy_str}",
+                    "Description": f"Invoice {invoice_no} FY {fy_str} (Demand: ₹{total_amount_due:,.2f})",
                     "Transaction_Type": "INVOICE",
                 })
                 added += 1
@@ -1870,33 +1889,39 @@ class OrchestratorAgent(BaseAgent):
                     tokens.add(phone)
                     identifiers.append((phone, "MOBILE"))
 
-                # IMPS: extract name between "/" and "IMPS" (e.g. "KMB / AJAY IMPSAB/...")
-                imps_match = re.search(r'/\s*([A-Za-z]+)\s+IMPS', particulars)
-                if imps_match:
-                    name_raw = imps_match.group(1).strip()
-                    for t in re.split(r'[\s.]+', name_raw):
-                        if len(t) > 1:
-                            token = t.upper()
-                            tokens.add(token)
-                            if _should_record_name(token):
-                                identifiers.append((token, "PAYEE_NAME"))
+                # IMPS: extract name — handles two formats:
+                #  Format A: "KMB / AJAY IMPSAB/..." (name between "/" and "IMPS")
+                if txn_type == "IMPS":
+                    imps_match = re.search(r'/\s*([A-Za-z]+)\s+IMPS', particulars)
+                    if imps_match:
+                        name_raw = imps_match.group(1).strip()
+                        for t in re.split(r'[\s.]+', name_raw):
+                            if len(t) > 1:
+                                token = t.upper()
+                                tokens.add(token)
+                                if _should_record_name(token):
+                                    identifiers.append((token, "PAYEE_NAME"))
+                    #  Format B: "IMPSAB/UTRN/PayeeName" or "IMPSAB/UTRN/PayeeName/Phone"
+                    if "/" in particulars:
+                        imps_parts = particulars.split("/")
+                        for seg in reversed(imps_parts):
+                            raw = seg.strip()
+                            first_word = re.split(r'[\s,]+', raw)[0] if raw else ""
+                            if re.match(r'[6-9]\d{9}', first_word):
+                                continue
+                            if "IMPS" in raw.upper():
+                                continue
+                            if first_word and re.match(r'^[A-Za-z]{2,}$', first_word):
+                                for t in re.split(r'[\s.]+', raw):
+                                    if len(t) > 1:
+                                        token = t.upper()
+                                        if token not in tokens:
+                                            tokens.add(token)
+                                            if _should_record_name(token):
+                                                identifiers.append((token, "PAYEE_NAME"))
+                                break
 
                 return tokens, identifiers
-
-            def _ngram_match(a, b, n=5):
-                """Check if any n-gram of a appears as substring in b."""
-                a_u, b_u = a.upper(), b.upper()
-                if a_u == b_u:
-                    return True
-                if len(a_u) < n or len(b_u) < n:
-                    return False
-                for i in range(len(a_u) - n + 1):
-                    if a_u[i:i+n] in b_u:
-                        return True
-                for i in range(len(b_u) - n + 1):
-                    if b_u[i:i+n] in a_u:
-                        return True
-                return False
 
             parsed_entries = []
             prev_balance = None
@@ -1987,81 +2012,11 @@ class OrchestratorAgent(BaseAgent):
                 # Phase 3b: Fuzzy name/token matching (only if no reference match)
                 if best_score < 100:
                     for member in members:
-                        name = str(member.get("Plot_Owner_Name") or "").upper()
-                        email = str(member.get("Email") or "").upper()
-                        phone_raw = member.get("Phone")
-                        phone = ""
-                        if phone_raw is not None:
-                            try:
-                                phone = str(int(float(str(phone_raw))))
-                            except (ValueError, TypeError, OverflowError):
-                                s = str(phone_raw).strip()
-                                if s.lower() not in ("", "nan", "inf", "-inf", "infinity", "-infinity", "none"):
-                                    phone = s
-                        name_tokens = set(re.split(r'[\s.]+', name))
-
-                        score = 0
-                        reason_parts = []
-
-                        # Surname match (highest priority)
-                        name_parts_list = re.split(r'[\s.]+', name)
-                        surname = name_parts_list[-1] if name_parts_list else ""
-                        if surname and len(surname) > 2:
-                            if surname in tokens:
-                                score += 20
-                                reason_parts.append("surname")
-                            else:
-                                matched = False
-                                for token in tokens:
-                                    if surname in token and len(token) > len(surname):
-                                        score += 15
-                                        reason_parts.append(f"surname_in_{token}")
-                                        matched = True
-                                        break
-                                if not matched:
-                                    for token in tokens:
-                                        if len(token) > 2 and _ngram_match(token, surname):
-                                            score += 15
-                                            reason_parts.append(f"surname_fuzzy:{token}")
-                                            break
-
-                        # Any name token match
-                        common = tokens & name_tokens
-                        if common:
-                            score += 5 * len(common)
-                            reason_parts.append(f"name:{','.join(common)}")
-                        # Fuzzy name token match (in addition to exact)
-                        fuzzy_common = set()
-                        for t in tokens:
-                            if len(t) <= 2:
-                                continue
-                            for nt in name_tokens:
-                                if len(nt) > 2 and t != nt and _ngram_match(t, nt):
-                                    fuzzy_common.add(t)
-                                    break
-                        deduped = fuzzy_common - common
-                        if deduped:
-                            score += 3 * len(deduped)
-                            reason_parts.append(f"name_fuzzy:{','.join(deduped)}")
-
-                        # Email local-part match
-                        if email and "@" in email:
-                            email_local = email.split("@")[0]
-                            email_parts = set(re.split(r'[.\s]+', email_local))
-                            common_email = tokens & email_parts
-                            if common_email:
-                                score += 3 * len(common_email)
-                                reason_parts.append(f"email:{','.join(common_email)}")
-
-                        # Phone match
-                        if phone and phone in tokens:
-                            score += 8
-                            reason_parts.append("phone")
-
+                        score, reason = score_member_match(tokens, member)
                         if score > best_score:
                             best_score = score
                             best_match = member
-                            best_reason = ", ".join(reason_parts)
+                            best_reason = reason
 
                 entry_type = pentry.get("entry_type", "credit")
 
@@ -2213,25 +2168,6 @@ class OrchestratorAgent(BaseAgent):
                             # Outstanding as of the transaction date
                             led_after = list(ledger) + [{"Date": date, "Credit": amount, "Debit": None}]
                             current_outstanding = compute_outstanding_as_of(led_after, date)
-                            receipt_data = {
-                                "receipt_id": receipt_id,
-                                "date": date,
-                                "member_name": best_match.get("Plot_Owner_Name", ""),
-                                "plot_no": best_match.get("Plot_No", ""),
-                                "amount": amount,
-                                "transaction_id": pentry.get("txn_id") or "N/A",
-                                "transaction_type": txn_type,
-                                "outstanding_balance": current_outstanding,
-                                "payment_details": particulars[:120],
-                            }
-                            if generate_receipts:
-                                receipt_dir = config.RECEIPTS_DIR / fy
-                                receipt_dir.mkdir(parents=True, exist_ok=True)
-                                plot_str = str(best_match.get("Plot_No", "") or "")
-                                plot_part = f"Plot_No_{plot_str.zfill(2)}" if plot_str else "Unknown"
-                                rpath = receipt_dir / f"Receipt_{plot_part}_{receipt_id}.pdf"
-                                create_simple_receipt_pdf(rpath, receipt_data)
-
                             pending_entries.append((mid, {
                                 "Date": date,
                                 "Particulars": f"By {particulars[:60]}",
@@ -2255,21 +2191,24 @@ class OrchestratorAgent(BaseAgent):
                                     svch = self.data_provider.get_next_voucher_number()
                                     sfy = get_fy_from_date(date)
                                     srid = f"{sfy}-{str(svch).zfill(3)}"
-                                    sdata = {
-                                        "receipt_id": srid,
-                                        "date": date,
-                                        "member_name": "Split Receipt",
-                                        "plot_no": "",
-                                        "amount": split_amt,
-                                        "transaction_id": f"SPLIT-{receipt_id}",
-                                        "transaction_type": "SPLIT",
-                                        "outstanding_balance": 0,
-                                        "payment_details": f"Split from {receipt_id} — {clean_payment_details(particulars)[:60]}",
-                                    }
+                                    sm = next((m for m in members if int(m.get("ID", 0)) == smid), None)
+                                    sname = sm.get("Plot_Owner_Name", "") if sm else ""
+                                    splot = sm.get("Plot_No", "") if sm else ""
                                     if generate_receipts:
                                         sdir = config.RECEIPTS_DIR / sfy
                                         sdir.mkdir(parents=True, exist_ok=True)
-                                        spath = sdir / f"Receipt_Plot_No_{str(smid).zfill(2)}_{srid}.pdf"
+                                        spath = sdir / f"Receipt_Plot_No_{str(splot or smid).zfill(2)}_{srid}.pdf"
+                                        sdata = {
+                                            "receipt_id": srid,
+                                            "date": date,
+                                            "member_name": sname,
+                                            "plot_no": splot,
+                                            "amount": split_amt,
+                                            "transaction_id": f"SPLIT-{receipt_id}",
+                                            "transaction_type": "SPLIT",
+                                            "outstanding_balance": 0,
+                                            "payment_details": f"Split from {receipt_id} — {clean_payment_details(particulars)[:60]}",
+                                        }
                                         create_simple_receipt_pdf(spath, sdata)
                                     pending_entries.append((smid, {
                                         "Date": date,
@@ -2282,6 +2221,25 @@ class OrchestratorAgent(BaseAgent):
                                         "Transaction_Type": "SPLIT",
                                         "Transaction_ID": f"SPLIT-{receipt_id}",
                                     }))
+                            else:
+                                if generate_receipts:
+                                    receipt_dir = config.RECEIPTS_DIR / fy
+                                    receipt_dir.mkdir(parents=True, exist_ok=True)
+                                    plot_str = str(best_match.get("Plot_No", "") or "")
+                                    plot_part = f"Plot_No_{plot_str.zfill(2)}" if plot_str else "Unknown"
+                                    rpath = receipt_dir / f"Receipt_{plot_part}_{receipt_id}.pdf"
+                                    receipt_data = {
+                                        "receipt_id": receipt_id,
+                                        "date": date,
+                                        "member_name": best_match.get("Plot_Owner_Name", ""),
+                                        "plot_no": best_match.get("Plot_No", ""),
+                                        "amount": amount,
+                                        "transaction_id": pentry.get("txn_id") or "N/A",
+                                        "transaction_type": txn_type,
+                                        "outstanding_balance": current_outstanding,
+                                        "payment_details": particulars[:120],
+                                    }
+                                    create_simple_receipt_pdf(rpath, receipt_data)
 
                             # Record known identifiers for future matching
                             identifiers = pentry.get("search_identifiers", [])
@@ -2922,7 +2880,7 @@ class OrchestratorAgent(BaseAgent):
             import importlib
             import tools.pdf_parser
             importlib.reload(tools.pdf_parser)
-            from tools.pdf_parser import _ngram_match, _extract_search_tokens
+            from tools.pdf_parser import _extract_search_tokens
 
             auto_income = 0
             for acct_entry in deposit_entries:
@@ -2993,107 +2951,11 @@ class OrchestratorAgent(BaseAgent):
                     # Phase 3b: Fuzzy matching
                     if best_score < 100:
                         for member in members:
-                            name = str(member.get("Plot_Owner_Name") or "").upper()
-                            email = str(member.get("Email") or "").upper()
-                            phone_raw = member.get("Phone")
-                            phone = ""
-                            if phone_raw is not None:
-                                try:
-                                    phone = str(int(float(str(phone_raw))))
-                                except (ValueError, TypeError, OverflowError):
-                                    s = str(phone_raw).strip()
-                                    if s.lower() not in ("", "nan", "inf", "-inf", "infinity", "-infinity", "none"):
-                                        phone = s
-                            wa_raw = member.get("WhatsApp_No")
-                            wa_phone = ""
-                            if wa_raw is not None:
-                                try:
-                                    wa_phone = str(int(float(str(wa_raw))))
-                                except (ValueError, TypeError, OverflowError):
-                                    s = str(wa_raw).strip()
-                                    if s.lower() not in ("", "nan", "inf", "-inf", "infinity", "-infinity", "none"):
-                                        wa_phone = s
-
-                            name_tokens = set(re.split(r'[\s.]+', name))
-
-                            score = 0
-                            reason_parts = []
-
-                            name_parts_list = re.split(r'[\s.]+', name)
-                            surname = name_parts_list[-1] if name_parts_list else ""
-                            if surname and len(surname) > 2:
-                                if surname in search_tokens:
-                                    score += 20
-                                    reason_parts.append("surname")
-                                else:
-                                    matched = False
-                                    for token in search_tokens:
-                                        if surname in token and len(token) > len(surname):
-                                            score += 15
-                                            reason_parts.append(f"surname_in_{token}")
-                                            matched = True
-                                            break
-                                    if not matched:
-                                        for token in search_tokens:
-                                            if len(token) > 2 and _ngram_match(token, surname):
-                                                score += 15
-                                                reason_parts.append(f"surname_fuzzy:{token}")
-                                                break
-
-                            common = search_tokens & name_tokens
-                            if common:
-                                score += 5 * len(common)
-                                reason_parts.append(f"name:{','.join(common)}")
-                            fuzzy_common = set()
-                            for t in search_tokens:
-                                if len(t) <= 2:
-                                    continue
-                                for nt in name_tokens:
-                                    if len(nt) > 2 and t != nt and _ngram_match(t, nt):
-                                        fuzzy_common.add(t)
-                                        break
-                            deduped = fuzzy_common - common
-                            if deduped:
-                                score += 3 * len(deduped)
-                                reason_parts.append(f"name_fuzzy:{','.join(deduped)}")
-
-                            # Substring/prefix: short search token is contained in name token (or vice versa)
-                            # Catches "SHW"→"SHWETA", "FUT"→"FUTANE" where ngram is too short
-                            sub_common = set()
-                            for t in search_tokens:
-                                if len(t) < 3:
-                                    continue
-                                for nt in name_tokens:
-                                    if len(nt) < 3:
-                                        continue
-                                    if (t in nt or nt in t) and t != nt:
-                                        sub_common.add(t)
-                                        break
-                            sub_deduped = sub_common - common - fuzzy_common
-                            if sub_deduped:
-                                score += 5 * len(sub_deduped)
-                                reason_parts.append(f"name_sub:{','.join(sub_deduped)}")
-
-                            if email and "@" in email:
-                                email_local = email.split("@")[0]
-                                email_parts = set(re.split(r'[.\s]+', email_local))
-                                common_email = search_tokens & email_parts
-                                if common_email:
-                                    score += 3 * len(common_email)
-                                    reason_parts.append(f"email:{','.join(common_email)}")
-
-                            if phone and phone in search_tokens:
-                                score += 8
-                                reason_parts.append("phone")
-
-                            if wa_phone and wa_phone in search_tokens:
-                                score += 8
-                                reason_parts.append("whatsapp")
-
+                            score, reason = score_member_match(search_tokens, member)
                             if score > best_score:
                                 best_score = score
                                 best_match = member
-                                best_reason = ", ".join(reason_parts)
+                                best_reason = reason
 
                 if best_match and best_score >= 5 and amount:
                     mid = best_match["ID"]
@@ -3115,26 +2977,6 @@ class OrchestratorAgent(BaseAgent):
                             "Transaction_Type": txn_type,
                             "Transaction_ID": txn_id,
                         }))
-
-                    if not is_preview and generate_receipts:
-                        from tools.pdf_generator import create_simple_receipt_pdf
-                        receipt_dir = config.RECEIPTS_DIR / fy_local
-                        receipt_dir.mkdir(parents=True, exist_ok=True)
-                        plot_str = str(best_match.get("Plot_No", "") or "")
-                        plot_part = f"Plot_No_{plot_str.zfill(2)}" if plot_str else "Unknown"
-                        rpath = receipt_dir / f"Receipt_{plot_part}_{receipt_id}.pdf"
-                        receipt_data = {
-                            "receipt_id": receipt_id,
-                            "date": date,
-                            "member_name": best_match.get("Plot_Owner_Name", ""),
-                            "plot_no": plot_str,
-                            "amount": amount,
-                            "transaction_id": txn_id or "N/A",
-                            "transaction_type": txn_type,
-                            "outstanding_balance": 0,
-                            "payment_details": particulars[:120],
-                        }
-                        create_simple_receipt_pdf(rpath, receipt_data)
 
                     # Split Rules
                     if not is_preview:
@@ -3160,14 +3002,18 @@ class OrchestratorAgent(BaseAgent):
                                     "Transaction_ID": f"SPLIT-{receipt_id}",
                                 }))
                                 if generate_receipts:
+                                    from tools.pdf_generator import create_simple_receipt_pdf
                                     sdir = config.RECEIPTS_DIR / sfy
                                     sdir.mkdir(parents=True, exist_ok=True)
-                                    spath = sdir / f"Receipt_Plot_No_{str(smid).zfill(2)}_{srid}.pdf"
+                                    sm = next((m for m in members if int(m.get("ID", 0)) == smid), None)
+                                    sname = sm.get("Plot_Owner_Name", "") if sm else ""
+                                    splot = sm.get("Plot_No", "") if sm else ""
+                                    spath = sdir / f"Receipt_Plot_No_{str(splot or smid).zfill(2)}_{srid}.pdf"
                                     sdata = {
                                         "receipt_id": srid,
                                         "date": date,
-                                        "member_name": "Split Receipt",
-                                        "plot_no": "",
+                                        "member_name": sname,
+                                        "plot_no": splot,
                                         "amount": split_amt,
                                         "transaction_id": f"SPLIT-{receipt_id}",
                                         "transaction_type": "SPLIT",
@@ -3175,6 +3021,26 @@ class OrchestratorAgent(BaseAgent):
                                         "payment_details": f"Split from {receipt_id} — {particulars[:60]}",
                                     }
                                     create_simple_receipt_pdf(spath, sdata)
+                        else:
+                            if generate_receipts:
+                                from tools.pdf_generator import create_simple_receipt_pdf
+                                receipt_dir = config.RECEIPTS_DIR / fy_local
+                                receipt_dir.mkdir(parents=True, exist_ok=True)
+                                plot_str = str(best_match.get("Plot_No", "") or "")
+                                plot_part = f"Plot_No_{plot_str.zfill(2)}" if plot_str else "Unknown"
+                                rpath = receipt_dir / f"Receipt_{plot_part}_{receipt_id}.pdf"
+                                receipt_data = {
+                                    "receipt_id": receipt_id,
+                                    "date": date,
+                                    "member_name": best_match.get("Plot_Owner_Name", ""),
+                                    "plot_no": plot_str,
+                                    "amount": amount,
+                                    "transaction_id": txn_id or "N/A",
+                                    "transaction_type": txn_type,
+                                    "outstanding_balance": 0,
+                                    "payment_details": particulars[:120],
+                                }
+                                create_simple_receipt_pdf(rpath, receipt_data)
                         # Record identifiers (non-preview only)
                         for id_value, id_type in search_identifiers:
                             self.data_provider.record_payment_reference(mid, id_type, id_value, date, transaction_type=txn_type)
@@ -3353,9 +3219,12 @@ class OrchestratorAgent(BaseAgent):
                            "Handles member resolution (by plot_no or fuzzy name match), multi-plot splitting, "
                            "and skips duplicates automatically. "
                            "For a SINGLE entry, use add_ledger_entry instead. "
-                           "Input JSON: {\"entries\": [{\"name\": \"...\", \"amount\": 2000, "
-                           "\"date\": \"DD-MM-YYYY\", \"particulars\": \"...\", "
-                           "\"plots\": [\"38\",\"39\"]}, ...]}. "
+                           "Input JSON with an 'entries' list. Each entry has: "
+                           "member_id (optional, overrides name/plot_no), plot_no (optional, direct member reference), "
+                           "plots (optional list for equal split across multiple plots), "
+                           "name (optional, fuzzy matched), "
+                           "amount (required), date (DD-MM-YYYY, required), "
+                           "particulars (required). "
                            "Returns a per-entry summary of created/skipped/failed results.")
 
         self.register_tool(add_demand_entry, "add_demand_entry",
@@ -3508,3 +3377,73 @@ class OrchestratorAgent(BaseAgent):
                            "Re-parses all PDFs from data/bank_statements/ in numeric-prefix order. "
                            "Int.Pd entries auto-recorded as Interest_Income. "
                            "No input required — call with empty JSON object.")
+
+        def get_member_statement_summary(input_str: str = None):
+            """Get outstanding summary or full statement for a member.
+            Input JSON keys: member_id (or plot_no), fy (optional, defaults to current FY),
+            include_entries (optional bool, default false).
+            Example: {"member_id": 5, "fy": "26-27"}"""
+            data = _parse_action_input(input_str or "")
+            mid = data.get("member_id")
+            plot_no = data.get("plot_no")
+            include_entries = data.get("include_entries", False)
+            if isinstance(include_entries, str):
+                include_entries = include_entries.lower() in ("true", "yes", "1")
+            fy = data.get("fy", "")
+            if mid:
+                try:
+                    mid = int(mid)
+                    member = next((m for m in self.data_provider.get_all_members() if m["ID"] == mid), None)
+                except (ValueError, TypeError):
+                    return f"Invalid member_id: {mid}"
+            elif plot_no:
+                member = self.data_provider.get_member_by_plot_no(str(plot_no))
+            else:
+                return "Either member_id or plot_no is required."
+            if not member:
+                return f"Member not found."
+            if not fy:
+                fy = get_fy_from_date(datetime.now().strftime("%d-%m-%Y"))
+            ledger = self.data_provider.get_member_ledger(member["ID"])
+            fy_start = f"01-04-20{fy[:2]}"
+            prev_outstanding = max(0, -compute_outstanding_as_of(ledger, fy_start))
+            fy_entries = [x for x in ledger if get_fy_from_date(str(x.get("Date", ""))) == fy]
+            total_demand = sum(float(x.get("Debit", 0) or 0) for x in fy_entries
+                               if str(x.get("Transaction_Type", "")).upper() == "INVOICE")
+            total_payments = sum(float(x.get("Credit", 0) or 0) for x in fy_entries)
+            total_due = max(0, prev_outstanding + total_demand - total_payments)
+            today = datetime.now().strftime("%d-%m-%Y")
+            lines = [
+                f"Weekend Ville Society",
+                f"Statement for {member.get('Plot_Owner_Name', '')} — Plot {member.get('Plot_No', '')}",
+                f"FY {fy} (as of {today})",
+                "",
+                "Summary:",
+                f"  Balance carried forward: ₹{prev_outstanding:,.2f}",
+                f"  New Invoice Demand: ₹{total_demand:,.2f}",
+                f"  Payments Received: ₹{total_payments:,.2f}",
+                f"  Total Outstanding: ₹{total_due:,.2f}",
+            ]
+            if include_entries and fy_entries:
+                lines.extend([
+                    "",
+                    "Entries:",
+                    f"{'Date':<12} {'Type':<10} {'Amount':>12}  {'Particulars':<40}",
+                    "-" * 75,
+                ])
+                for e in sorted(fy_entries, key=lambda x: str(x.get("Date", ""))):
+                    etype = "INVOICE" if str(e.get("Transaction_Type", "")).upper() == "INVOICE" else "RECEIPT"
+                    amt = float(e.get("Debit", 0) or 0) or float(e.get("Credit", 0) or 0)
+                    lines.append(f"{str(e.get('Date', '')):<12} {etype:<10} ₹{amt:>8,.2f}  {str(e.get('Particulars', ''))[:40]}")
+            return "\n".join(lines)
+
+        self.register_tool(get_member_statement_summary, "get_member_statement_summary",
+                           "Get outstanding summary or detailed statement for a specific member/plot. "
+                           "Returns a formatted text summary with balance carried forward, "
+                           "new invoice demand, payments received, and total outstanding for a given FY. "
+                           "Can optionally include individual entry details (statement mode). "
+                           "Input JSON keys: member_id (int) or plot_no (str as alternative), "
+                           "fy (optional str, defaults to current FY, e.g. '26-27'), "
+                           "include_entries (optional bool, default false — set true for full statement). "
+                           "Examples: {\"plot_no\": \"25\"} for outstanding summary, "
+                           "{\"member_id\": 5, \"fy\": \"26-27\", \"include_entries\": true} for full statement.")
