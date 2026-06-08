@@ -11,8 +11,8 @@ def test_build_wa_message_receipt():
     pdf_names = ["Receipt_Plot_No_25_26-27-005.pdf"]
     msg = build_wa_message("receipt", member, summary, entries, pdf_names)
     assert "Weekend Ville Society" in msg
-    assert "Plot 25" in msg
-    assert "Anil Sharma" in msg
+    assert "\n25\n" in msg
+    assert "Dear Anil Sharma" in msg
     assert "₹5,000" in msg or "₹ 5,000" in msg
     assert "Receipt_Plot_No_25_26-27-005.pdf" in msg
 
@@ -29,8 +29,8 @@ def test_build_wa_message_invoice_with_summary():
     pdf_names = ["Invoice_Plot_No_12_26-27-001.pdf"]
     msg = build_wa_message("invoice", member, summary, entries, pdf_names)
     assert "Weekend Ville Society" in msg
-    assert "Plot 12" in msg
-    assert "Amit Patel" in msg
+    assert "\n12\n" in msg
+    assert "Dear Amit Patel" in msg
     assert "Invoice" in msg
     assert "Balance carried forward" in msg
     assert "₹2,500" in msg or "₹ 2,500" in msg
@@ -58,6 +58,7 @@ def test_build_wa_message_statement():
     pdf_names = ["Invoice_Plot_No_5_26-27-001.pdf", "Receipt_Plot_No_5_26-27-003.pdf"]
     msg = build_wa_message("statement", member, summary, entries, pdf_names)
     assert "Weekend Ville Society" in msg
+    assert "\n5\n" in msg
     assert "statement" in msg
     assert "Summary" in msg
     assert "Attached Documents" in msg
@@ -75,6 +76,7 @@ def test_build_wa_message_reminder():
     pdf_names = []
     msg = build_wa_message("reminder", member, summary, entries, pdf_names)
     assert "Weekend Ville Society" in msg
+    assert "\n8\n" in msg
     assert "reminder" in msg
     assert "Outstanding" in msg
 

@@ -38,21 +38,25 @@ def build_wa_message(
     name = member.get("Plot_Owner_Name", "")
 
     lines = [
-        f"Weekend Ville Society",
-        f"Plot {plot} — {name}",
+        "Weekend Ville Society",
+        f"{plot}",
+        "",
+        f"Dear {name}, ",
     ]
 
     if template_type == "receipt":
         if entries:
             e = entries[0]
-            lines.append(f"\nDear {name}, a payment of {_fmt_amt(e.get('amount', 0))} has been received for your plot at Weekend Ville Society.")
-            lines.append(f"Receipt: {e.get('ref_id', '')}, Date: {e.get('date', '')}")
+            lines[-1] += f"a payment of {_fmt_amt(e.get('amount', 0))} has been received for Plot {plot} at Weekend Ville Society."
+            lines[-1] += f"\nReceipt: {e.get('ref_id', '')}, Date: {e.get('date', '')}"
+        else:
+            lines[-1] += f"a payment has been received for Plot {plot} at Weekend Ville Society."
     elif template_type == "invoice":
-        lines.append(f"\nDear {name}, your invoice for Plot {plot} at Weekend Ville Society is ready.")
+        lines[-1] += f"your invoice for Plot {plot} at Weekend Ville Society is ready."
     elif template_type == "statement":
-        lines.append(f"\nDear {name}, your statement for Plot {plot} at Weekend Ville Society.")
+        lines[-1] += f"your statement for Plot {plot} at Weekend Ville Society."
     elif template_type == "reminder":
-        lines.append(f"\nDear {name}, a gentle reminder for outstanding dues for Plot {plot} at Weekend Ville Society.")
+        lines[-1] += f"a gentle reminder for outstanding dues for Plot {plot} at Weekend Ville Society."
 
     s = _summary_text(summary)
     if s:
