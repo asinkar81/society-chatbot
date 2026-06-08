@@ -30,20 +30,6 @@ FORMAT_PROFILES = {
 }
 
 
-def _ngram_match(a, b, n=5):
-    a_u, b_u = a.upper(), b.upper()
-    if a_u == b_u:
-        return True
-    if len(a_u) < n or len(b_u) < n:
-        return False
-    for i in range(len(a_u) - n + 1):
-        if a_u[i:i+n] in b_u:
-            return True
-    for i in range(len(b_u) - n + 1):
-        if b_u[i:i+n] in a_u:
-            return True
-    return False
-
 
 def extract_text_from_pdf(pdf_path: str, password: str = "") -> str:
     with pdfplumber.open(pdf_path, password=password) as pdf:
@@ -281,16 +267,37 @@ def _extract_search_tokens(particulars: str, txn_type: str, txn_id: str = None) 
                 tokens.add(token)
                 identifiers.append((token, "UPI_ID"))
 
-    # IMPS: extract name between "/" and "IMPS" (e.g. "KMB / AJAY IMPSAB/...")
-    imps_match = re.search(r'/\s*([A-Za-z]+)\s+IMPS', particulars)
-    if imps_match:
-        name_raw = imps_match.group(1).strip()
-        for t in re.split(r'[\s.]+', name_raw):
-            if len(t) > 1:
-                token = t.upper()
-                tokens.add(token)
-                if should_record_name(token):
-                    identifiers.append((token, "PAYEE_NAME"))
+    # IMPS: extract name — handles two formats:
+    #  Format A: "KMB / AJAY IMPSAB/..." (name between "/" and "IMPS")
+    if txn_type == "IMPS":
+        imps_match = re.search(r'/\s*([A-Za-z]+)\s+IMPS', particulars)
+        if imps_match:
+            name_raw = imps_match.group(1).strip()
+            for t in re.split(r'[\s.]+', name_raw):
+                if len(t) > 1:
+                    token = t.upper()
+                    tokens.add(token)
+                    if should_record_name(token):
+                        identifiers.append((token, "PAYEE_NAME"))
+        #  Format B: "IMPSAB/UTRN/PayeeName" or "IMPSAB/UTRN/PayeeName/Phone"
+        if "/" in particulars:
+            imps_parts = particulars.split("/")
+            for seg in reversed(imps_parts):
+                raw = seg.strip()
+                first_word = re.split(r'[\s,]+', raw)[0] if raw else ""
+                if re.match(r'[6-9]\d{9}', first_word):
+                    continue
+                if "IMPS" in raw.upper():
+                    continue
+                if first_word and re.match(r'^[A-Za-z]{2,}$', first_word):
+                    for t in re.split(r'[\s.]+', raw):
+                        if len(t) > 1:
+                            token = t.upper()
+                            if token not in tokens:
+                                tokens.add(token)
+                                if should_record_name(token):
+                                    identifiers.append((token, "PAYEE_NAME"))
+                    break
 
     for phone in re.findall(r'([6-9]\d{9})', particulars):
         if txn_id and phone in txn_id:

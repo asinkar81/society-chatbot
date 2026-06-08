@@ -2,6 +2,7 @@
 Local Excel-based implementation of DataProvider
 """
 import logging
+import os
 import pandas as pd
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -58,6 +59,11 @@ class LocalExcelDataProvider(DataProvider):
         "ID", "Source_Member_ID", "Members",
     ]
 
+    COMM_HEADERS = [
+        "ID", "Date", "Member_ID", "Template_Type", "Subject",
+        "Recipients", "CC", "Status", "Document_Refs", "Error",
+    ]
+
     ACCOUNTS_HEADERS = [
         "Entry_ID", "Date", "Particulars", "Withdrawal", "Deposit",
         "Balance", "Calculated_Balance", "Balance_Check",
@@ -77,6 +83,7 @@ class LocalExcelDataProvider(DataProvider):
         self.split_rules_sheet = "Split_Rules"
         self.accounts_sheet = "Accounts"
         self.interest_income_sheet = "Interest_Income"
+        self.communications_sheet = "Communications"
         self._ensure_workbook_exists()
         self._ensure_payment_refs_sheet_exists()
         self._ensure_suspense_sheet_exists()
@@ -85,6 +92,7 @@ class LocalExcelDataProvider(DataProvider):
         self._ensure_sheet(self.split_rules_sheet, self.SPLIT_RULES_HEADERS)
         self._ensure_sheet(self.accounts_sheet, self.ACCOUNTS_HEADERS)
         self._ensure_sheet(self.interest_income_sheet, self.INTEREST_INCOME_HEADERS)
+        self._ensure_sheet(self.communications_sheet, self.COMM_HEADERS)
         self._seed_default_categories()
         self._migrate_members_schema()
         self._migrate_expenses_schema()
@@ -94,11 +102,16 @@ class LocalExcelDataProvider(DataProvider):
         self._ensure_processed_statements_sheet()
         self._migrate_payment_refs_schema()
         self._clean_payment_refs()
+        self._file_mtime = os.path.getmtime(self.excel_file)
         self._cache = None
 
     # ── Cache ──────────────────────────────────────────────────────────────
 
     def _load_cache(self):
+        current_mtime = os.path.getmtime(self.excel_file)
+        if current_mtime > self._file_mtime:
+            self._cache = None
+            self._file_mtime = current_mtime
         if self._cache is not None:
             return
         try:
@@ -341,7 +354,10 @@ class LocalExcelDataProvider(DataProvider):
 
     def get_member_by_plot_no(self, plot_no: str) -> Optional[Dict[str, Any]]:
         df = pd.read_excel(self.excel_file, sheet_name=self.members_sheet)
-        member = df[df["Plot_No"].astype(str) == str(plot_no).zfill(2)]
+        padded = str(plot_no).zfill(2)
+        member = df[df["Plot_No"].astype(str) == padded]
+        if member.empty:
+            member = df[df["Plot_No"].astype(str) == str(plot_no)]
         if member.empty:
             return None
         return member.iloc[0].to_dict()
@@ -398,7 +414,10 @@ class LocalExcelDataProvider(DataProvider):
         df = pd.read_excel(self.excel_file, sheet_name=self.ledger_sheet)
         df = _ensure_columns(df, entry_df.columns)
         df = pd.concat([df, entry_df.reindex(columns=df.columns)], ignore_index=True)
-        self._write_sheet(df, self.ledger_sheet)
+        try:
+            self._write_sheet(df, self.ledger_sheet)
+        except (PermissionError, OSError):
+            return False
         self._invalidate_cache()
         return True
 
@@ -410,7 +429,10 @@ class LocalExcelDataProvider(DataProvider):
             entry_df = pd.DataFrame([entry])
             df = _ensure_columns(df, entry_df.columns)
             df = pd.concat([df, entry_df.reindex(columns=df.columns)], ignore_index=True)
-        self._write_sheet(df, self.ledger_sheet)
+        try:
+            self._write_sheet(df, self.ledger_sheet)
+        except (PermissionError, OSError):
+            return 0
         self._invalidate_cache()
         return len(entries)
 
@@ -444,7 +466,10 @@ class LocalExcelDataProvider(DataProvider):
         if not mask.any():
             return False
         df = df[~mask].reset_index(drop=True)
-        self._write_sheet(df, self.ledger_sheet)
+        try:
+            self._write_sheet(df, self.ledger_sheet)
+        except (PermissionError, OSError):
+            return False
         self._invalidate_cache()
         return True
 
@@ -479,6 +504,30 @@ class LocalExcelDataProvider(DataProvider):
         self._write_sheet(df, self.settings_sheet)
         self._invalidate_cache()
         return True
+
+    def log_communication(self, member_id: int, template_type: str, subject: str,
+                          recipients: str, cc: str, status: str, document_refs: str = "",
+                          error: str = "") -> int:
+        df = pd.read_excel(self.excel_file, sheet_name=self.communications_sheet)
+        new_id = (df["ID"].max() + 1) if not df.empty else 1
+        from datetime import datetime
+        new_row = pd.DataFrame([{
+            "ID": new_id, "Date": datetime.now().strftime("%d-%m-%Y %H:%M"),
+            "Member_ID": member_id, "Template_Type": template_type,
+            "Subject": subject, "Recipients": recipients, "CC": cc,
+            "Status": status, "Document_Refs": document_refs, "Error": error,
+        }])
+        df = pd.concat([df, new_row], ignore_index=True)
+        self._write_sheet(df, self.communications_sheet)
+        return new_id
+
+    def get_communication_log(self, member_id: Optional[int] = None,
+                              limit: int = 100) -> List[Dict[str, Any]]:
+        df = pd.read_excel(self.excel_file, sheet_name=self.communications_sheet)
+        if member_id is not None:
+            df = df[df["Member_ID"] == member_id]
+        df = df.sort_values("Date", ascending=False).head(limit)
+        return df.to_dict("records")
 
     def get_next_voucher_number(self) -> int:
         settings = self.get_settings()
@@ -692,7 +741,7 @@ class LocalExcelDataProvider(DataProvider):
             elif id_type == "PAYEE_NAME":
                 is_amount = bool(re.match(r'^[\d,]+\.\d{2}$', val))
                 is_ref_code = 5 <= len(val) <= 15 and bool(re.match(r'^[A-Z][A-Za-z0-9]*\d{4,}$', val))
-                is_short_upper = val.isalpha() and val.isupper() and len(val) <= 4
+                is_short_upper = val.isalpha() and val.isupper() and len(val) <= 2
                 is_stop = val.upper() in ID_STOP_WORDS
                 is_numeric = bool(re.match(r'^\d+$', val))
                 is_code = bool(re.match(r'^[A-Z0-9]{4,}$', val)) and not bool(re.search(r'[AEIOU]', val))
@@ -790,6 +839,16 @@ class LocalExcelDataProvider(DataProvider):
                        date: str = None, confidence: int = 1) -> int:
         self.record_payment_reference(member_id, id_type, id_value, date)
         return 0
+
+    def update_identifier_member(self, idr_id: int, new_member_id: int) -> bool:
+        self._ensure_sheet(self.payment_refs_sheet, self.PAYMENT_REF_HEADERS)
+        df = pd.read_excel(self.excel_file, sheet_name=self.payment_refs_sheet)
+        idx = df[df["ID"] == idr_id].index
+        if idx.empty:
+            return False
+        df.loc[idx, "Member_ID"] = new_member_id
+        self._write_sheet(df, self.payment_refs_sheet)
+        return True
 
     # ── Suspense Entries ──────────────────────────────────────────────────
 

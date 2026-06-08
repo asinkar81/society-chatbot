@@ -217,6 +217,11 @@ class DataProvider(ABC):
         """Add a new identifier manually."""
         pass
 
+    @abstractmethod
+    def update_identifier_member(self, idr_id: int, new_member_id: int) -> bool:
+        """Reassign an identifier record to a different member."""
+        pass
+
     # ── Accounts Sheet ─────────────────────────────────────────────────
 
     @abstractmethod
@@ -255,4 +260,19 @@ class DataProvider(ABC):
     def migrate_accounts_from_ledger(self) -> int:
         """One-time: reconstruct Accounts sheet from existing Ledger + Expenses + Suspense data.
         Returns count of entries created."""
+        pass
+
+    # ── Communication Log ───────────────────────────────────────────────
+
+    @abstractmethod
+    def log_communication(self, member_id: int, template_type: str, subject: str,
+                          recipients: str, cc: str, status: str,
+                          document_refs: str = "", error: str = "") -> int:
+        """Record an email/communication send attempt. Returns record ID."""
+        pass
+
+    @abstractmethod
+    def get_communication_log(self, member_id: Optional[int] = None,
+                              limit: int = 100) -> List[Dict[str, Any]]:
+        """Fetch recent communication log entries, optionally filtered by member."""
         pass
