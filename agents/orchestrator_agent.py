@@ -1131,7 +1131,7 @@ class OrchestratorAgent(BaseAgent):
             total_line_items = repair_amount + service_amount + sinking_amount
             total_amount_due = total_line_items + prev_outstanding + pending_interest
 
-            invoice_no = f"{int(member.get('Plot_No', 0)):03d}{inv_date.strftime('%m%d')}"
+            invoice_no = f"{int(member.get('Plot_No', 0)):03d}{inv_date.strftime('%y%m%d')}"
             due_date = (inv_date + timedelta(days=config.INVOICE_DUE_DAYS)).strftime("%d-%m-%Y")
             plot_str = str(member.get("Plot_No", "") or "")
             plot_part = f"Plot_No_{plot_str.zfill(2)}" if plot_str else "Unknown"
@@ -1470,7 +1470,7 @@ class OrchestratorAgent(BaseAgent):
                 total_line_items = repair_amount + service_amount + sinking_amount
                 total_amount_due = total_line_items + prev_outstanding + pending_interest
 
-                invoice_no = f"{int(member.get('Plot_No', 0)):03d}{inv_date.strftime('%m%d')}"
+                invoice_no = f"{int(member.get('Plot_No', 0)):03d}{inv_date.strftime('%y%m%d')}"
                 plot_str = str(member.get("Plot_No", "") or "")
                 plot_part = f"Plot_No_{plot_str.zfill(2)}" if plot_str else "Unknown"
                 line_items = {

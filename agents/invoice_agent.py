@@ -88,7 +88,7 @@ class InvoiceAgent(BaseAgent):
             calc = calculate_invoice_amount(member_id, fy)
 
             # Generate invoice number
-            invoice_no = f"{int(member.get('Plot_No', 0)):03d}{datetime.now().strftime('%m%d')}"
+            invoice_no = f"{int(member.get('Plot_No', 0)):03d}{datetime.now().strftime('%y%m%d')}"
 
             # Prepare invoice data
             invoice_data = {

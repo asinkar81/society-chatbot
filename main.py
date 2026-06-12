@@ -446,9 +446,20 @@ def regenerate_invoice(dp: Any, member_id: int, entry: Dict) -> Optional[str]:
     service_amt = service_rate * months
     sinking_amt = sinking_rate * months
     pending_interest = float(member.get("Pending_Interest", 0) or 0)
+    plot_str = str(member.get("Plot_No", "") or "")
+    plot_part = f"Plot_No_{plot_str.zfill(2)}" if plot_str else "Unknown"
 
-    # ── Delete old PDF first ──
-    _delete_pdf_files(ref_id)
+    # ── Delete old PDF(s) ──
+    fy_short = info["fy"][:2]
+    # Delete old shared PDF (no FY suffix) across all invoice dirs
+    for sub_dir in [d for d in config.INVOICES_DIR.iterdir() if d.is_dir()]:
+        old_path = sub_dir / f"Invoice_{plot_part}_{ref_id}.pdf"
+        old_path.unlink(missing_ok=True)
+    # Delete FY-specific PDF (with FY suffix) from the correct directory
+    fy_dir = config.INVOICES_DIR / fy_short
+    if fy_dir.exists():
+        for p in fy_dir.glob(f"*{ref_id}*"):
+            p.unlink(missing_ok=True)
 
     # ── Delete ALL existing entries with this invoice_no (clean up duplicates) ──
     ledger = dp.get_member_ledger(member_id)
@@ -485,8 +496,6 @@ def regenerate_invoice(dp: Any, member_id: int, entry: Dict) -> Optional[str]:
     if not invoice_date:
         invoice_date = inv_date.strftime("%d-%m-%Y")
     due_date = (inv_date + timedelta(days=config.INVOICE_DUE_DAYS)).strftime("%d-%m-%Y")
-    plot_str = str(member.get("Plot_No", "") or "")
-    plot_part = f"Plot_No_{plot_str.zfill(2)}" if plot_str else "Unknown"
     line_items = {
         f"Repair & Maintenance Fund @ ₹{repair_rate:,.2f}/month × {months} months": repair_amt,
         f"Service Charges @ ₹{service_rate:,.2f}/month × {months} months": service_amt,
@@ -524,7 +533,7 @@ def regenerate_invoice(dp: Any, member_id: int, entry: Dict) -> Optional[str]:
     fy_short = info["fy"][:2]
     invoice_dir = config.INVOICES_DIR / fy_short
     invoice_dir.mkdir(parents=True, exist_ok=True)
-    invoice_path = invoice_dir / f"Invoice_{plot_part}_{invoice_no}.pdf"
+    invoice_path = invoice_dir / f"Invoice_{plot_part}_{invoice_no}_FY{fy_short}.pdf"
     if not create_simple_invoice_pdf(invoice_path, invoice_data):
         return f"Failed to generate PDF for invoice {invoice_no}"
 
@@ -661,7 +670,14 @@ def _invoice_exists(entry: dict) -> str:
     desc = str(entry.get("Description", "") or "")
     inv_match = re.search(r'Invoice\s+(\S+)', desc)
     ref_id = inv_match.group(1) if inv_match else _extract_ref_id(desc)
-    if ref_id and _get_pdf_path(config.INVOICES_DIR, ref_id):
+    if not ref_id:
+        return "no"
+    fy_match = re.search(r'FY\s+(\d{2})-\d{2}', desc)
+    if fy_match:
+        fy_dir = config.INVOICES_DIR / fy_match.group(1)
+        if fy_dir.exists() and any(fy_dir.glob(f"*{ref_id}*")):
+            return "yes"
+    if _get_pdf_path(config.INVOICES_DIR, ref_id):
         return "yes"
     return "no"
 
