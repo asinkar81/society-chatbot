@@ -54,7 +54,9 @@ def _summary_html(summary: Optional[Dict]) -> str:
 def _build_html_body(template_type: str, member_name: str, plot_no: str,
                      fy: str, entries: List[Dict], society: str,
                      pdf_names: Optional[List[str]] = None,
-                     summary: Optional[Dict] = None) -> str:
+                     summary: Optional[Dict] = None,
+                     reminder_num: int = 0,
+                     interest_rate: float = 10.0) -> str:
     if template_type == "invoice":
         return f"""<!DOCTYPE html>
 <html>
@@ -85,7 +87,7 @@ def _build_html_body(template_type: str, member_name: str, plot_no: str,
     for e in sorted_entries:
         amt = float(e.get("amount", 0))
         typ = e.get("type", "CR")
-        if template_type == "statement":
+        if template_type in ("statement", "reminder"):
             total += amt if typ == "CR" else -amt
         else:
             total += amt
@@ -117,13 +119,17 @@ def _build_html_body(template_type: str, member_name: str, plot_no: str,
     elif template_type == "statement":
         title = "Statement of Account"
         label = "entries"
+    elif template_type == "reminder":
+        n = min(reminder_num, 3) if reminder_num else 1
+        title = f"Payment Reminder (Reminder {n} of 3)"
+        label = "outstanding entries"
     else:
         title = "Payment Reminder"
         label = "outstanding entries"
 
-    summary_section = _summary_html(summary) if template_type == "statement" else ""
+    summary_section = _summary_html(summary) if template_type in ("statement", "reminder") else ""
 
-    if template_type == "statement":
+    if template_type in ("statement", "reminder"):
         header_cols = """<th style="padding:6px 8px;border:1px solid #ddd;text-align:left;">Date</th>
 <th style="padding:6px 8px;border:1px solid #ddd;text-align:left;">Ref</th>
 <th style="padding:6px 8px;border:1px solid #ddd;text-align:left;">Particulars</th>
@@ -138,7 +144,7 @@ def _build_html_body(template_type: str, member_name: str, plot_no: str,
     entries_section = ""
     total_line = ""
     if rows_html:
-        if template_type == "statement":
+        if template_type in ("statement", "reminder"):
             total_line = f'<p style="font-size:16px;font-weight:bold;text-align:right;">Net Total: ₹{total:,.2f}</p>'
         else:
             total_line = f'<p style="font-size:16px;font-weight:bold;text-align:right;">Total: ₹{total:,.2f}</p>'
@@ -149,6 +155,17 @@ def _build_html_body(template_type: str, member_name: str, plot_no: str,
 {rows_html}
 </table>
 {total_line}"""
+
+    reminder_warning = ""
+    if template_type == "reminder":
+        n = min(reminder_num, 3) if reminder_num else 1
+        reminder_warning = f"""<div style="background:#fff3cd;border:1px solid #ffc107;border-radius:6px;padding:12px;margin:12px 0;">
+<p style="margin:0;color:#856404;font-size:13px;">
+<strong>⏰ Reminder {n} of 3</strong><br>
+This is a friendly reminder that your payment is due. Please clear the outstanding amount at the earliest.<br>
+<strong>Note:</strong> After 3 reminders, an interest of {interest_rate:.0f}% will be levied on the outstanding amount if payment is not settled by the due date.
+</p>
+</div>"""
 
     return f"""<!DOCTYPE html>
 <html>
@@ -161,6 +178,7 @@ def _build_html_body(template_type: str, member_name: str, plot_no: str,
 <div style="padding:24px;">
 <p>Dear <strong>{member_name}</strong> (Plot {plot_no}),</p>
 <p>Please find below the {label} for FY {fy}:</p>
+{reminder_warning}
 {summary_section}
 {entries_section}
 {_attachments_html(pdf_names)}
@@ -173,7 +191,8 @@ def _build_html_body(template_type: str, member_name: str, plot_no: str,
 
 
 def _build_subject(template_type: str, member_name: str, plot_no: str,
-                   fy: str, amount: Optional[float] = None) -> str:
+                   fy: str, amount: Optional[float] = None,
+                   reminder_num: int = 0) -> str:
     if template_type == "receipt":
         base = f"Payment Receipt - {member_name} (Plot {plot_no})"
         if amount:
@@ -183,7 +202,8 @@ def _build_subject(template_type: str, member_name: str, plot_no: str,
     elif template_type == "statement":
         base = f"Statement of Account - {member_name} (Plot {plot_no}) - FY {fy}"
     else:
-        base = f"Reminder: Payment Due - {member_name} (Plot {plot_no}) - FY {fy}"
+        n = min(reminder_num, 3) if reminder_num else 1
+        base = f"Reminder {n} - Payment Due - {member_name} (Plot {plot_no}) - FY {fy}"
     return f"Weekend Ville {base}"
 
 
@@ -204,6 +224,8 @@ def send_template_email(
     subject_override: Optional[str] = None,
     body_override: Optional[str] = None,
     summary: Optional[Dict] = None,
+    reminder_num: int = 0,
+    interest_rate: float = 10.0,
 ) -> Dict:
     """Send a template-based email with optional PDF attachments.
     Returns dict with keys: success (bool), subject (str), error (str).
@@ -220,12 +242,15 @@ def send_template_email(
     entries = entries or []
     pdf_paths = pdf_paths or []
 
-    subject = subject_override or _build_subject(template_type, member_name, plot_no, fy)
+    subject = subject_override or _build_subject(template_type, member_name, plot_no, fy, reminder_num=reminder_num)
 
     soc = "Weekend Ville Maintenance Co-Op. Society Ltd"
 
     pdf_names = [p.name for p in pdf_paths if p and p.exists()]
-    body_html = body_override or _build_html_body(template_type, member_name, plot_no, fy, entries, soc, pdf_names, summary=summary)
+    body_html = body_override or _build_html_body(
+        template_type, member_name, plot_no, fy, entries, soc, pdf_names,
+        summary=summary, reminder_num=reminder_num, interest_rate=interest_rate,
+    )
 
     msg = MIMEMultipart("mixed")
     alt = MIMEMultipart("alternative")

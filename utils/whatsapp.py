@@ -33,6 +33,8 @@ def build_wa_message(
     summary: Optional[dict] = None,
     entries: Optional[List[dict]] = None,
     pdf_names: Optional[List[str]] = None,
+    reminder_num: int = 0,
+    interest_rate: float = 10.0,
 ) -> str:
     plot = member.get("Plot_No", "") or member.get("plot", "")
     name = member.get("Plot_Owner_Name", "") or member.get("name", "")
@@ -56,7 +58,10 @@ def build_wa_message(
     elif template_type == "statement":
         lines[-1] += f"your statement for Plot {plot} at Weekend Ville Society."
     elif template_type == "reminder":
+        n = min(reminder_num, 3) if reminder_num else 1
         lines[-1] += f"a gentle reminder for outstanding dues for Plot {plot} at Weekend Ville Society."
+        lines.append("")
+        lines.append(f"⏰ Reminder {n} of 3 — After 3 reminders, {interest_rate:.0f}% interest will be levied if payment is not settled by the due date.")
 
     s = _summary_text(summary)
     if s:

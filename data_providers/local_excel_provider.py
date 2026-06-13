@@ -331,6 +331,7 @@ class LocalExcelDataProvider(DataProvider):
                 ["Sinking_Fund_Rate", "15.00"],
                 ["April_1st_Auto_Entry_Amount", "12000"],
                 ["Last_Voucher_No", "0"],
+                ["Late_Interest_Rate", "10.0"],
             ]:
                 ws_settings.append(row)
 

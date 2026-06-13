@@ -2800,33 +2800,40 @@ def show_settings_page():
     )
 
     with tab1:
-        st.subheader("Invoice Rates")
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            repair = st.number_input(
-                "Repair & Maintenance Fund (₹/month)",
-                value=float(settings.get("Repair_Fund_Rate", 100)),
-                min_value=0.0,
-            )
-        with col2:
-            service = st.number_input(
-                "Service Charges (₹/month)",
-                value=float(settings.get("Service_Charges_Rate", 885)),
-                min_value=0.0,
-            )
-        with col3:
-            sinking = st.number_input(
-                "Sinking Fund (₹/month)",
-                value=float(settings.get("Sinking_Fund_Rate", 15)),
-                min_value=0.0,
-            )
-        if st.button("Update Rates", use_container_width=True):
-            data_provider.update_settings({
-                "Repair_Fund_Rate": str(repair),
-                "Service_Charges_Rate": str(service),
-                "Sinking_Fund_Rate": str(sinking),
-            })
-            st.success("Rates updated successfully!")
+            st.subheader("Invoice Rates")
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                repair = st.number_input(
+                    "Repair & Maintenance Fund (₹/month)",
+                    value=float(settings.get("Repair_Fund_Rate", 100)),
+                    min_value=0.0,
+                )
+            with col2:
+                service = st.number_input(
+                    "Service Charges (₹/month)",
+                    value=float(settings.get("Service_Charges_Rate", 885)),
+                    min_value=0.0,
+                )
+            with col3:
+                sinking = st.number_input(
+                    "Sinking Fund (₹/month)",
+                    value=float(settings.get("Sinking_Fund_Rate", 15)),
+                    min_value=0.0,
+                )
+            with col4:
+                late_interest = st.number_input(
+                    "Late Interest Rate (%)",
+                    value=float(settings.get("Late_Interest_Rate", 10.0)),
+                    min_value=0.0, max_value=100.0,
+                )
+            if st.button("Update Rates", use_container_width=True):
+                data_provider.update_settings({
+                    "Repair_Fund_Rate": str(repair),
+                    "Service_Charges_Rate": str(service),
+                    "Sinking_Fund_Rate": str(sinking),
+                    "Late_Interest_Rate": str(late_interest),
+                })
+                st.success("Rates updated successfully!")
 
     with tab2:
         st.subheader("Member Management")
@@ -3357,6 +3364,14 @@ def show_settings_page():
                 if mid and mid not in _last_sent_map:
                     _last_sent_map[mid] = (c.get("Date", ""), c.get("Template_Type", ""))
             import re as _re
+            _reminder_counts = {}
+            if template_key == "reminder":
+                for c in _all_comms:
+                    if c.get("Template_Type") == "reminder":
+                        subj = str(c.get("Subject", "") or "")
+                        if share_fy not in ("All", "Custom") and _re.search(rf"FY\s+{_re.escape(share_fy)}", subj):
+                            mid = c.get("Member_ID")
+                            _reminder_counts[mid] = _reminder_counts.get(mid, 0) + 1
             share_data = []
             for m in all_members:
                 mid = m["ID"]
@@ -3395,6 +3410,7 @@ def show_settings_page():
                         "total_due": max(0, share_prev_outstanding + share_total_demand - share_total_payments),
                         "as_of_date": share_today_str,
                     }
+                reminder_num = _reminder_counts.get(mid, 0) + 1 if template_key == "reminder" else 0
                 share_data.append({
                     "mid": mid, "plot": m.get("Plot_No", "?"),
                     "name": m.get("Plot_Owner_Name", "?"),
@@ -3403,6 +3419,7 @@ def show_settings_page():
                     "total": total, "entries": relevant,
                     "last_sent": _last_sent_map.get(mid),
                     "summary": summary,
+                    "reminder_num": reminder_num,
                 })
 
             if share_data:
@@ -3426,11 +3443,16 @@ def show_settings_page():
                 sel_labels = st.multiselect("Recipients", list(filtered_opts.keys()), key="share_sel")
                 sel_items = [share_opts[l] for l in sel_labels] if sel_labels else []
 
-                if sel_items and any(sd["last_sent"] for sd in sel_items):
+                if sel_items:
                     for sd in sel_items:
-                        if sd["last_sent"]:
+                        parts = []
+                        if template_key == "reminder" and sd.get("reminder_num"):
+                            parts.append(f"📬 Reminder {min(sd['reminder_num'], 3)}/3")
+                        if sd.get("last_sent"):
                             _ls_d, _ls_t = sd["last_sent"]
-                            st.caption(f"📨 {sd['name']}: last sent {_ls_d} ({_ls_t})")
+                            parts.append(f"📨 last sent {_ls_d} ({_ls_t})")
+                        if parts:
+                            st.caption(f"{sd['name']}: {' | '.join(parts)}")
 
                 wa_include_receipts = st.checkbox("Include Receipts", value=True, key="wa_inc_rec")
                 wa_include_invoices = st.checkbox("Include Invoices", value=True, key="wa_inc_inv")
@@ -3470,6 +3492,8 @@ def show_settings_page():
                             template_type=template_key, fy=share_fy,
                             entries=entries_for_body, pdf_paths=pdfs,
                             summary=sd.get("summary"),
+                            reminder_num=sd.get("reminder_num", 0),
+                            interest_rate=float(email_settings.get("Late_Interest_Rate", 10.0)),
                         )
                         ref_str = ";".join(p.name for p in pdfs)
                         data_provider.log_communication(
@@ -3544,6 +3568,8 @@ def show_settings_page():
                         msg = build_wa_message(
                             template_key, sd, summary=sd.get("summary"),
                             entries=entries_for_body, pdf_names=pdf_names,
+                            reminder_num=sd.get("reminder_num", 0),
+                            interest_rate=float(email_settings.get("Late_Interest_Rate", 10.0)),
                         )
                         wa_link = build_wa_link(sd["wa_phone"], msg)
                         with st.expander(f"💬 Plot {sd['plot']} — {sd['name']} ({sd['wa_phone']})"):
