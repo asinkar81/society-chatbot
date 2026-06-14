@@ -10,6 +10,7 @@ env:
   REGION: us-central1               # Update to your GCP region if different
   SERVICE_NAME: society-chatbot     # Name of your Cloud Run service
   REPOSITORY_NAME: society-repo     # Name of your Artifact Registry repository
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 jobs:
   deploy:
