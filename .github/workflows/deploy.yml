@@ -28,22 +28,26 @@ jobs:
       # Authentication options:
       # =========================================================================
       
-      # Option A (Default): Authentication via traditional Service Account Key JSON
+      # Option A: Authentication via traditional Service Account Key JSON
       # Stores service account JSON key in secrets.GCP_SA_KEY
       - name: Google Auth (Service Account Key)
         uses: google-github-actions/auth@v2
-        if: "${{ secrets.GCP_SA_KEY != '' }}"
+        if: "${{ env.GCP_SA_KEY != '' }}"
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      # Option B (Recommended): Authentication via Workload Identity Federation (Keyless)
-      # Uncomment and configure if utilizing WIF instead of service account JSON keys:
-      # - name: Google Auth (Workload Identity Federation)
-      #   uses: google-github-actions/auth@v2
-      #   if: "${{ secrets.GCP_WIF_PROVIDER != '' }}"
-      #   with:
-      #     workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
-      #     service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
+      # Option B: Authentication via Workload Identity Federation (Keyless)
+      # Stores provider and service account in secrets
+      - name: Google Auth (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        if: "${{ env.GCP_WIF_PROVIDER != '' }}"
+        env:
+          GCP_WIF_PROVIDER: ${{ secrets.GCP_WIF_PROVIDER }}
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
 
       # =========================================================================
       # Build, Publish, & Deploy Pipeline:
