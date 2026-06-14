@@ -14,13 +14,20 @@ PROJECT_ROOT = Path(__file__).parent
 # Admin credentials
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "password123")
+ADMIN_EMAILS = os.getenv("ADMIN_EMAILS", "")  # Comma-separated admin emails
 
-# API Provider selection ("anthropic" or "openrouter")
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openrouter")  # Default to direct Anthropic API
+# Firebase Authentication configuration
+FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY", "")
+FIREBASE_AUTH_ENABLED = bool(FIREBASE_API_KEY)
 
-# API keys
+# API Provider selection (e.g., "anthropic", "openrouter", "openai", "google", "groq")
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openrouter")
+
+# API keys and URLs
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+LLM_API_KEY = os.getenv("LLM_API_KEY", os.getenv("OPENROUTER_API_KEY", ""))
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1")
 
 # Data storage configuration
 DATA_PROVIDER = os.getenv("DATA_PROVIDER", "local")  # "local" or "google"
@@ -106,6 +113,7 @@ OPENROUTER_MODEL_VISION_FREE = "google/gemini-2.0-flash:free"
 OPENROUTER_MODEL_MAIN_PAID = "anthropic/claude-3.5-haiku"
 OPENROUTER_MODEL_VISION_PAID = "anthropic/claude-3.5-sonnet"
 
+# Determine model names based on provider and tier
 if LLM_PROVIDER == "openrouter":
     if USE_FREE_MODELS:
         LLM_MODEL_MAIN = OPENROUTER_MODEL_MAIN_FREE
@@ -116,6 +124,14 @@ if LLM_PROVIDER == "openrouter":
 else:
     LLM_MODEL_MAIN = ANTHROPIC_MODEL_MAIN
     LLM_MODEL_VISION = ANTHROPIC_MODEL_VISION
+
+# Direct environment variable overrides for custom model flexibility
+ENV_MODEL_MAIN = os.getenv("LLM_MODEL_MAIN")
+ENV_MODEL_VISION = os.getenv("LLM_MODEL_VISION")
+if ENV_MODEL_MAIN:
+    LLM_MODEL_MAIN = ENV_MODEL_MAIN
+if ENV_MODEL_VISION:
+    LLM_MODEL_VISION = ENV_MODEL_VISION
 
 # OpenRouter settings (if using OpenRouter provider)
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"

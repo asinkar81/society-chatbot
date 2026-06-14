@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List
 import re
 import config
-from utils.auth import show_login_page, logout
+from utils.auth import show_login_page, logout, get_user_role
 from utils.chat_manager import ChatManager
 from utils.converters import get_fy_string, get_fy_from_date, compute_outstanding_as_of, get_payment_history, get_previous_invoices, number_to_words_inr, clean_payment_details
 from data_providers.local_excel_provider import LocalExcelDataProvider
@@ -87,6 +87,10 @@ elif not st.session_state.authenticated:
     show_login_page()
     st.stop()
 
+# Set role based on username
+if "role" not in st.session_state or st.session_state.username:
+    st.session_state.role = get_user_role(st.session_state.username)
+
 # Initialize agents
 agents = init_agents()
 data_provider = agents["data_provider"]
@@ -105,11 +109,18 @@ def main():
     # Sidebar navigation
     with st.sidebar:
         st.title("🏘️ Society Management")
-        st.caption(f"Welcome, {st.session_state.username}!")
+        role_display = getattr(st.session_state, "role", "member")
+        st.caption(f"Welcome, {st.session_state.username}! ({role_display.capitalize()})")
+
+        # Role-based Navigation Options
+        if role_display == "admin":
+            nav_options = ["Chat", "Dashboard", "Settings", "Help"]
+        else:
+            nav_options = ["Chat", "Help"]
 
         page = st.radio(
             "Navigation",
-            ["Chat", "Dashboard", "Settings", "Help"],
+            nav_options,
             key="page_nav",
         )
 
@@ -118,15 +129,18 @@ def main():
         if st.button("🚪 Logout", use_container_width=True):
             logout()
 
-    # Route to pages
+    # Route to pages (double-guard role permissions)
     if page == "Chat":
         show_chat_page()
-    elif page == "Dashboard":
+    elif page == "Dashboard" and role_display == "admin":
         show_dashboard_page()
-    elif page == "Settings":
+    elif page == "Settings" and role_display == "admin":
         show_settings_page()
     elif page == "Help":
         show_help_page()
+    else:
+        # Fallback for unauthorized pages
+        show_chat_page()
 
 
 def save_uploaded_file(uploaded_file) -> Path:
@@ -3686,6 +3700,16 @@ def process_user_input(user_input: str) -> str:
         try:
             router = get_router()
             routing_result = router.route(user_input)
+            
+            # Shield check for out-of-scope query
+            if routing_result.get("agent") == "out_of_scope":
+                st.warning("⚠️ **Out of Scope Request**")
+                return (
+                    "I am a virtual assistant designed strictly for the Weekend Ville Co-operative Housing "
+                    "Society management. I can only assist with tasks like invoices, payments, statements, "
+                    "ledger lookups, and administrative settings. Please ask a society-related question."
+                )
+            
             st.info(f"🤖 **Intent**: {routing_result['intent']} (confidence: {routing_result['confidence']:.0%})")
             if routing_result.get("clarification_needed") and routing_result.get("agent") is None:
                 return f"❓ {routing_result.get('clarification_question', 'I need more information to help you.')}\n\n**Suggested actions:**\n- Generate invoices\n- Process payments\n- View ledgers\n- Manage admin settings"

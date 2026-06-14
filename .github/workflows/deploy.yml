@@ -1,0 +1,96 @@
+name: Build and Deploy to Cloud Run
+
+on:
+  push:
+    branches:
+      - main  # Deploy on pushes to the main branch
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  REGION: us-central1               # Update to your GCP region if different
+  SERVICE_NAME: society-chatbot     # Name of your Cloud Run service
+  REPOSITORY_NAME: society-repo     # Name of your Artifact Registry repository
+
+jobs:
+  deploy:
+    name: Build & Deploy
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: 'read'
+      id-token: 'write' # Required for Workload Identity Federation
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # =========================================================================
+      # Authentication options:
+      # =========================================================================
+      
+      # Option A (Default): Authentication via traditional Service Account Key JSON
+      # Stores service account JSON key in secrets.GCP_SA_KEY
+      - name: Google Auth (Service Account Key)
+        uses: google-github-actions/auth@v2
+        if: "${{ secrets.GCP_SA_KEY != '' }}"
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      # Option B (Recommended): Authentication via Workload Identity Federation (Keyless)
+      # Uncomment and configure if utilizing WIF instead of service account JSON keys:
+      # - name: Google Auth (Workload Identity Federation)
+      #   uses: google-github-actions/auth@v2
+      #   if: "${{ secrets.GCP_WIF_PROVIDER != '' }}"
+      #   with:
+      #     workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+      #     service_account: ${{ secrets.GCP_WIF_SERVICE_ACCOUNT }}
+
+      # =========================================================================
+      # Build, Publish, & Deploy Pipeline:
+      # =========================================================================
+
+      # Set up Google Cloud SDK
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      # Configure Docker auth for Google Artifact Registry
+      - name: Configure Docker Auth
+        run: |
+          gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      # Build and push the Docker image
+      - name: Build and Push Docker Container
+        run: |
+          IMAGE_TAG="${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY_NAME }}/${{ env.SERVICE_NAME }}:${{ github.sha }}"
+          docker build -t $IMAGE_TAG .
+          docker push $IMAGE_TAG
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+
+      # Deploy to Google Cloud Run
+      - name: Deploy to Cloud Run
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: ${{ env.SERVICE_NAME }}
+          region: ${{ env.REGION }}
+          image: ${{ env.IMAGE_TAG }}
+          # Configure Free Tier limits, GCS FUSE volume mount, and parameters
+          flags: |
+            --min-instances=0
+            --max-instances=1
+            --cpu=1
+            --memory=512Mi
+            --allow-unauthenticated
+            --add-volume=name=data-volume,type=cloud-storage,bucket=${{ secrets.GCP_DATA_BUCKET }}
+            --add-volume-mount=volume=data-volume,mount-path=/app/data
+          # Pass secrets dynamically as environment variables (no .env needed in production)
+          env_vars: |
+            LLM_PROVIDER=${{ secrets.LLM_PROVIDER }}
+            LLM_API_KEY=${{ secrets.LLM_API_KEY }}
+            LLM_BASE_URL=${{ secrets.LLM_BASE_URL }}
+            LLM_MODEL_MAIN=${{ secrets.LLM_MODEL_MAIN }}
+            LLM_MODEL_VISION=${{ secrets.LLM_MODEL_VISION }}
+            FIREBASE_API_KEY=${{ secrets.FIREBASE_API_KEY }}
+            BYPASS_LOGIN=false
+            ADMIN_USERNAME=${{ secrets.ADMIN_USERNAME }}
+            ADMIN_PASSWORD=${{ secrets.ADMIN_PASSWORD }}
+            ADMIN_EMAILS=${{ secrets.ADMIN_EMAILS }}

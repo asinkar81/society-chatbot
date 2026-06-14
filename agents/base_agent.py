@@ -76,23 +76,27 @@ def _parse_and_call(func, input_str: str) -> str:
 def create_llm(model: str, use_vision: bool = False):
     """
     Create LLM instance based on configured provider.
-    For OpenRouter: uses ChatOpenAI (OpenAI-compatible endpoint /v1/chat/completions),
-    which all models support. For direct Anthropic: uses ChatAnthropic.
+    For OpenAI-compatible providers (like OpenRouter, Google Gemini compatibility, DeepSeek):
+    uses ChatOpenAI. For direct Anthropic: uses ChatAnthropic.
     """
-    if config.LLM_PROVIDER == "openrouter":
+    if config.LLM_PROVIDER != "anthropic":
         from langchain.chat_models import ChatOpenAI
-        if not config.OPENROUTER_API_KEY:
-            raise ValueError("OPENROUTER_API_KEY environment variable not set")
+        if not config.LLM_API_KEY:
+            raise ValueError("LLM_API_KEY (or OPENROUTER_API_KEY) environment variable not set")
+        
+        # Build headers (optional site details for openrouter, safe for others)
+        headers = {}
+        if config.LLM_BASE_URL and "openrouter" in config.LLM_BASE_URL:
+            headers["HTTP-Referer"] = getattr(config, "OPENROUTER_SITE_URL", "http://localhost:8501")
+            headers["X-Title"] = getattr(config, "OPENROUTER_SITE_NAME", "Society Chatbot")
+            
         return ChatOpenAI(
             model=model,
             temperature=config.LLM_TEMPERATURE,
             max_tokens=config.LLM_MAX_TOKENS,
-            api_key=config.OPENROUTER_API_KEY,
-            base_url=config.OPENROUTER_BASE_URL,
-            default_headers={
-                "HTTP-Referer": config.OPENROUTER_SITE_URL,
-                "X-Title": config.OPENROUTER_SITE_NAME,
-            },
+            api_key=config.LLM_API_KEY,
+            base_url=config.LLM_BASE_URL,
+            default_headers=headers if headers else None,
         )
     else:
         from langchain_anthropic import ChatAnthropic
@@ -137,6 +141,31 @@ class BaseAgent(ABC):
             name = tool_func.__name__
         if description is None:
             description = tool_func.__doc__ or ""
+
+        # Check if this tool is a write tool and needs admin protection
+        is_write_tool = name not in (
+            "get_member_details",
+            "extract_payment",
+            "get_member_ledger",
+            "get_outstanding_summary",
+            "get_current_settings",
+            "get_member_statement_summary"
+        )
+
+        if is_write_tool:
+            orig_tool_func = tool_func
+            def admin_shield_wrapper(*args, **kwargs):
+                import streamlit as st
+                role = "admin"
+                try:
+                    if st.session_state and st.session_state.get("authenticated", False):
+                        role = st.session_state.get("role", "member")
+                except Exception:
+                    pass
+                if role != "admin":
+                    return "Error: Permission Denied. You do not have administrator privileges required to perform this action."
+                return orig_tool_func(*args, **kwargs)
+            tool_func = admin_shield_wrapper
 
         # LangChain Tool passes Action Input as a single string.
         # Wrap multi-param functions to parse the input string.
