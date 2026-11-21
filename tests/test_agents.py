@@ -1,8 +1,9 @@
 """
 Comprehensive test suite for the Society Management Chatbot
 """
+import os
 import sys
-sys.path.insert(0, '/Users/ashutoshsinkar/society-chatbot')
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import unittest
 from pathlib import Path

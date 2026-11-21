@@ -4,7 +4,7 @@
 
 ### Step 1: Install Dependencies
 ```bash
-cd /Users/ashutoshsinkar/society-chatbot
+cd society-chatbot
 pip install -r requirements.txt
 ```
 

@@ -127,7 +127,7 @@ tests/test_agents.py        230 lines   Unit tests for all major components
 
 ### 1. Install & Configure (2 minutes)
 ```bash
-cd /Users/ashutoshsinkar/society-chatbot
+cd society-chatbot
 pip install -r requirements.txt
 cp .env.example .env
 # Add your Anthropic API key to .env
@@ -419,7 +419,7 @@ Your **Society Management Chatbot** is production-ready and waiting to automate 
 
 ```bash
 # Setup
-cd /Users/ashutoshsinkar/society-chatbot
+cd society-chatbot
 pip install -r requirements.txt
 python init_sample_data.py
 

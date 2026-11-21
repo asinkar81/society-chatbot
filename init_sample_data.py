@@ -1,8 +1,9 @@
 """
 Initialize sample data for testing
 """
+import os
 import sys
-sys.path.insert(0, '/Users/ashutoshsinkar/society-chatbot')
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
 from data_providers.local_excel_provider import LocalExcelDataProvider
 import config

@@ -7,8 +7,9 @@ Comprehensive test suite for all new features:
 - Filter Helpers (fy_date_range, filter_entries, get_available_fys)
 - Payment References
 """
+import os
 import sys
-sys.path.insert(0, '/Users/ashutoshsinkar/society-chatbot')
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import unittest
 import tempfile

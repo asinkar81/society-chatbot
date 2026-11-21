@@ -4,7 +4,7 @@
 
 Your **Agentic AI Society Management Chatbot** has been fully implemented and is ready for use!
 
-**Location**: `/Users/ashutoshsinkar/society-chatbot`
+**Location**: `society-chatbot`
 
 **Status**: ✅ MVP Complete - Production Ready
 
@@ -50,7 +50,7 @@ Your **Agentic AI Society Management Chatbot** has been fully implemented and is
 
 ### Step 1: Install Dependencies
 ```bash
-cd /Users/ashutoshsinkar/society-chatbot
+cd society-chatbot
 pip install -r requirements.txt
 ```
 
@@ -461,7 +461,7 @@ All the infrastructure is in place for:
 
 ### Start Using Today!
 ```bash
-cd /Users/ashutoshsinkar/society-chatbot
+cd society-chatbot
 streamlit run main.py
 ```
 
@@ -474,7 +474,7 @@ Login and start managing your society with intelligent agents! 🤖
 | Property | Value |
 |----------|-------|
 | **Project Name** | Society Management Agentic Chatbot |
-| **Location** | `/Users/ashutoshsinkar/society-chatbot` |
+| **Location** | `society-chatbot` |
 | **Status** | ✅ MVP Complete |
 | **Version** | 1.0 |
 | **Created** | May 11, 2026 |
