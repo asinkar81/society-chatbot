@@ -35,12 +35,12 @@ All society withdrawals from Union Bank of India have been deduplicated, cross-v
 ┌──────────────────────────────────────────────┬──────────────┬──────────────┬──────────────┬──────────────┬──────────────┬────────────────┐
 │ Expense Category                             │   FY 22-23   │   FY 23-24   │   FY 24-25   │   FY 25-26   │   FY 26-27*  │  Total Spends  │
 ├──────────────────────────────────────────────┼──────────────┼──────────────┼──────────────┼──────────────┼──────────────┼────────────────┤
-│ 1. Security & Caretaker Salary (Pandit/Shiv) │  ₹1,21,000.00│  ₹1,44,000.00│  ₹1,44,000.00│  ₹1,70,500.00│   ₹83,750.00 │    ₹6,63,250.00│
+│ 1. Security & Caretaker Salary (Pandit/Shiv) │  ₹1,21,000.00│  ₹1,44,000.00│  ₹1,44,000.00│  ₹1,68,000.00│   ₹77,000.00 │    ₹6,54,000.00│
 │ 2. Electricity & Utilities (MSEDCL/MSEB)     │        ₹0.00 │   ₹33,360.00 │        ₹0.00 │  ₹1,30,000.00│  ₹3,69,097.00 │    ₹5,32,457.00│
 │ 3. Investments & Term Deposits (FD Reserve)  │        ₹0.00 │        ₹0.00 │        ₹0.00 │        ₹0.00 │  ₹1,00,000.00 │    ₹1,00,000.00│
-│ 4. Site Maintenance & Member Reimbursements  │    ₹2,220.00 │    ₹4,844.00 │    ₹9,700.00 │   ₹41,205.00 │        ₹0.00 │     ₹57,969.00│
-│ 5. Repairs & Infrastructure (Civil/Pipes)    │   ₹26,150.00 │   ₹26,000.00 │        ₹0.00 │        ₹0.00 │        ₹0.00 │     ₹52,150.00│
-│ 6. Accounting & Statutory Audit Fees         │        ₹0.00 │        ₹0.00 │   ₹18,450.00 │   ₹14,140.00 │        ₹0.00 │     ₹32,590.00│
+│ 4. Site Maintenance & Member Reimbursements  │    ₹2,220.00 │    ₹4,844.00 │    ₹9,700.00 │   ₹46,445.00 │    ₹6,750.00 │     ₹69,959.00│
+│ 5. Repairs & Infrastructure (Civil/Pipes)    │   ₹26,150.00 │   ₹26,000.00 │        ₹0.00 │    ₹3,200.00 │        ₹0.00 │     ₹55,350.00│
+│ 6. Accounting & Statutory Audit Fees         │        ₹0.00 │        ₹0.00 │   ₹18,450.00 │    ₹8,200.00 │        ₹0.00 │     ₹26,650.00│
 │ 7. Statutory Taxes (Tashildar Mulshi NA Tax) │        ₹0.00 │    ₹7,318.00 │   ₹14,586.00 │    ₹7,218.00 │        ₹0.00 │     ₹29,122.00│
 │ 8. Capital Asset (Borewell Motor Pump)       │        ₹0.00 │        ₹0.00 │        ₹0.00 │   ₹13,916.00 │        ₹0.00 │     ₹13,916.00│
 │ 9. Bank & Administrative SMS/MICR Charges    │        ₹5.90 │       ₹15.94 │       ₹18.60 │      ₹375.84 │      ₹133.05 │        ₹549.33│
@@ -58,10 +58,11 @@ All society withdrawals from Union Bank of India have been deduplicated, cross-v
    - **The Actual Root Cause:** The society did **not receive any electricity bills from MSEDCL for 3 consecutive years**. When MSEDCL finally issued the billing, it arrived as a massive consolidated bill containing 3 years of accumulated arrears, heavy delayed payment surcharges (DPC), defaulting interest, and penalty charges.
    - **Tariff Classification:** The connection **is billed as per Residential rates** (NOT Commercial rates).
    - **Meter Ownership & Present Status:** The electricity meter was originally registered in the developer/individual name and has not yet been formally transferred to the Society. However, the Society has **now cleared 100% of all arrears, penalties, and outstanding dues** to MSEDCL. Having achieved zero arrears, the Society is now fully eligible and entitled to complete the statutory transfer of ownership into the Society’s name.
-2. **Security & Caretaker (₹6.63 Lakhs - 44.8% of Total Spends):**
+2. **Security & Caretaker (₹6.54 Lakhs - 44.1% of Total Spends):**
    - Shivaji Maroti Vaikar served until late 2022.
    - Pandit Hiraji Vairal has been our dedicated caretaker/watchman since December 2022.
-   - Compensation base: ₹12,000/month (₹1,44,000/year) plus annual Diwali bonus (₹12,000) and occasional maintenance disbursements, resulting in ~₹1.70L in FY 25-26.
+   - Compensation base: ₹12,000/month (₹1,44,000/year) plus annual Diwali bonus (₹12,000), resulting in clean 54 salary/bonus disbursements totaling ₹6.54 Lakhs.
+   - *Audit Correction via Cheque Counterfoils:* Prior drafts counted ₹9,250 of non-salary cheques in caretaker costs; counterfoil inspection proved these were for SGM food (₹700), conveyance for MSEDCL bills (₹750), lawn mower repairs & cable (₹3,000), MCB electrical switches & grass cutting petty cash (₹3,000), and site supplies (₹1,800).
 3. **Accountant's "Suspense" Entries (₹43,705 in FY 25-26):**
    - In `EXPENSES DETAILS.pdf`, the external accountant dumped all committee reimbursements into a temporary "Suspense Ledger" totaling ₹43,705.
    - **In Society Records**, every single one of these payments has been verified with underlying bills and correctly classified under *Site Maintenance & Supplies* (grass cutter fuel, plumbing valves, PVC fittings, gate welding) and *Capital Assets* (borewell motor pump).
@@ -280,7 +281,7 @@ To place society operations on a permanent, debt-free, professional footing, the
 │ 3. Regularized MSEB Electricity Bill          │ ₹3,69,000 (FY27)│ ₹1,44,000 / yr  │ Post arrears clearance & meter transfer:   │
 │                                               │                 │                 │ ₹12,000/mo (drops to ₹3k/mo post-solar).   │
 │ 4. Statutory Taxes (NA Tax & Gram Panchayat)  │  ₹14,586 / yr   │  ₹16,000 / yr   │ Mulshi Tashildar NA Tax & Panchayat cess.  │
-│ 5. Statutory Audit & Account Writing          │  ₹14,140 / yr   │  ₹18,000 / yr   │ Statutory Auditor ₹5k + Walunj Accts ₹13k. │
+│ 5. Statutory Audit & Account Writing          │   ₹8,200 / yr   │  ₹18,000 / yr   │ Statutory Auditor ₹5k + Walunj Accts ₹13k. │
 │ 6. Seasonal Grass Cutting & Bush Clearing     │   ₹6,572 / yr   │  ₹24,000 / yr   │ 3 seasonal trimming cycles (Monsoon/Post). │
 │ 7. Water Supply & Pump Routine Maintenance    │  ₹25,435 / yr   │  ₹25,000 / yr   │ Valve replacements, grease, pipe repairs.  │
 │ 8. Common Lighting Consumables & Repairs      │   ₹4,580 / yr   │  ₹15,000 / yr   │ LED street light replacements & cabling.   │
