@@ -5,6 +5,7 @@ The LLM plans and executes a sequence of tool calls, passing outputs between ste
 import json
 import re
 import csv
+import pandas as pd
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional
@@ -63,18 +64,19 @@ def _check_duplicate_payment(ledger: list, transaction_id: str, date: str, amoun
         return None
     txn_clean = str(transaction_id).strip()
     for entry in ledger:
-        existing_txn = str(entry.get("Transaction_ID", "") or "").strip()
-        if not existing_txn:
-            continue
-        if existing_txn != txn_clean:
+        existing_credit = _safe_float(entry.get("Credit"))
+        if abs(existing_credit - amount) > 0.01:
             continue
         existing_date = str(entry.get("Date", "") or "").strip()
         if existing_date != str(date).strip():
             continue
-        existing_credit = _safe_float(entry.get("Credit"))
-        if abs(existing_credit - amount) > 0.01:
-            continue
-        return entry
+        existing_txn = str(entry.get("Transaction_ID", "") or "").strip()
+        if existing_txn and existing_txn.upper() == txn_clean.upper():
+            return entry
+        existing_part = str(entry.get("Particulars", "") or "")
+        existing_desc = str(entry.get("Description", "") or "")
+        if len(txn_clean) >= 6 and (txn_clean.upper() in existing_part.upper() or txn_clean.upper() in existing_desc.upper()):
+            return entry
     return None
 
 
@@ -1868,7 +1870,7 @@ class OrchestratorAgent(BaseAgent):
                                     identifiers.append((token, "PAYEE_NAME"))
 
                 # MOBFT: extract name after "from: "
-                mobft_match = re.search(r'from:\s*([A-Za-z\s.]+?)(?:/|\s+\d)', particulars)
+                mobft_match = re.search(r'(?:from:\s*|MOBFT/)([A-Za-z\s.]+?)(?:/|\s+\d|$)', particulars)
                 if mobft_match:
                     name_raw = mobft_match.group(1).strip()
                     for t in re.split(r'[\s.]+', name_raw):
@@ -2881,6 +2883,9 @@ class OrchestratorAgent(BaseAgent):
             matched_results = []
             unmatched_entries = []
             pending_ledger = []
+            pending_accounts_status = {}
+            existing_ledger = self.data_provider.get_member_ledger_all() or []
+            reconciled_vchs = set()
 
             import importlib
             import tools.pdf_parser
@@ -2912,6 +2917,70 @@ class OrchestratorAgent(BaseAgent):
                     auto_income += 1
                     continue
 
+                # ── Step 1: Check for existing ledger entry match (reconcile manual/existing entries) ──
+                existing_match = None
+                for l in existing_ledger:
+                    vch = int(l.get("Vch_No") or 0)
+                    if vch in reconciled_vchs:
+                        continue
+                    l_cr = _safe_float(l.get("Credit"))
+                    if abs(l_cr - amount) > 0.01:
+                        continue
+                    l_date = str(l.get("Date", "") or "").strip()
+                    if l_date != date:
+                        continue
+
+                    l_tid = str(l.get("Transaction_ID", "") or "").strip()
+                    l_part = str(l.get("Particulars", "") or "")
+                    l_desc = str(l.get("Description", "") or "")
+
+                    # Match by exact Transaction_ID or UTR embedded in particulars/description (len >= 6)
+                    if txn_id and l_tid and txn_id.upper() == l_tid.upper():
+                        existing_match = l
+                        break
+                    if txn_id and len(txn_id) >= 6 and (txn_id.upper() in l_part.upper() or txn_id.upper() in l_desc.upper()):
+                        existing_match = l
+                        break
+
+                if existing_match:
+                    mid = int(existing_match.get("Member_ID") or 0)
+                    vch_no = int(existing_match.get("Vch_No") or 0)
+                    reconciled_vchs.add(vch_no)
+                    matched_member = next((m for m in members if int(m.get("ID", 0)) == mid), None)
+                    m_name = matched_member.get("Plot_Owner_Name", "") if matched_member else ""
+                    m_plot = matched_member.get("Plot_No", "") if matched_member else existing_match.get("Plot_No", "")
+
+                    if not is_preview:
+                        updates = {}
+                        if txn_id:
+                            updates["Transaction_ID"] = txn_id
+                        cur_tt = str(existing_match.get("Transaction_Type") or "").upper()
+                        if (cur_tt in ("MANUAL", "NAN", "") or pd.isna(existing_match.get("Transaction_Type"))) and txn_type:
+                            updates["Transaction_Type"] = txn_type
+                        desc = str(existing_match.get("Description") or "")
+                        if "Bank Verified" not in desc:
+                            updates["Description"] = f"{desc} [Bank Verified]"
+                        if updates:
+                            self.data_provider.update_ledger_entry(mid, vch_no, updates)
+                        self.data_provider.update_accounts_entry(entry_id, {"Status": "Matched"})
+
+                    matched_results.append({
+                        "date": date,
+                        "amount": amount,
+                        "entry_id": entry_id,
+                        "member_name": m_name,
+                        "plot_no": m_plot,
+                        "member_id": mid,
+                        "receipt_id": f"Vch #{vch_no}",
+                        "reason": f"Already in Ledger (Vch #{vch_no}) — Bank Verified",
+                        "has_pdf": False,
+                        "particulars": particulars,
+                        "status": "matched",
+                        "reconciled": True,
+                        "existing_vch": vch_no,
+                    })
+                    continue
+
                 # Check forced assignment
                 forced_plot = forced_assignments.get(str(entry_id)) or forced_assignments.get(entry_id)
                 if forced_plot:
@@ -2922,7 +2991,7 @@ class OrchestratorAgent(BaseAgent):
                         best_score = 100
                     else:
                         if not is_preview:
-                            self.data_provider.update_accounts_entry(entry_id, {"Status": "Unmatched"})
+                            pending_accounts_status[entry_id] = "Unmatched"
                         unmatched_entries.append({
                             "date": date, "amount": amount, "particulars": particulars,
                             "txn_type": txn_type, "txn_id": txn_id, "entry_id": entry_id,
@@ -2965,12 +3034,64 @@ class OrchestratorAgent(BaseAgent):
                 if best_match and best_score >= 5 and amount:
                     mid = best_match["ID"]
 
+                    # Check if this matched member already has an unverified MANUAL ledger entry on same date & amount
+                    manual_match = None
+                    for l in existing_ledger:
+                        vch = int(l.get("Vch_No") or 0)
+                        if vch in reconciled_vchs:
+                            continue
+                        if int(l.get("Member_ID") or 0) != mid:
+                            continue
+                        l_cr = _safe_float(l.get("Credit"))
+                        if abs(l_cr - amount) > 0.01:
+                            continue
+                        l_date = str(l.get("Date", "") or "").strip()
+                        if l_date != date:
+                            continue
+                        if str(l.get("Transaction_Type") or "").upper() == "MANUAL":
+                            manual_match = l
+                            break
+
+                    if manual_match:
+                        vch_no = int(manual_match.get("Vch_No") or 0)
+                        reconciled_vchs.add(vch_no)
+                        if not is_preview:
+                            updates = {}
+                            if txn_id:
+                                updates["Transaction_ID"] = txn_id
+                            cur_tt = str(manual_match.get("Transaction_Type") or "").upper()
+                            if (cur_tt in ("MANUAL", "NAN", "") or pd.isna(manual_match.get("Transaction_Type"))) and txn_type:
+                                updates["Transaction_Type"] = txn_type
+                            desc = str(manual_match.get("Description") or "")
+                            if "Bank Verified" not in desc:
+                                updates["Description"] = f"{desc} [Bank Verified]"
+                            if updates:
+                                self.data_provider.update_ledger_entry(mid, vch_no, updates)
+                            self.data_provider.update_accounts_entry(entry_id, {"Status": "Matched"})
+
+                        matched_results.append({
+                            "date": date,
+                            "amount": amount,
+                            "entry_id": entry_id,
+                            "member_name": best_match.get("Plot_Owner_Name", ""),
+                            "plot_no": best_match.get("Plot_No", ""),
+                            "member_id": mid,
+                            "receipt_id": f"Vch #{vch_no}",
+                            "reason": f"Already in Ledger (Vch #{vch_no}) — Bank Verified",
+                            "has_pdf": False,
+                            "particulars": particulars,
+                            "status": "matched",
+                            "reconciled": True,
+                            "existing_vch": vch_no,
+                        })
+                        continue
+
                     fy_local = get_fy_from_date(date)
                     vch_no = self.data_provider.get_next_voucher_number()
                     receipt_id = f"{fy_local}-{str(vch_no).zfill(3)}"
 
                     if not is_preview:
-                        self.data_provider.update_accounts_entry(entry_id, {"Status": "Matched"})
+                        pending_accounts_status[entry_id] = "Matched"
                         pending_ledger.append((mid, {
                             "Date": date,
                             "Particulars": f"By {particulars[:60]}",
@@ -3065,7 +3186,7 @@ class OrchestratorAgent(BaseAgent):
                     })
                 else:
                     if not is_preview:
-                        self.data_provider.update_accounts_entry(entry_id, {"Status": "Unmatched"})
+                        pending_accounts_status[entry_id] = "Unmatched"
                     unmatched_entries.append({
                         "date": date,
                         "amount": amount,
@@ -3076,8 +3197,11 @@ class OrchestratorAgent(BaseAgent):
                         "status": "unmatched",
                     })
 
-            if not is_preview and pending_ledger:
-                self.data_provider.add_ledger_entries(pending_ledger)
+            if not is_preview:
+                if pending_ledger:
+                    self.data_provider.add_ledger_entries(pending_ledger)
+                for eid, stat in pending_accounts_status.items():
+                    self.data_provider.update_accounts_entry(eid, {"Status": stat})
 
             if is_preview:
                 return _json.dumps({

@@ -131,6 +131,62 @@
   - Staging folder (`data/staging/whatsapp/`) collects PDFs for drag-drop into WhatsApp Web
   - Messages include Weekend Ville Society context + Summary table as plain text
   - Communication logged with `template_type="whatsapp"`
+- **Table Grid PDF Extraction & Header Stripping Fix (`tools/pdf_parser.py`)**:
+  - Identified table grid structure in digital statements (Union Bank of India statements from March 2026 onwards).
+  - Implemented `_extract_table_grid_lines()` and `has_table_grid()`: extracts cells directly from table boundaries, completely eliminating multi-line cell baseline shifts where payee names bled into previous entries (e.g. Ashutosh Vijaykumar bleeding into Rama Salvi).
+  - Tagged table grid withdrawals with `Dr` and deposits with `Cr` during extraction so first-row withdrawals/deposits calculate correctly without ambiguity.
+  - Added header metadata pattern filtering in `_strip_non_transaction()` and `clean_entries()` (`DETAILS OF STATEMENT`, `Customer ID`, `Branch`, `IFSC`, `MICR`, `KYC`, etc.) to prevent bank statement metadata from leaking into first-row transaction particulars.
+  - Added 100% backward-compatible fallback to character extraction for legacy passbook/printed statements without table grids (verified statements 1-5 continue to match 100%).
+  - Added automated unit tests in `tests/test_pdf_parser.py` (`test_has_table_grid_detection`, `test_table_grid_multiline_isolation`, `test_extract_text_backward_compatibility`, `test_batch_statements_june_to_oct_2026`). Full test suite passes 156/156 tests.
+  - Restored `data/society_data.xlsx` from pre-parse backup `society_data_20261121_155200_pre_parse.xlsx`, resetting Accounts (441 rows) and Ledger (603 rows) to clean state before June statement ingestion.
+  - Verified batch parsing of statements from `9_June_26.pdf` through `13_Oct_26.pdf`: all 60 entries across 5 months parsed with zero `Balance_Check` discrepancies, zero header bleed, and mathematical continuity from ₹2,86,627.72 down to ₹1,67,710.67.
+- **Auto-Reconcile & Retag for Manual Ledger Entries (`orchestrator_agent.py` & `main.py`)**:
+  - Automatically cross-references pending Accounts statement deposits against existing Ledger entries by `Date + Amount + (Transaction_ID or UTR inside Particulars/Description)` or `Member + Date + Amount + MANUAL`.
+  - In Preview mode, flags entries as `reconciled` with `🔗` icon and `"Already in Ledger (Vch #{vch}) — Bank Verified"`.
+  - Added unit test `test_reconcile_existing_manual_ledger_entry` in `tests/test_comprehensive.py`. Full test suite passes 157/157 tests.
+- **Reconciliation Report & Balance Fixes (`main.py`, `tools/pdf_parser.py`, `orchestrator_agent.py`)**:
+  - Replaced naive continuous sequence check with **Voucher Uniqueness Check** (`FAIL` only if duplicate vouchers exist; currently 0 duplicates) and an informational **Voucher Sequence Audit** (`OK`, explaining FY series block jumps and auto-split parent removals).
+  - Enhanced MOBFT regex in `tools/pdf_parser.py` and `agents/orchestrator_agent.py` to match `MOBFT/<name>/...` formats in addition to `from: <name>`.
+  - Added transactional atomicity to `create_ledger_from_accounts`: tracks `pending_accounts_status` and applies `update_accounts_entry` only after `add_ledger_entries(pending_ledger)` completes, preventing partial failures from leaving accounts entries marked "Matched" without ledger entries.
+  - Resolved FY 26-27 balance mismatch by creating missing entries for Plot 10 (Entry 442) and Plot 41 (Entry 444), bringing FY 26-27 to 100% balance (`₹272,000.00 == ₹272,000.00 ✅`). All 6 financial years now pass balance reconciliation.
+  - Added automated unit tests `test_extract_search_tokens_mobft` and `test_mobft_matching_and_atomicity`. Full test suite passes 159/159 tests.
+- **Accounting-Sound Duplicate Detection Engine (`utils/matching.py` & `main.py`)**:
+  - Replaced naive `_normalize_particulars` grouping which previously generated **55 false positive duplicate groups** by grouping identical particulars without checking plot, date, amount, or transaction type (e.g., flagging standard annual invoices for 41 different plots as one duplicate group, legitimate multi-plot split entries, and recurring annual payments across years).
+  - Implemented `extract_txn_ref(e)` to safely extract genuine bank transaction references/UTRs while ignoring split references and stop words.
+  - Implemented `scan_ledger_duplicates(ledger)` in `utils/matching.py` with 3 accounting-sound checks:
+    1. **Same-Plot Duplicate**: Same plot + date + amount + direction, unless entries have distinct verified UTRs (permits legitimate same-day multiple payments).
+    2. **Cross-Plot UTR Collision**: Same real alphanumeric bank UTR assigned to multiple plots, strictly excluding intentional `SPLIT` entries.
+    3. **Duplicate Invoices**: Same plot billed more than once within the same Financial Year.
+  - Updated UI in `main.py`: cleanly differentiates un-run (`None`), zero duplicates found (`✅ No duplicates found! All ledger entries are verified.`), and genuine duplicates found, while preserving per-row delete and undo-split capabilities.
+  - Added `TestLedgerDuplicateScanner` unit tests in `tests/test_comprehensive.py`. Full test suite passes 165/165 tests.
+  - Verified on live database: drops from 55 false positive groups to 0 duplicates.
+- **Defaulters Report Audit & Multi-Category Enhancement (`main.py`)**:
+  - Investigated why Plot 33 (Mrs. Sangita Sunil Varpe) was missing from the Defaulters report: Plot 33 is NOT a defaulter. Plot 33 has ₹67,000 in credits vs ₹65,000 in debits across all 6 financial years, having a **net surplus of +₹2,000.00** (advance paid).
+  - Identified 4 anomalies in Defaulters report: silent omission of non-defaulters without explanation, lack of categorization filter, missing high-level summary KPIs, and redundant N+1 Excel ledger reads (82 reads per load).
+  - Enhanced `main.py`: aggregated ledger in a single memory pass with `_s()` NaN safety, added 4 KPI metric cards (🔴 37 Defaulters: ₹11,35,999 due | 🟢 2 In Surplus: ₹3,000 | ⚪ 2 Settled | 📋 41 Total Plots), added an interactive view filter radio (`Defaulters`, `In Surplus / Advance`, `Settled`, `All Plots`), and added an explanatory caption in the Defaulters view clarifying that 4 plots have no pending dues (Plots 16 and 33 in surplus; Plots 26 and 30 settled).
+- **Comprehensive 41-Plot Ledger Audit & Anomaly Resolution**:
+  - Cross-referenced all 41 accountant plot PDFs in `data/Accountant Ledgers/` against our database ledger.
+  - Proved ₹18,000 Anshul Rathod payment was 100% correctly credited to Plots 5 & 20; accountant erroneously credited it to Ashutosh Pujari (Plots 28 & 29).
+  - Confirmed phone 9960184874 belongs to Plot 18 (Mrs. Manjiri Gavande); master record for Pujari updated with 9962132503.
+  - Verified user moved Vch #920 (₹18k) from Plot 27 to Plot 36, and Vch #683 (₹5k `CONTINUUM`) from Plot 18 to Plot 19.
+  - Tagged `NEFT:CONTINUUM` to Plot 19 in `Payment_References`, soft-deleted duplicate, and hardened `LocalExcelDataProvider.find_member_by_identifier()` against soft-deleted entries.
+  - Forensic investigation of Plot 8 vs 37 misassignment: branch token `SHAN` (HDFC Shanipar) misattributed to Shantanu Kulkarni; Ajaykumar's phone verified for Plot 37.
+  - Resolved `ValueError: cannot convert float NaN to integer` in `local_excel_provider.py:1080` by cleaning `Split_Rules` sheet and adding `pd.isna()` type guards.
+- **Bank Debits Recording & Society Expenses Dashboard (`main.py` & `local_excel_provider.py`)**:
+  - Extracted, deduplicated, and classified all **129 genuine bank debit entries** (totaling **₹14,82,003.33**) from `Accounts` into `Expenses` sheet across 5 financial years (FY 22-23 to FY 26-27).
+  - Implemented `sync_accounts_debits_to_expenses()` in `LocalExcelDataProvider` to scan and auto-classify any future debit transactions.
+  - Upgraded `get_expense_summary(fy)` to support financial year filtering.
+  - Completely revamped `tab_expenses` in `main.py`: added 4 metric KPI cards, an interactive multi-year FY breakdown pivot matrix, search and category/FY filter drill-downs, a "🔄 Sync Bank Debits" button, and manual expense recording. Full test suite passes 165/165 tests.
+- **Treasurer's AGM Financial Report, Expense Analysis & Next FY Budget Artifacts**:
+  - Created and finalized [agm_audit_validation_report.md](file:///Users/ashutoshsinkar/.gemini/antigravity/brain/db392fa2-4f19-47cd-a060-f89008858d15/agm_audit_validation_report.md) with two-report publishing strategy, 41-plot audit reconciliation, Builder WhatsApp Nov 2021 salary evidence, and member reimbursement policy.
+  - Created, revised, and secured user approval on [treasurer_budget_and_expense_analysis.md](file:///Users/ashutoshsinkar/.gemini/antigravity/brain/db392fa2-4f19-47cd-a060-f89008858d15/treasurer_budget_and_expense_analysis.md):
+    * Audited 5-year spend trends (Salaries ₹6.63L, MSEB ₹5.32L, Reserves ₹1.00L, Maintenance/Repairs ₹1.24L, Audit/Accts ₹32.6k, NA Tax ₹29.1k).
+    * Factual root cause of MSEB escalation: 3-year non-issuance of bills by MSEDCL resulting in accumulated arrears/penalties under residential rates; 100% of arrears now cleared and eligible for ownership transfer.
+    * 37-plot Defaulter Crisis (₹10.53 Lakhs unpaid dues, 60.6% collection efficiency, with 54.3% concentrated in 9 chronic defaulters).
+    * Statutory recovery framework under Section 154B-29 of Maharashtra Co-operative Societies Act, including detailed legal analysis on water regulation (immediate disconnection for non-essential water; due process with 15-day notice for domestic water).
+    * Operational Budget (OPEX) for Next FY (₹5.38 Lakhs / year): Caretaker Pandit hike to ₹14,000/mo, dedicated Society Property Manager @ ₹9,000/mo, regularized MSEB, and taxes.
+    * 3-Tier Prioritized Capital Budget (CAPEX) totaling ₹8,32,000 (~₹20,000/plot): Must Have (₹1 Lakh for Club House legal ownership/lawyer, MSEB meter transfer ₹40k, standby pump ₹65k); Requires Immediate Attention (Solar Power Plant ₹3.25L, CCTV network ₹1.35L, railing red oxide ₹70k, gutter clearing ₹35k, grass machine overhaul ₹12k); Nice to Have (Children's play area downscaled to ₹50k).
+    * Tabled 6 formal Draft AGM Resolutions for the Treasurer to move at tomorrow's AGM.
 
 ### In Progress
 - (none)
@@ -224,3 +280,23 @@
 - `tests/test_comprehensive.py`: 138 tests — includes IMPS tests (Format A + short-name extraction), name_sub tests, CR short-name tests
 - `tests/test_whatsapp.py`: 7 tests for WhatsApp message builder, wa.me links, clipboard
 - `config.py`: STAGING_DIR for WhatsApp staging folder
+- **`Split_Rules` NaN crash fix**: `ValueError: cannot convert float NaN to integer` occurred in `get_split_group_for_member` when manual Excel edits left trailing rows with NaN in `Source_Member_ID`. Cleaned `Split_Rules` sheet in `society_data.xlsx`, hardened `get_split_rules` and `get_split_group_for_member` in `local_excel_provider.py` to drop invalid/NaN rows, and added `pd.isna()` guards across all call sites in `main.py`.
+- **AGM Audit Cross-Verification**: Audited all 41 accountant plot ledgers against system records. 15 plots match 100%. Confirmed Anshul Rathod's ₹18k was 100% correctly attributed to Plots 5 & 20 in our system (accountant mistakenly gave it to Ashutosh Pujari in `PLOT NO.28 PUJARI.pdf`). Confirmed phone `9960184874` belongs to Plot 18 (Manjiri Gavande), validating that Vch #286 (₹6,000 on 03-07-2022) is correctly credited to Plot 18 in both systems. Detailed raw entry for 09-12-2025 UPI payment (`534366020481`) with 5-point rationale for Plot 36 (Rahul Palnitkar) vs Plot 27 (Rahul Bachikar). Clarified Continuum Industries (₹5,000) for Plots 18/19 where combined dues match ₹49,000. Full audit documented in `agm_audit_validation_report.md`.
+- **Treasurer's Financial Report, Expense Analysis & FY 2027-28 Budget PDF (`tools/generate_agm_budget_pdf.py`)**:
+  - Implemented an exact 5-page, publication-grade executive presentation PDF optimized for WhatsApp sharing and AGM printing:
+    - **Page 1**: Executive Summary & Liquid Financial Position (₹2.68L total liquid reserves) + 5-Year Audited Spend Matrix (129 bank debits totaling ₹14,82,003.33) + Factual clarification callout on MSEB non-billing arrears and 100% regularized residential rates.
+    - **Page 2**: Defaulter Severity Analysis (₹10.50L arrears across 37 plots) + Plot 37 audit clarification + Comprehensive Section 154B-29 (MCS Act) summary recovery legal powers and water regulation/disconnection rules.
+    - **Page 3**: Master 41-Plot Individual Audit Reconciliation Sheet (all 41 plots + total row fitted on a single dedicated page with single-line rows, no line wrapping, color-coded severity badges).
+    - **Page 4**: Proposed OPEX Routine Budget (₹5,38,000/yr, ₹1,093/plot/mo) + Prioritized 3-Tier CAPEX Plan (₹8,32,000 total: Must Have ₹2.05L, Requires Immediate Attention ₹5.77L, Nice to Have ₹50k).
+    - **Page 5**: Funding Recommendations (Maintenance revision to ₹1,500/mo, Special Capital Levy ₹20,000/plot, Defaulter recovery linkage to fast-track Solar/CCTV) + 6 Formal Draft AGM Resolutions + Society Treasurer Certification block.
+  - Universal mobile rendering: Uses universal `Rs.` notation and en-dash `&ndash;` (eliminates ReportLab Latin-1 character conversion issues and `(cid:xxx)` missing glyphs on iOS/Android WhatsApp viewers).
+  - Generated identical copies to root `Weekend_Ville_Treasurer_Budget_and_Expense_Analysis.pdf`, WhatsApp staging folder `data/staging/whatsapp/`, and artifact folder.
+- **AGM Audit Validation & Reconciliation Report PDF (`tools/generate_agm_audit_pdf.py`)**:
+  - Implemented an exact 4-page, publication-grade executive audit report PDF optimized for WhatsApp sharing and AGM printing:
+    - **Page 1**: Executive Summary & The Two-Report Approach (Statutory Audit as of 31-Mar-2026 for formal adoption vs Management Live Reconciled Addendum as of 31-Oct-2026) + High-Level Reconciliation KPI Summary Table (15 plots 100% match, family groups reconciled, ₹13,110 net verified bank collections) + Accounting Policy on Member Expenses (Plots 13 & 26 direct reimbursement principle).
+    - **Page 2**: Builder's Verified Record (November 2021 Shivaji Salary register from Mr. Shailesh Dave, Axis Bank breakdown, proving Plot 12 Maskikar duplicate cash entry) + Proven Audit Errors Table (6 plots with verified bank UTRs: Rathod ₹18k, Pujari ₹18k reversal, Modak ₹9k, Bhosale ₹2k, Maskikar ₹1k duplicate reversal, Phutane ₹1k reimbursement) + Specific Live Adjustments (Plot 36 Palnitkar vs Plot 27 Bachikar Vch #920 moved, Plot 19 Continuum Vch #683 moved, Plot 18 Phone 9960184874 verification, Plot 8 vs 37 Rs. 3k validation).
+    - **Page 3**: Master 41-Plot Audit Reconciliation Table (all 41 plots + total row comparing Accountant Audit Credits vs Society Records Credits vs Audit Net Balance vs Status badges fitted completely on a single dedicated page).
+    - **Page 4**: Formal Draft AGM Resolution for General Body Minutes (Resolution No. __: Adoption of Audited Accounts for FY 2025-26 & Authorization of FY 2026-27 Rectification Journal Entries across 5 clauses) + Managing Committee Certification & Sign-off Block (dual columns for Treasurer and Secretary/Chairman).
+  - Generated identical copies to root `Weekend_Ville_AGM_Audit_Validation_Report.pdf`, WhatsApp staging folder `data/staging/whatsapp/`, and artifact folder.
+
+

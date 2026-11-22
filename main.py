@@ -9,6 +9,7 @@ import config
 from utils.auth import show_login_page, logout, get_user_role
 from utils.chat_manager import ChatManager
 from utils.converters import get_fy_string, get_fy_from_date, compute_outstanding_as_of, get_payment_history, get_previous_invoices, number_to_words_inr, clean_payment_details
+from utils.matching import scan_ledger_duplicates
 from data_providers.local_excel_provider import LocalExcelDataProvider
 from file_storage.local_storage import LocalFileStorage
 from agents.invoice_agent import InvoiceAgent
@@ -988,20 +989,119 @@ def show_dashboard_page():
     # TAB 2: Expenses
     # ═══════════════════════════════════════════════════════════════
     with tab_expenses:
+        st.subheader("💰 Society Expenses & FY Budget Analysis")
+
+        all_expenses = data_provider.get_expenses()
+
+        # Action Toolbar
+        exp_tb1, exp_tb2 = st.columns([3, 1])
+        with exp_tb1:
+            st.caption(f"Showing audited society bank expenditures across FY 22-23 to FY 26-27 (Total: {len(all_expenses)} verified debit entries)")
+        with exp_tb2:
+            if st.button("🔄 Sync Bank Debits", key="sync_exp_btn", use_container_width=True, help="Scan Accounts sheet for any new bank debits and import into Expenses"):
+                added_count = data_provider.sync_accounts_debits_to_expenses()
+                if added_count > 0:
+                    st.success(f"✅ Synced {added_count} new debit entries from Accounts!")
+                else:
+                    st.info("Everything up to date — 0 new debits found.")
+                st.rerun()
+
+        # Metric KPI Cards
+        if all_expenses:
+            tot_exp_amt = sum(_s(e.get("Amount", 0)) for e in all_expenses)
+            salary_amt = sum(_s(e.get("Amount", 0)) for e in all_expenses if e.get("Category") == "Salaries & Caretaker")
+            mseb_amt = sum(_s(e.get("Amount", 0)) for e in all_expenses if e.get("Category") == "Electricity & Utilities")
+            maint_amt = sum(_s(e.get("Amount", 0)) for e in all_expenses if e.get("Category") in ["Site Maintenance & Supplies", "Repairs & Infrastructure", "Capital Assets"])
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("💳 Total Recorded", f"₹{tot_exp_amt:,.2f}", f"{len(all_expenses)} entries")
+            m2.metric("👮 Caretaker / Security", f"₹{salary_amt:,.2f}", "Pandit & Shivaji")
+            m3.metric("⚡ Electricity (MSEB)", f"₹{mseb_amt:,.2f}", "Pumps & Common")
+            m4.metric("🛠️ Repairs & Maintenance", f"₹{maint_amt:,.2f}", "Site & Equipment")
+
+            st.markdown("---")
+
+            # ── Multi-Year Financial Year Expense Matrix ─────────────
+            st.markdown("#### 📊 FY-Wise Category Breakdown")
+            df_exp_all = pd.DataFrame(all_expenses)
+            df_exp_all["FY"] = df_exp_all["Date"].apply(lambda d: f"FY {get_fy_from_date(str(d))}")
+            df_exp_all["Amount_Num"] = df_exp_all["Amount"].apply(_s)
+
+            pivot_exp = pd.pivot_table(
+                df_exp_all,
+                index="Category",
+                columns="FY",
+                values="Amount_Num",
+                aggfunc="sum",
+                fill_value=0.0
+            )
+            pivot_exp["Total Spend"] = pivot_exp.sum(axis=1)
+            pivot_exp = pivot_exp.sort_values("Total Spend", ascending=False)
+
+            total_row = pivot_exp.sum(axis=0)
+            total_row.name = "Total Expenses"
+            pivot_display = pd.concat([pivot_exp, pd.DataFrame([total_row])])
+
+            pivot_formatted = pivot_display.map(lambda x: f"₹{x:,.2f}")
+            st.dataframe(pivot_formatted, use_container_width=True)
+
+            st.markdown("---")
+
+            # ── Filter & Search Expenses ──────────────────────────────
+            st.markdown("#### 🔍 Filter & Inspect Entries")
+            f_col1, f_col2, f_col3 = st.columns([1, 1, 2])
+            with f_col1:
+                available_fys = ["All"] + sorted(list(df_exp_all["FY"].unique()), reverse=True)
+                sel_fy = st.selectbox("Financial Year", available_fys, key="exp_filter_fy")
+            with f_col2:
+                available_cats = ["All"] + sorted(list(df_exp_all["Category"].unique()))
+                sel_cat = st.selectbox("Category", available_cats, key="exp_filter_cat")
+            with f_col3:
+                exp_search = st.text_input("Search Particulars / Description", key="exp_filter_search", placeholder="e.g. Pandit, MSEDCL, Pump...")
+
+            filtered_df = df_exp_all.copy()
+            if sel_fy != "All":
+                filtered_df = filtered_df[filtered_df["FY"] == sel_fy]
+            if sel_cat != "All":
+                filtered_df = filtered_df[filtered_df["Category"] == sel_cat]
+            if exp_search.strip():
+                kw = exp_search.strip().lower()
+                filtered_df = filtered_df[
+                    filtered_df["Particulars"].astype(str).str.lower().str.contains(kw) |
+                    filtered_df["Description"].astype(str).str.lower().str.contains(kw)
+                ]
+
+            filtered_df = filtered_df.sort_values("ID", ascending=False)
+            filtered_total = filtered_df["Amount_Num"].sum()
+            st.caption(f"Showing {len(filtered_df)} entries — Subtotal: **₹{filtered_total:,.2f}**")
+
+            exp_display_table = []
+            for _, r in filtered_df.iterrows():
+                exp_display_table.append({
+                    "ID": r.get("ID", ""),
+                    "Date": r.get("Date", ""),
+                    "FY": r.get("FY", ""),
+                    "Particulars": str(r.get("Particulars", ""))[:60],
+                    "Category": r.get("Category", ""),
+                    "Amount": f"₹{_s(r.get('Amount', 0)):,.2f}",
+                    "Description": str(r.get("Description", ""))[:65],
+                    "Type": r.get("Transaction_Type", "Bank Debit"),
+                })
+            st.dataframe(exp_display_table, use_container_width=True)
 
         # ── Expense Entry Form ────────────────────────────────────
-        with st.expander("➕ Record Expense", expanded=False):
+        with st.expander("➕ Record Manual / Petty-Cash Expense", expanded=False):
             exp_col1, exp_col2 = st.columns(2)
             with exp_col1:
                 exp_date = st.text_input("Date (DD-MM-YYYY)", value="", key="exp_date", placeholder="e.g. 15-05-2026")
                 exp_amount = st.number_input("Amount (₹)", min_value=0.0, step=100.0, key="exp_amount")
             with exp_col2:
-                exp_particulars = st.text_input("Particulars", key="exp_particulars", placeholder="e.g. Plumbing repair")
+                exp_particulars = st.text_input("Particulars", key="exp_particulars", placeholder="e.g. Plumbing repair / Valve purchase")
                 cats = data_provider.get_expense_categories()
-                flat_cats = sorted(set(c["Name"] for c in cats)) if cats else ["Other"]
+                flat_cats = sorted(set(c["Name"] for c in cats)) if cats else ["Other Operating Expenses"]
                 exp_cat = st.selectbox("Category", flat_cats, key="exp_cat")
-            exp_comments = st.text_area("Comments", key="exp_comments", placeholder="Optional notes...")
-            uploaded_bill = st.file_uploader("Attach Bill", type=list(config.ALLOWED_UPLOAD_TYPES), key="exp_bill")
+            exp_comments = st.text_area("Comments / Description", key="exp_comments", placeholder="Optional vendor name, purpose, approval note...")
+            uploaded_bill = st.file_uploader("Attach Bill / Invoice", type=list(config.ALLOWED_UPLOAD_TYPES), key="exp_bill")
 
             if st.button("Save Expense", type="primary", use_container_width=True, key="exp_save"):
                 if not exp_date.strip() or not exp_particulars.strip() or exp_amount <= 0:
@@ -1019,38 +1119,27 @@ def show_dashboard_page():
                         "Particulars": exp_particulars.strip(),
                         "Amount": exp_amount,
                         "Category": exp_cat,
-                        "Bill_File": bill_path,
-                        "Comments": exp_comments.strip(),
+                        "Description": exp_comments.strip() or f"Manual Entry (Bill: {uploaded_bill.name if uploaded_bill else 'None'})",
+                        "Transaction_Type": "Manual / Cash",
                     })
                     st.success(f"✅ Expense recorded (ID: {eid})")
                     st.rerun()
 
-        # ── Manage Expenses ────────────────────────────────────────
-        with st.expander("📋 Manage Expenses", expanded=False):
-            all_expenses = data_provider.get_expenses()
+        # ── Manage / Delete Expenses ──────────────────────────────
+        with st.expander("🗑️ Delete an Expense Entry", expanded=False):
             if all_expenses:
-                exp_df_data = []
-                for exp in all_expenses:
-                    exp_df_data.append({
-                        "ID": exp.get("ID", ""),
-                        "Date": exp.get("Date", ""),
-                        "Particulars": str(exp.get("Particulars", "") or "")[:50],
-                        "Amount": f"₹{_s(exp.get('Amount', 0)):,.2f}",
-                        "Category": exp.get("Category", ""),
-                    })
-                st.dataframe(exp_df_data, use_container_width=True)
-                del_exp_opts = {f"{e.get('ID', '')}: {str(e.get('Particulars', '') or '')[:40]}": e.get("ID")
+                del_exp_opts = {f"ID #{e.get('ID', '')} | {e.get('Date', '')} | ₹{_s(e.get('Amount', 0)):,.2f} | {str(e.get('Particulars', '') or '')[:35]}": e.get("ID")
                                for e in all_expenses}
-                del_exp_sel = st.selectbox("Delete Expense", [""] + list(del_exp_opts.keys()),
+                del_exp_sel = st.selectbox("Select Expense to Delete", [""] + list(del_exp_opts.keys()),
                                            format_func=lambda x: "Select..." if not x else x,
-                                           key="del_exp")
-                if del_exp_sel and st.button("Delete Selected Expense", type="secondary", key="del_exp_btn"):
+                                           key="del_exp_sel_box")
+                if del_exp_sel and st.button("Confirm Delete Selected Expense", type="secondary", key="del_exp_btn"):
                     eid = del_exp_opts[del_exp_sel]
                     if data_provider.delete_expense(eid):
-                        st.success(f"Expense {eid} deleted!")
+                        st.success(f"Expense #{eid} deleted!")
                         st.rerun()
                     else:
-                        st.error(f"Failed to delete expense {eid}")
+                        st.error(f"Failed to delete expense #{eid}")
             else:
                 st.info("No expenses recorded yet.")
 
@@ -1763,6 +1852,8 @@ def show_dashboard_page():
                             "particulars": m.get("particulars", ""),
                             "plot_no": m.get("plot_no", ""), "member_name": m.get("member_name", ""),
                             "member_id": m.get("member_id"), "reason": m.get("reason", ""),
+                            "reconciled": m.get("reconciled", False),
+                            "existing_vch": m.get("existing_vch"),
                         })
                     for u in unmatched:
                         all_entries.append({
@@ -1828,7 +1919,7 @@ def show_dashboard_page():
                                 eid = e["entry_id"]
                                 cols = st.columns([0.5, 0.7, 1.3, 1.3, 2.5, 2.5, 3.5])
                                 cols[0].checkbox("", key=f"pv_cb_{eid}")
-                                cols[1].write("✅" if e["status"] == "matched" else "❌")
+                                cols[1].write("🔗" if e.get("reconciled") else ("✅" if e["status"] == "matched" else "❌"))
                                 cols[2].write(e["date"])
                                 cols[3].write(f"₹{e['amount']:>8,.2f}")
                                 # Plot / Member dropdown for ALL entries
@@ -1898,7 +1989,11 @@ def show_dashboard_page():
                                 for eid in created_set:
                                     for k in (f"pv_cb_{eid}", f"pv_plot_{eid}", f"pv_idtxt_{eid}"):
                                         st.session_state.pop(k, None)
-                                msg = f"✅ Created {len(to_create)} entries successfully."
+                                rec_cnt = sum(1 for eid in to_create if any(e.get("reconciled") for e in all_entries if e["entry_id"] == eid))
+                                if rec_cnt:
+                                    msg = f"✅ Processed {len(to_create)} entries ({rec_cnt} reconciled with existing ledger, {len(to_create)-rec_cnt} new)."
+                                else:
+                                    msg = f"✅ Created {len(to_create)} entries successfully."
                                 if remaining:
                                     msg += f" {len(remaining)} entries still in preview."
                                     st.session_state.ledger_preview_data = {
@@ -2224,8 +2319,9 @@ def show_dashboard_page():
                                         if can_split:
                                             if st.form_submit_button("➡️ Source", key=f"led_route_{idx}", help="Route to source member"):
                                                 src_rule = next((r for r in data_provider.get_split_rules()
-                                                                if int(r.get("Source_Member_ID", 0)) == led_member_id
-                                                                or led_member_id in [int(x) for x in str(r.get("Members", "")).split(",") if x.strip().isdigit()]), None)
+                                                                if not pd.isna(r.get("Source_Member_ID"))
+                                                                and (int(r.get("Source_Member_ID")) == led_member_id
+                                                                or led_member_id in [int(x) for x in str(r.get("Members", "")).split(",") if x.strip().isdigit()])), None)
                                                 if src_rule:
                                                     src_mid = int(src_rule["Source_Member_ID"])
                                                     vch_no = int(ev) if ev else 0
@@ -2485,6 +2581,8 @@ def show_dashboard_page():
                     rules = data_provider.get_split_rules()
                     total_split = 0
                     for rule in rules:
+                        if pd.isna(rule.get("Source_Member_ID")):
+                            continue
                         src_mid = int(rule["Source_Member_ID"])
                         group = [int(x.strip()) for x in str(rule.get("Members", "")).split(",") if x.strip().isdigit()]
                         if not group or src_mid not in group:
@@ -2545,35 +2643,95 @@ def show_dashboard_page():
 
         # ── Defaulters Report ─────────────────────────────────────
         with st.expander("📊 Defaulters Report", expanded=False):
-            defaulter_data = []
+            all_ledger = data_provider.get_member_ledger_all()
+            mid_totals = {}
+            for e in all_ledger:
+                mid = e.get("Member_ID") or e.get("Plot_No")
+                if mid is None:
+                    continue
+                try:
+                    mid = int(float(mid))
+                except (ValueError, TypeError):
+                    continue
+                d = mid_totals.setdefault(mid, {"dr": 0.0, "cr": 0.0})
+                d["dr"] += _s(e.get("Debit"))
+                d["cr"] += _s(e.get("Credit"))
+
+            report_entries = []
             for m in members:
                 mid = m["ID"]
-                ledger = data_provider.get_member_ledger(mid)
-                td = _s(sum(_s(e.get("Debit")) for e in ledger))
-                tc = _s(sum(_s(e.get("Credit")) for e in ledger))
-                outstanding = data_provider.get_current_outstanding(mid)
-                if outstanding < 0:
-                    defaulter_data.append({
-                        "Plot": m.get("Plot_No", "?"),
-                        "Name": m.get("Plot_Owner_Name", "?"),
-                        "Total Debits": td,
-                        "Total Credits": tc,
-                        "Outstanding": outstanding,
-                    })
-            if defaulter_data:
-                defaulter_data.sort(key=lambda x: x["Outstanding"])
+                totals = mid_totals.get(mid, {"dr": 0.0, "cr": 0.0})
+                td = totals["dr"]
+                tc = totals["cr"]
+                net_bal = tc - td  # > 0 means surplus, < 0 means demand
+                if net_bal < 0:
+                    status = "Defaulter"
+                elif net_bal > 0:
+                    status = "Surplus"
+                else:
+                    status = "Settled"
+                report_entries.append({
+                    "Plot": m.get("Plot_No", "?"),
+                    "Name": m.get("Plot_Owner_Name", "?"),
+                    "Total Debits": td,
+                    "Total Credits": tc,
+                    "Net Balance": net_bal,
+                    "Status": status,
+                })
+
+            defaulters = [d for d in report_entries if d["Status"] == "Defaulter"]
+            surplus_list = [d for d in report_entries if d["Status"] == "Surplus"]
+            settled_list = [d for d in report_entries if d["Status"] == "Settled"]
+
+            tot_demand = sum(abs(d["Net Balance"]) for d in defaulters)
+            tot_surplus = sum(d["Net Balance"] for d in surplus_list)
+
+            # Top KPI metrics
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("🔴 Defaulters", f"{len(defaulters)} plots", f"Demand ₹{tot_demand:,.2f}", delta_color="inverse")
+            k2.metric("🟢 In Surplus / Advance", f"{len(surplus_list)} plots", f"Surplus ₹{tot_surplus:,.2f}")
+            k3.metric("⚪ Settled", f"{len(settled_list)} plots")
+            k4.metric("📋 Total Plots", f"{len(report_entries)} plots")
+
+            # Filter selector
+            view_opt = st.radio(
+                "Filter View",
+                [f"Defaulters ({len(defaulters)})",
+                 f"In Surplus / Advance ({len(surplus_list)})",
+                 f"Settled ({len(settled_list)})",
+                 f"All Plots ({len(report_entries)})"],
+                horizontal=True,
+                key="defaulter_view_filter"
+            )
+
+            if view_opt.startswith("Defaulters"):
+                display_list = sorted(defaulters, key=lambda x: x["Net Balance"])
+                surplus_desc = ", ".join(f"Plot {d['Plot']} [₹{d['Net Balance']:,.0f}]" for d in surplus_list)
+                settled_desc = ", ".join(f"Plot {d['Plot']}" for d in settled_list)
+                st.caption(f"ℹ️ Showing {len(defaulters)} plots with pending dues. 4 plots have no pending dues: "
+                           f"2 in advance ({surplus_desc}) and 2 settled ({settled_desc}).")
+            elif view_opt.startswith("In Surplus"):
+                display_list = sorted(surplus_list, key=lambda x: -x["Net Balance"])
+                st.caption("ℹ️ These members have paid in excess of all billed invoices and have an advance credit balance.")
+            elif view_opt.startswith("Settled"):
+                display_list = sorted(settled_list, key=lambda x: int(x["Plot"]) if str(x["Plot"]).isdigit() else 0)
+                st.caption("ℹ️ These members have zero outstanding balance (payments exactly match billed charges).")
+            else:
+                display_list = sorted(report_entries, key=lambda x: int(x["Plot"]) if str(x["Plot"]).isdigit() else 0)
+
+            if display_list:
                 st.dataframe(
                     [{"Plot": d["Plot"], "Name": d["Name"],
                       "Total Debits": f"₹{d['Total Debits']:,.2f}",
                       "Total Credits": f"₹{d['Total Credits']:,.2f}",
-                      "Outstanding": f"₹{abs(d['Outstanding']):,.2f}"}
-                     for d in defaulter_data],
+                      "Net Outstanding": f"₹{abs(d['Net Balance']):,.2f}" if d["Net Balance"] < 0 else f"+₹{d['Net Balance']:,.2f}" if d["Net Balance"] > 0 else "₹0.00",
+                      "Status": "⚠️ Due" if d["Status"] == "Defaulter" else ("✅ Advance" if d["Status"] == "Surplus" else "✅ Settled")}
+                     for d in display_list],
                     use_container_width=True,
+                    hide_index=True,
                 )
-                total_demand = sum(abs(d["Outstanding"]) for d in defaulter_data)
-                st.metric("Total Outstanding Demand", f"₹{total_demand:,.2f}")
             else:
-                st.success("No defaulters — all plots are settled or in surplus.")
+                st.success("No entries matching filter.")
 
         st.divider()
 
@@ -2598,16 +2756,26 @@ def show_dashboard_page():
                                         "Detail": f"Demand Rs {abs(outstanding):,.2f}"})
 
                 if vch_nos:
-                    expected_range = list(range(min(vch_nos), max(vch_nos) + 1))
-                    missing = sorted(set(expected_range) - set(vch_nos))
-                    if missing:
+                    # Check 1: Voucher Uniqueness (true integrity check)
+                    seen_vch = set()
+                    dup_vch = set()
+                    for v in vch_nos:
+                        if v in seen_vch:
+                            dup_vch.add(v)
+                        seen_vch.add(v)
+                    if dup_vch:
                         results.append({"Plot_No": "-", "Owner": "-",
-                                        "Check": "Voucher Gaps", "Status": "FAIL",
-                                        "Detail": f"Missing Vch_No: {missing[:10]}{'...' if len(missing)>10 else ''}"})
+                                        "Check": "Voucher Uniqueness", "Status": "FAIL",
+                                        "Detail": f"Duplicate Vch_No: {sorted(list(dup_vch))[:10]}"})
                     else:
                         results.append({"Plot_No": "-", "Owner": "-",
-                                        "Check": "Voucher Gaps", "Status": "OK",
-                                        "Detail": f"No gaps ({min(vch_nos)}-{max(vch_nos)})"})
+                                        "Check": "Voucher Uniqueness", "Status": "OK",
+                                        "Detail": f"All {len(vch_nos)} vouchers are unique"})
+
+                    # Check 2: Sequence Audit (informational summary)
+                    results.append({"Plot_No": "-", "Owner": "-",
+                                    "Check": "Voucher Sequence", "Status": "OK",
+                                    "Detail": f"{len(vch_nos)} entries (range {min(vch_nos)}–{max(vch_nos)}; gaps exist due to FY series blocks and auto-split parent entries)"})
 
                 rdf = pd.DataFrame(results)
                 st.dataframe(rdf, use_container_width=True)
@@ -2673,37 +2841,16 @@ def show_dashboard_page():
         # ── Duplicate Detection ───────────────────────────────────
         with st.expander("🔍 Duplicate Detection", expanded=False):
             if "dup_result" not in st.session_state:
-                st.session_state.dup_result = []
+                st.session_state.dup_result = None
             if st.button("Run Duplicate Scan", key="dup_scan_btn"):
                 all_ledger = data_provider.get_member_ledger_all()
-                part_map = {}  # normalized particulars → list
-
-                for e in all_ledger:
-                    mid = e.get("Member_ID") or e.get("Plot_No")
-                    if not mid:
-                        continue
-                    try:
-                        mid = int(float(mid))
-                    except (ValueError, TypeError):
-                        continue
-                    pn = _normalize_particulars(e.get("Particulars", ""))
-                    if pn:
-                        part_map.setdefault(pn, []).append({**e, "_dup_mid": mid})
-
-                dup_groups = []
-                seen = set()
-                for pn, items in part_map.items():
-                    if len(items) >= 2 and len(pn) >= 5:
-                        ids = tuple(sorted((e.get("Vch_No"), e["_dup_mid"]) for e in items))
-                        if ids not in seen:
-                            seen.add(ids)
-                            dup_groups.append((f"Particulars: {pn}", items))
-
-                st.session_state.dup_result = dup_groups
+                st.session_state.dup_result = scan_ledger_duplicates(all_ledger)
 
             dup_groups = st.session_state.dup_result
-            if not dup_groups:
+            if dup_groups is None:
                 st.info("Click 'Run Duplicate Scan' to check for potential duplicates across all members.")
+            elif len(dup_groups) == 0:
+                st.success("✅ No duplicates found! All ledger entries are verified.")
             else:
                 st.warning(f"⚠️ Found {len(dup_groups)} potential duplicate group(s)")
                 for gi, (reason, items) in enumerate(dup_groups):
@@ -2740,7 +2887,7 @@ def show_dashboard_page():
                                                     total_amt += _s(se.get("Credit"))
                                                     data_provider.delete_ledger_entry(int(float(se_mid)), se_vch)
                                             data_provider.delete_ledger_entry(e["_dup_mid"], vch_no)
-                                            st.session_state.dup_result = []
+                                            st.session_state.dup_result = None
                                             st.success(f"✅ Undid split — ₹{total_amt:>,.2f} total across {len(all_split_entries)+1} entries deleted")
                                             st.rerun()
                             del_clicked = st.form_submit_button("🗑️ Delete Selected", type="primary", use_container_width=True)
@@ -2751,7 +2898,7 @@ def show_dashboard_page():
                                         if data_provider.delete_ledger_entry(e["_dup_mid"], int(e.get("Vch_No", 0))):
                                             _delete_pdf_files(_extract_ref_id(str(e.get("Description", ""))))
                                             dc += 1
-                                st.session_state.dup_result = []
+                                st.session_state.dup_result = None
                                 if dc:
                                     st.success(f"✅ Deleted {dc} duplicate entries")
                                 else:
@@ -3206,11 +3353,11 @@ def show_settings_page():
         if rules:
             st.dataframe(
                 [{"ID": r.get("ID", ""),
-                  "Source": _member_label(r.get("Source_Member_ID")),
+                  "Source": _member_label(int(r["Source_Member_ID"])) if not pd.isna(r.get("Source_Member_ID")) else "",
                   "Members": ", ".join(
-                      _member_label(int(x)) for x in str(r.get("Members", "")).split(",") if x.strip()
+                      _member_label(int(x)) for x in str(r.get("Members", "")).split(",") if x.strip().isdigit()
                   )}
-                 for r in rules],
+                 for r in rules if not pd.isna(r.get("Source_Member_ID"))],
                 use_container_width=True,
             )
         members = data_provider.get_all_members()

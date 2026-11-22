@@ -31,10 +31,99 @@ FORMAT_PROFILES = {
 
 
 
-def extract_text_from_pdf(pdf_path: str, password: str = "") -> str:
+def _extract_table_grid_lines(pdf: pdfplumber.PDF) -> Optional[List[str]]:
+    """Extract transaction lines directly from structured PDF table grids.
+    
+    Prevents multiline cell baseline shifts from causing transaction rows to bleed
+    into adjacent lines. Returns None if no recognizable transaction table grid is present.
+    """
+    txn_lines = []
+    has_txn_table = False
+
+    for page in pdf.pages:
+        tables = page.extract_tables() or []
+        for table in tables:
+            if not table or len(table) < 2:
+                continue
+
+            # Identify if this table has transaction headers within first 3 rows
+            for r_idx in range(min(3, len(table))):
+                header = [str(c or '').strip().upper() for c in table[r_idx]]
+                has_date = any('DATE' in h for h in header)
+                has_part = any('PARTICULAR' in h or 'DESCRIPTION' in h for h in header)
+                has_amount = any(x in h for h in header for x in ['WITHDRAWAL', 'DEPOSIT', 'AMOUNT', 'BALANCE', 'DEBIT', 'CREDIT'])
+
+                if has_date and has_part and has_amount:
+                    has_txn_table = True
+                    si_idx = next((i for i, h in enumerate(header) if h in ['SI', 'SL', 'S.NO', 'SR NO', 'SR.NO.', 'SL NO']), None)
+                    date_idx = next(i for i, h in enumerate(header) if 'DATE' in h)
+                    part_idx = next(i for i, h in enumerate(header) if 'PARTICULAR' in h or 'DESCRIPTION' in h)
+                    chq_idx = next((i for i, h in enumerate(header) if 'CHQ' in h or 'CHEQUE' in h), None)
+                    wd_idx = next((i for i, h in enumerate(header) if 'WITHDRAWAL' in h or 'DEBIT' in h), None)
+                    dep_idx = next((i for i, h in enumerate(header) if 'DEPOSIT' in h or 'CREDIT' in h), None)
+                    bal_idx = next((i for i, h in enumerate(header) if 'BALANCE' in h), None)
+
+                    for row in table[r_idx + 1:]:
+                        if not row or len(row) <= part_idx:
+                            continue
+                        dt_raw = str(row[date_idx] or '').strip()
+                        dt_match = re.search(r'(\d{2})[-/](\d{2})[-/](\d{4})', dt_raw)
+                        if not dt_match:
+                            continue
+                        dt = f"{dt_match.group(1)}-{dt_match.group(2)}-{dt_match.group(3)}"
+
+                        si = str(row[si_idx] or '').strip() if si_idx is not None and si_idx < len(row) else ''
+                        part = ' '.join(str(row[part_idx] or '').split())
+
+                        chq = str(row[chq_idx] or '').strip() if chq_idx is not None and chq_idx < len(row) else ''
+                        wd = str(row[wd_idx] or '').strip() if wd_idx is not None and wd_idx < len(row) else ''
+                        dep = str(row[dep_idx] or '').strip() if dep_idx is not None and dep_idx < len(row) else ''
+                        bal = str(row[bal_idx] or '').strip() if bal_idx is not None and bal_idx < len(row) else ''
+                        amounts = []
+                        if chq:
+                            amounts.append(chq)
+                        if wd:
+                            wd_val = wd if re.search(r'(?:Cr|Dr)$', wd, re.IGNORECASE) else f"{wd} Dr"
+                            amounts.append(wd_val)
+                        if dep:
+                            dep_val = dep if re.search(r'(?:Cr|Dr)$', dep, re.IGNORECASE) else f"{dep} Cr"
+                            amounts.append(dep_val)
+                        if bal:
+                            bal_val = bal if re.search(r'(?:Cr|Dr)$', bal, re.IGNORECASE) else f"{bal} Cr"
+                            amounts.append(bal_val)
+
+                        if si and si.isdigit():
+                            line = f"{si} {dt} {part} " + " ".join(amounts)
+                        else:
+                            line = f"{dt} {part} " + " ".join(amounts)
+                        txn_lines.append(line.strip())
+                    break
+
+    if has_txn_table and txn_lines:
+        return txn_lines
+    return None
+
+
+def has_table_grid(pdf_path: str, password: str = "") -> bool:
+    """Check if the PDF has a structured transaction table grid."""
     with pdfplumber.open(pdf_path, password=password) as pdf:
+        return _extract_table_grid_lines(pdf) is not None
+
+
+def extract_text_from_pdf(pdf_path: str, password: str = "") -> str:
+    """Extract statement text from PDF.
+    
+    If structured transaction tables exist (e.g. digital PDF statements), extracts
+    via cell boundaries to prevent row bleeding. Otherwise falls back to character-based
+    extraction for older printed/scanned statements.
+    """
+    with pdfplumber.open(pdf_path, password=password) as pdf:
+        table_lines = _extract_table_grid_lines(pdf)
+        if table_lines is not None:
+            return "\n".join(table_lines)
         pages = [page.extract_text() or "" for page in pdf.pages]
     return "\n".join(pages)
+
 
 
 def detect_format(lines: List[str]) -> str:
@@ -82,6 +171,26 @@ def _strip_non_transaction(line: str) -> bool:
         return False
     if re.match(r"^\d{2}:\d{2}:\d{2}\s+", line):
         return False
+    HEADER_PATTERNS = [
+        r"DETAILS\s+OF\s+STATEMENT",
+        r"Name\s+&\s+Address",
+        r"Customer\s+ID|Cust\s+ID",
+        r"Account\s+Number|Account\s+Open\s+Date|Account\s+Type",
+        r"IFSC\s*:",
+        r"MICR\s*:",
+        r"Nomination\s+Availed",
+        r"Re\s+KYC",
+        r"Generated\s+Date",
+        r"E-?Mail\s*:",
+        r"Phone\s*:",
+        r"CKYC\s+No",
+        r"TALUKA\s+MULSHI",
+        r"AT\s+AND\s+POST\s+MUTHA",
+        r"Branch\s*:",
+    ]
+    for pat in HEADER_PATTERNS:
+        if re.search(pat, line, re.IGNORECASE):
+            return False
     return True
 
 
@@ -100,11 +209,27 @@ def clean_entries(lines: List[str]) -> List[str]:
         preamble.append(normalized.pop(0))
     if not normalized:
         return []
+    # Discard non-transaction header lines that may have leaked into preamble
+    HEADER_PATTERNS = [
+        r"DETAILS\s+OF\s+STATEMENT",
+        r"Customer\s+ID|Cust\s+ID",
+        r"Account\s+Number|Account\s+Open|Account\s+Type",
+        r"IFSC",
+        r"MICR",
+        r"Nomination",
+        r"Re\s+KYC",
+        r"Generated\s+Date",
+        r"E-?Mail",
+        r"Branch\s*:",
+        r"Name\s+&\s+Address",
+    ]
+    preamble = [p for p in preamble if not any(re.search(pat, p, re.IGNORECASE) for pat in HEADER_PATTERNS)]
+
     _EMBEDDED_ENTRY = re.compile(r'\b(\d{1,3})\s+(?=\d{2}-\d{2}-\d{4})')
     merged = []
     for line in normalized:
         if re.match(r"^\d{2}-\d{2}-\d{4}", line):
-            if preamble:
+            if not merged and preamble:
                 line = line + " " + " ".join(preamble)
                 preamble = []
             merged.append(line)
@@ -249,7 +374,7 @@ def _extract_search_tokens(particulars: str, txn_type: str, txn_id: str = None) 
                     if should_record_name(token):
                         identifiers.append((token, "PAYEE_NAME"))
 
-    mobft_match = re.search(r'from:\s*([A-Za-z\s.]+?)(?:/|\s+\d)', particulars)
+    mobft_match = re.search(r'(?:from:\s*|MOBFT/)([A-Za-z\s.]+?)(?:/|\s+\d|$)', particulars)
     if mobft_match:
         name_raw = mobft_match.group(1).strip()
         for t in re.split(r'[\s.]+', name_raw):
@@ -429,7 +554,15 @@ def parse_entries_to_accounts(entries: List[str], fmt: str) -> Dict[str, Any]:
         date = date_match.group(1)
         first_line = date_match.group(2)
         all_text = entry_text
-        particulars = first_line
+        amt_re = re.compile(r'[\d,]+\.\d{2}\s*(?:(?:Cr|Dr)\b)?', re.IGNORECASE)
+        amt_matches = list(amt_re.finditer(first_line))
+        if len(amt_matches) >= 2:
+            clean_part = first_line[:amt_matches[-2].start()].strip()
+        elif len(amt_matches) == 1:
+            clean_part = first_line[:amt_matches[-1].start()].strip()
+        else:
+            clean_part = first_line.strip()
+        particulars = clean_part if clean_part else first_line
 
         amt = _parse_entry_amounts(all_text, fmt, prev_balance)
         if amt is None:

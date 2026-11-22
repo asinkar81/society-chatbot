@@ -35,6 +35,8 @@ data/bank_statements/
 data/staging/
 data/uploads/
 *.xlsx
+!data/society_data.xlsx
+~$*
 *.csv
 
 # Cache

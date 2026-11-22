@@ -12,6 +12,7 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import unittest
+import json
 import tempfile
 from pathlib import Path
 from datetime import datetime
@@ -21,6 +22,7 @@ import pandas as pd
 import config
 from data_providers.local_excel_provider import LocalExcelDataProvider
 from utils.converters import get_fy_from_date, get_fy_string
+from utils.matching import scan_ledger_duplicates, extract_txn_ref
 
 
 # ── Helper functions (copied from main.py for testability) ────────────
@@ -357,6 +359,91 @@ class TestDuplicateDetection(unittest.TestCase):
         )
         self.assertIsNotNone(result)
         print("  ✓ check_duplicate_ledger_entry detects by particulars prefix")
+
+
+class TestLedgerDuplicateScanner(unittest.TestCase):
+    """Test scan_ledger_duplicates and extract_txn_ref logic"""
+
+    def test_extract_txn_ref(self):
+        """Test extraction of bank UTR / transaction IDs"""
+        self.assertEqual(extract_txn_ref({"Transaction_ID": "AXIS12345678"}), "AXIS12345678")
+        # Split transaction IDs ignored
+        self.assertEqual(extract_txn_ref({"Transaction_ID": "SPLIT_VCH_12"}), "")
+        # Stop words ignored
+        self.assertEqual(extract_txn_ref({"Transaction_ID": "MAHARASHTRA_ELECTRICITY_123"}), "")
+        # Extracted from Particulars parentheses
+        self.assertEqual(extract_txn_ref({"Particulars": "UPI/1234 (Y82107246)/PQR"}), "Y82107246")
+        # Extracted from Particulars/Description token
+        self.assertEqual(extract_txn_ref({"Particulars": "UPIAB/795776709303/CR/SHRIKANT"}), "795776709303")
+        print("  ✓ extract_txn_ref correctly extracts valid references and ignores splits/stopwords")
+
+    def test_clean_ledger_no_duplicates(self):
+        """A normal ledger with diverse entries produces 0 duplicates"""
+        ledger = [
+            {"Member_ID": 1, "Plot_No": "01", "Date": "01-04-2026", "Vch_No": 1, "Credit": 0, "Debit": 5000, "Transaction_Type": "INVOICE", "Particulars": "To Annual Maintenance Charges"},
+            {"Member_ID": 2, "Plot_No": "02", "Date": "01-04-2026", "Vch_No": 2, "Credit": 0, "Debit": 5000, "Transaction_Type": "INVOICE", "Particulars": "To Annual Maintenance Charges"},
+            {"Member_ID": 1, "Plot_No": "01", "Date": "15-06-2026", "Vch_No": 3, "Credit": 5000, "Debit": 0, "Transaction_Type": "NEFT", "Transaction_ID": "NEFT987654321", "Particulars": "By NEFT 987654321"},
+            {"Member_ID": 2, "Plot_No": "02", "Date": "20-06-2026", "Vch_No": 4, "Credit": 5000, "Debit": 0, "Transaction_Type": "UPI", "Transaction_ID": "UPI123456789", "Particulars": "By UPI 123456789"},
+            # Legitimate split entries across plots sharing a split description
+            {"Member_ID": 16, "Plot_No": "16", "Date": "05-07-2026", "Vch_No": 5, "Credit": 2500, "Debit": 0, "Transaction_Type": "SPLIT", "Description": "Split from #100 (src:16)", "Particulars": "By Split from Owner (NEFT88888888)"},
+            {"Member_ID": 17, "Plot_No": "17", "Date": "05-07-2026", "Vch_No": 6, "Credit": 2500, "Debit": 0, "Transaction_Type": "SPLIT", "Description": "Split from #100 (src:16)", "Particulars": "By Split from Owner (NEFT88888888)"},
+        ]
+        dups = scan_ledger_duplicates(ledger)
+        self.assertEqual(len(dups), 0)
+        print("  ✓ scan_ledger_duplicates produces 0 duplicates for clean ledger with invoices & splits")
+
+    def test_detect_same_plot_duplicate(self):
+        """Detect duplicate entries on same plot, date, amount, direction lacking distinct UTRs"""
+        ledger = [
+            {"Member_ID": 5, "Plot_No": "05", "Date": "10-08-2026", "Vch_No": 10, "Credit": 2000, "Debit": 0, "Transaction_Type": "UPI", "Particulars": "By UPI payment"},
+            {"Member_ID": 5, "Plot_No": "05", "Date": "10-08-2026", "Vch_No": 11, "Credit": 2000, "Debit": 0, "Transaction_Type": "UPI", "Particulars": "By UPI payment"},
+        ]
+        dups = scan_ledger_duplicates(ledger)
+        self.assertEqual(len(dups), 1)
+        reason, items = dups[0]
+        self.assertIn("Plot 05", reason)
+        self.assertIn("₹2,000.00", reason)
+        self.assertEqual(len(items), 2)
+        print("  ✓ scan_ledger_duplicates detects same-plot duplicate entries")
+
+    def test_permit_same_plot_distinct_utrs(self):
+        """Permit same plot, date, amount if entries have distinct verified UTRs"""
+        ledger = [
+            {"Member_ID": 5, "Plot_No": "05", "Date": "10-08-2026", "Vch_No": 10, "Credit": 2000, "Debit": 0, "Transaction_Type": "UPI", "Transaction_ID": "UPI1111222233", "Particulars": "By UPI 1111222233"},
+            {"Member_ID": 5, "Plot_No": "05", "Date": "10-08-2026", "Vch_No": 11, "Credit": 2000, "Debit": 0, "Transaction_Type": "UPI", "Transaction_ID": "UPI4444555566", "Particulars": "By UPI 4444555566"},
+        ]
+        dups = scan_ledger_duplicates(ledger)
+        self.assertEqual(len(dups), 0)
+        print("  ✓ scan_ledger_duplicates permits same-plot payments with distinct UTRs")
+
+    def test_detect_cross_plot_duplicate_utr(self):
+        """Detect cross-plot collision of same real bank UTR (excluding splits)"""
+        ledger = [
+            {"Member_ID": 7, "Plot_No": "07", "Date": "12-09-2026", "Vch_No": 20, "Credit": 3000, "Debit": 0, "Transaction_Type": "IMPS", "Transaction_ID": "IMPS99998888", "Particulars": "By IMPS 99998888"},
+            {"Member_ID": 8, "Plot_No": "08", "Date": "12-09-2026", "Vch_No": 21, "Credit": 3000, "Debit": 0, "Transaction_Type": "IMPS", "Transaction_ID": "IMPS99998888", "Particulars": "By IMPS 99998888"},
+        ]
+        dups = scan_ledger_duplicates(ledger)
+        self.assertEqual(len(dups), 1)
+        reason, items = dups[0]
+        self.assertIn("Cross-Plot", reason)
+        self.assertIn("IMPS99998888", reason)
+        print("  ✓ scan_ledger_duplicates detects cross-plot duplicate UTR")
+
+    def test_detect_duplicate_invoices(self):
+        """Detect duplicate invoices for the same plot and same financial year"""
+        ledger = [
+            {"Member_ID": 10, "Plot_No": "10", "Date": "01-04-2026", "Vch_No": 30, "Credit": 0, "Debit": 5000, "Transaction_Type": "INVOICE", "Particulars": "To Annual Maintenance Charges FY 26-27"},
+            {"Member_ID": 10, "Plot_No": "10", "Date": "15-05-2026", "Vch_No": 31, "Credit": 0, "Debit": 5000, "Transaction_Type": "INVOICE", "Particulars": "To Duplicate Maintenance Charges FY 26-27"},
+            # Another plot's invoice in the same FY is valid
+            {"Member_ID": 11, "Plot_No": "11", "Date": "01-04-2026", "Vch_No": 32, "Credit": 0, "Debit": 5000, "Transaction_Type": "INVOICE", "Particulars": "To Annual Maintenance Charges FY 26-27"},
+        ]
+        dups = scan_ledger_duplicates(ledger)
+        self.assertEqual(len(dups), 1)
+        reason, items = dups[0]
+        self.assertIn("Duplicate Invoices", reason)
+        self.assertIn("Plot 10", reason)
+        self.assertEqual(len(items), 2)
+        print("  ✓ scan_ledger_duplicates detects duplicate invoices for same plot and FY")
 
 
 class TestInvoiceParsing(unittest.TestCase):
@@ -1346,6 +1433,86 @@ class TestLedgerFromAccountsIntegration(unittest.TestCase):
                       f"Expected substring match reason, got: {matched[0].get('reason')}")
         print("  ✓ Integration: SHW matches Shweta Shete via substring")
 
+    def test_reconcile_existing_manual_ledger_entry(self):
+        """Statement deposit with matching UTR reconciles to existing manual ledger entry."""
+        mid = self._add_member("24", "Amit Bhosale")
+        # Add existing manual ledger entry
+        self.provider.add_ledger_entry(mid, {
+            "Date": "07-06-2026",
+            "Particulars": "By BIL/NEFT/IN12615841150265/WvPl24Fy2223J2",
+            "Vch_Type": "Journal",
+            "Vch_No": 1062,
+            "Debit": None,
+            "Credit": 8000.0,
+            "Description": "BIL/NEFT/IN12615841150265/WvPl24Fy2223J2 Receipt 26-27-1062",
+            "Transaction_ID": None,
+            "Transaction_Type": "MANUAL",
+        })
+        # Add account deposit entry from bank statement
+        self._add_accounts_entry(
+            date="07-06-2026",
+            particulars="NEFT:AMIT VIJAY BHOSALE IN12615841150265",
+            deposit=8000.0,
+            txn_type="NEFT",
+            txn_id="IN12615841150265",
+        )
+        import json
+        tool = self._get_tool("create_ledger_from_accounts")
+        self.assertIsNotNone(tool)
+
+        # Test preview mode
+        prev_res = tool.func(json.dumps({"fy": "26-27", "mode": "preview"}))
+        prev_data = json.loads(prev_res)
+        matched = prev_data.get("matched", [])
+        self.assertEqual(len(matched), 1)
+        self.assertTrue(matched[0].get("reconciled"))
+        self.assertEqual(matched[0].get("existing_vch"), 1062)
+        self.assertIn("Already in Ledger", matched[0].get("reason", ""))
+
+        # Test create mode
+        create_res = tool.func(json.dumps({"fy": "26-27", "mode": "create"}))
+        # Verify ledger entry was updated, NOT duplicated
+        all_ledger = self.provider.get_member_ledger_all()
+        self.assertEqual(len(all_ledger), 1, "Should NOT create duplicate ledger entry")
+        entry = all_ledger[0]
+        self.assertEqual(entry["Vch_No"], 1062)
+        self.assertEqual(entry["Transaction_ID"], "IN12615841150265")
+        self.assertEqual(entry["Transaction_Type"], "NEFT")
+        self.assertIn("Bank Verified", entry["Description"])
+
+        # Verify accounts entry is marked Matched
+        accts = self.provider.get_accounts_entries()
+        self.assertEqual(accts[0]["Status"], "Matched")
+        print("  ✓ Integration: Reconciles and enriches manual ledger entry without duplicating")
+
+    def test_mobft_matching_and_atomicity(self):
+        """Verify MOBFT format MOBFT/<name>/... extracts tokens and creates ledger entry"""
+        mid = self._add_member("10", "Mrs. Shruti Avinash Bhagwat & Mr. Avinash Balkrishna Bhagwat")
+        self._add_accounts_entry(
+            date="01-06-2026",
+            particulars="MOBFT/AVINASH BALKRISHNA B/534774550045",
+            deposit=1000.0,
+            txn_type="MOBFT",
+            txn_id="BALKRISHNA",
+            status="Pending",
+        )
+        tool = self._get_tool("create_ledger_from_accounts")
+        payload = {"mode": "create", "fy": "26-27"}
+        res = tool.func(json.dumps(payload))
+        self.assertIn("Matched: 1", res)
+
+        # Verify ledger has entry for Member mid
+        all_ledger = self.provider.get_member_ledger_all()
+        self.assertEqual(len(all_ledger), 1)
+        self.assertEqual(all_ledger[0]["Member_ID"], mid)
+        self.assertEqual(all_ledger[0]["Credit"], 1000.0)
+
+        # Verify accounts entry is marked Matched
+        accts = self.provider.get_accounts_entries()
+        self.assertEqual(accts[0]["Status"], "Matched")
+        print("  ✓ Integration: MOBFT/<name>/... matches member and creates ledger atomically")
+
+
     def test_continuity_has_deposits_withdrawals(self):
         """Accounts continuity includes total_deposits and total_withdrawals"""
         self._add_member("1", "Test Member")
@@ -1377,6 +1544,7 @@ def run_tests():
     suite.addTests(loader.loadTestsFromTestCase(TestSuspenseEntries))
     suite.addTests(loader.loadTestsFromTestCase(TestLedgerDelete))
     suite.addTests(loader.loadTestsFromTestCase(TestDuplicateDetection))
+    suite.addTests(loader.loadTestsFromTestCase(TestLedgerDuplicateScanner))
     suite.addTests(loader.loadTestsFromTestCase(TestInvoiceParsing))
     suite.addTests(loader.loadTestsFromTestCase(TestHelperFunctions))
     suite.addTests(loader.loadTestsFromTestCase(TestPaymentReferences))

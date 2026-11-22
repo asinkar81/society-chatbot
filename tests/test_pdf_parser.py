@@ -1,3 +1,7 @@
+import os
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 import pytest
 from tools.pdf_parser import (
     extract_text_from_pdf,
@@ -8,6 +12,8 @@ from tools.pdf_parser import (
     _parse_entry_amounts,
     _strip_non_transaction,
     _is_footer_artifact,
+    has_table_grid,
+    _extract_search_tokens,
 )
 
 
@@ -544,3 +550,123 @@ def test_parse_entry_amounts_clean_entry_no_preamble():
     assert result["withdrawal"] is None
     assert result["deposit"] == 5000.0
     assert result["balance"] == 50000.0
+
+
+def test_has_table_grid_detection():
+    """Verify table grid detection correctly distinguishes digital statements from legacy ones."""
+    import os
+    import config
+    # 9_June_26.pdf has a structured digital table grid
+    june_path = "data/bank_statements/9_June_26.pdf"
+    if os.path.exists(june_path):
+        assert has_table_grid(june_path, config.BANK_STMT_PASSWORD) is True
+    
+    # 1_23_Mar_22_to_31_Mar_22.pdf is a legacy printed printout with no table grid
+    legacy_path = "data/bank_statements/1_23_Mar_22_to_31_Mar_22.pdf"
+    if os.path.exists(legacy_path):
+        assert has_table_grid(legacy_path, config.BANK_STMT_PASSWORD) is False
+
+
+def test_table_grid_multiline_isolation():
+    """Verify that multi-line particulars inside table cells do not bleed into adjacent rows."""
+    import os
+    import config
+    from tools.pdf_parser import parse_bank_pdf
+
+    june_path = "data/bank_statements/9_June_26.pdf"
+    if os.path.exists(june_path):
+        res = parse_bank_pdf(june_path, password=config.BANK_STMT_PASSWORD)
+        entries = res["entries"]
+        assert len(entries) == 20
+
+        # Entry 13 should be Ashutosh Vijaykumar ONLY — must NOT contain Rama Salvi
+        e13 = entries[12]
+        assert "VIJAYKUMAR" in e13
+        assert "25,000" in e13
+        assert "RAMA" not in e13, f"Entry 13 contaminated with Rama Salvi: {e13}"
+        assert "RAMDAS" not in e13, f"Entry 13 contaminated with Ramdas Salvi: {e13}"
+
+        # Entry 14 should be Rama Salvi ONLY — must NOT contain Ramdas Salvi
+        e14 = entries[13]
+        assert "RAMA" in e14
+        assert "32,000" in e14
+        assert "RAMDAS GANGARAM" not in e14, f"Entry 14 contaminated with Ramdas Salvi: {e14}"
+
+        # Entry 15 should be Ramdas Salvi ONLY
+        e15 = entries[14]
+        assert "RAMDAS GANGARAM" in e15
+        assert "29,000" in e15
+        assert "MADHU" not in e15, f"Entry 15 contaminated with Madhukar: {e15}"
+
+
+def test_extract_text_backward_compatibility():
+    """Ensure older historical statements (without table grid) continue to parse the exact same entries."""
+    import os
+    import config
+    from tools.pdf_parser import parse_bank_pdf
+
+    # Check 1_23_Mar_22_to_31_Mar_22.pdf has exactly 13 entries
+    p1 = "data/bank_statements/1_23_Mar_22_to_31_Mar_22.pdf"
+    if os.path.exists(p1):
+        res = parse_bank_pdf(p1, password=config.BANK_STMT_PASSWORD)
+        assert res["entry_count"] == 13
+
+    # Check 2_1_Apr22_To_31Mar23.pdf has exactly 89 entries
+    p2 = "data/bank_statements/2_1_Apr22_To_31Mar23.pdf"
+    if os.path.exists(p2):
+        res = parse_bank_pdf(p2, password=config.BANK_STMT_PASSWORD)
+        assert res["entry_count"] == 89
+
+
+def test_batch_statements_june_to_oct_2026():
+    """Verify June to October 2026 statements all use table grid and balance with zero discrepancies."""
+    import os
+    import config
+    from tools.pdf_parser import has_table_grid, parse_bank_pdf, parse_entries_to_accounts
+
+    expected_counts = {
+        "9_June_26.pdf": 20,
+        "10_Jul_26.pdf": 16,
+        "11_Aug_26.pdf": 4,
+        "12_Sep_26.pdf": 9,
+        "13_Oct_26.pdf": 11,
+    }
+
+    for filename, count in expected_counts.items():
+        p = os.path.join("data/bank_statements", filename)
+        if not os.path.exists(p):
+            continue
+        assert has_table_grid(p, config.BANK_STMT_PASSWORD) is True, f"{filename} should detect table grid"
+        res = parse_bank_pdf(p, password=config.BANK_STMT_PASSWORD)
+        assert res["entry_count"] == count, f"{filename} expected {count} entries, got {res['entry_count']}"
+
+        acc = parse_entries_to_accounts(res["entries"], res["format"])
+        entries = acc["entries"]
+        assert len(entries) == count
+        # Verify no entry has balance check discrepancies
+        for e in entries:
+            assert e["Balance_Check"] == "✓", f"{filename} entry failed balance check: {e}"
+
+        # Verify first row does not contain statement metadata/headers
+        first_part = entries[0]["Particulars"]
+        for header_kw in ["DETAILS OF STATEMENT", "Customer ID", "IFSC", "Branch", "MICR", "KYC"]:
+            assert header_kw not in first_part, f"{filename} row 1 leaked header keyword '{header_kw}': {first_part}"
+
+
+def test_extract_search_tokens_mobft():
+    # Test MOBFT/<name>/<utr_or_acct> format
+    part = "MOBFT/AVINASH BALKRISHNA B/534774550045"
+    tokens, identifiers = _extract_search_tokens(part, "MOBFT", "BALKRISHNA")
+    assert "AVINASH" in tokens
+    assert "BALKRISHNA" in tokens
+    assert ("AVINASH", "PAYEE_NAME") in identifiers
+    assert ("BALKRISHNA", "PAYEE_NAME") in identifiers
+
+    # Test legacy "from: <name>" format
+    part_legacy = "MOBFT from: AVINASH BALKRISHNA / 534774550045"
+    tokens_legacy, identifiers_legacy = _extract_search_tokens(part_legacy, "MOBFT")
+    assert "AVINASH" in tokens_legacy
+    assert "BALKRISHNA" in tokens_legacy
+
+
+

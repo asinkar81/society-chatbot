@@ -771,6 +771,8 @@ class LocalExcelDataProvider(DataProvider):
             return None
         if df.empty:
             return None
+        if "Deleted" in df.columns:
+            df = df[df["Deleted"] != "Yes"]
         df["match"] = df["Identifier_Value"].astype(str).str.strip().str.upper() == val
         matches = df[df["match"]]
         if matches.empty:
@@ -947,15 +949,158 @@ class LocalExcelDataProvider(DataProvider):
         self._write_sheet(df.reset_index(drop=True), self.expenses_sheet)
         return True
 
-    def get_expense_summary(self, fy: str) -> Dict[str, float]:
+    def get_expense_summary(self, fy: Optional[str] = None) -> Dict[str, float]:
         try:
             df = pd.read_excel(self.excel_file, sheet_name=self.expenses_sheet)
         except Exception:
             return {}
         if df.empty:
             return {}
+        if fy and str(fy).lower() != "all":
+            from utils.converters import get_fy_from_date
+            target_fy = str(fy).replace("FY ", "").strip()
+            df = df[df["Date"].apply(lambda d: get_fy_from_date(str(d))) == target_fy]
         summary = df.groupby("Category")["Amount"].sum().to_dict()
         return {str(k): float(v) for k, v in summary.items()}
+
+    def sync_accounts_debits_to_expenses(self) -> int:
+        """Scan Accounts sheet for bank debits, classify them, and add any missing to Expenses sheet."""
+        try:
+            df_acc = pd.read_excel(self.excel_file, sheet_name=self.accounts_sheet)
+        except Exception:
+            return 0
+        if df_acc.empty:
+            return 0
+
+        debits = df_acc[df_acc["Withdrawal"] > 0].copy()
+        if debits.empty:
+            return 0
+
+        overlap_eids = [205, 213, 215, 216, 223, 419, 421, 423]
+        dedup_debits = debits[~debits["Entry_ID"].isin(overlap_eids)].copy().sort_values("Entry_ID")
+
+        try:
+            df_exp = pd.read_excel(self.excel_file, sheet_name=self.expenses_sheet)
+        except Exception:
+            df_exp = pd.DataFrame(columns=self.EXPENSES_HEADERS)
+
+        existing_descs = set(df_exp["Description"].dropna().astype(str).tolist()) if not df_exp.empty else set()
+        existing_txns = set(df_exp["Transaction_ID"].dropna().astype(str).tolist()) if not df_exp.empty else set()
+
+        new_rows = []
+        next_id = int(df_exp["ID"].max()) + 1 if not df_exp.empty and "ID" in df_exp.columns else 1
+
+        for _, r in dedup_debits.iterrows():
+            eid = r["Entry_ID"]
+            txn_id = str(r.get("Transaction_ID", "") or "").strip()
+
+            if any(f"#{eid}" in d for d in existing_descs):
+                continue
+            if txn_id and txn_id in existing_txns:
+                continue
+
+            p = str(r["Particulars"]).upper()
+            amt = float(r["Withdrawal"])
+            d = str(r["Date"])
+
+            mid = None
+            ttype = "Bank Debit"
+            if "FUNDING A/C" in p or "DR. TRAN FOR FUNDING" in p:
+                cat = "Investments & Term Deposits"
+                desc = f"Transfer to Fixed Deposit / Term Deposit A/c (Accounts #{eid})"
+                ttype = "Transfer"
+            elif "MAHARASHTRA STATE ELE" in p or "ELECTR" in p:
+                cat = "Electricity & Utilities"
+                desc = f"MSEDCL Electricity Bill Payment (Accounts #{eid})"
+                ttype = "Clearing / NEFT"
+            elif "TASHILDAR" in p or "NA TAX" in p:
+                cat = "Statutory Taxes"
+                desc = f"Tashildar Mulshi - NA Tax / Revenue Cess (Accounts #{eid})"
+                ttype = "Cheque / Clearing"
+            elif any(k in p for k in ["PANDIT", "SHIVAJI", "VAIRAL", "VAIKAR"]):
+                cat = "Salaries & Caretaker"
+                if "SHIVAJI" in p:
+                    desc = f"Shivaji Maroti Vaikar - Security/Caretaker (Accounts #{eid})"
+                else:
+                    desc = f"Pandit Hiraji Vairal - Security & Caretaker (Accounts #{eid})"
+                ttype = "Cheque / Transfer"
+            elif "KAKADE" in p or "AUDIT" in p:
+                cat = "Accounting & Audit"
+                desc = f"Ashok Gangaram Kakade - Statutory Audit Fees (Accounts #{eid})"
+                ttype = "Cheque"
+            elif "WALUN" in p or "VAISHALI" in p:
+                cat = "Accounting & Audit"
+                desc = f"Dadapatil / Vaishali Walunj - Account Writing & Filing (Accounts #{eid})"
+                ttype = "Clearing"
+            elif any(k in p for k in ["SMS CHARGES", "MICR CHEQUE", "RELATED PARTY DET"]):
+                cat = "Bank & Administrative Charges"
+                desc = f"Bank Charges / SMS Notification / MICR Cheque (Accounts #{eid})"
+                ttype = "Bank Debit"
+            elif any(k in p for k in ["SHUBHRA", "AMBIKA", "PRAKASH", "VIJAYANDER"]):
+                cat = "Repairs & Infrastructure"
+                if "SHUBHRA" in p:
+                    desc = f"Shubhra Electricals - Electrical Site Works & Wiring (Accounts #{eid})"
+                elif "AMBIKA" in p:
+                    desc = f"Ambika Sales Corp - Plumbing & Pipe Materials (Accounts #{eid})"
+                elif "PRAKASH" in p:
+                    desc = f"Prakash Arts - Society Signage & Boards (Accounts #{eid})"
+                else:
+                    desc = f"Vijayander Rathod - Site Civil Works & Fabrication (Accounts #{eid})"
+                ttype = "Cheque"
+            elif "RATHOD" in p and amt == 13916.0:
+                cat = "Capital Assets"
+                desc = f"New Motor Pump for Borewell - Reimbursement Anshul Rathod (Accounts #{eid})"
+                mid = 5
+                ttype = "Clearing"
+            elif any(k in p for k in ["SINKAR", "SINKA", "ROHINI", "ASHUT"]):
+                cat = "Site Maintenance & Supplies"
+                desc = f"Site Maintenance / Fuel / Hardware Reimbursement (Sinkar) (Accounts #{eid})"
+                mid = 26
+                ttype = "Clearing"
+            elif "RATHOD" in p:
+                cat = "Site Maintenance & Supplies"
+                desc = f"Site Works & Material Reimbursement (Rathod) (Accounts #{eid})"
+                mid = 5
+                ttype = "Clearing"
+            elif "KONDHE" in p:
+                cat = "Site Maintenance & Supplies"
+                desc = f"Site Maintenance / Grass Cutter / Repairs (Kondhekar) (Accounts #{eid})"
+                mid = 11
+                ttype = "Clearing"
+            elif "FUT" in p or "FHUT" in p:
+                cat = "Site Maintenance & Supplies"
+                desc = f"Site Electrical / Plumbing Repair (Phutane) (Accounts #{eid})"
+                mid = 13
+                ttype = "Clearing"
+            elif "RADHAKRISHN" in p:
+                cat = "Site Maintenance & Supplies"
+                desc = f"Site Material Reimbursement (Ajaykumar Radhakrishnan) (Accounts #{eid})"
+                mid = 37
+                ttype = "Clearing"
+            else:
+                cat = "Other Operating Expenses"
+                desc = f"Operational Spend (Accounts #{eid})"
+
+            new_rows.append({
+                "ID": next_id,
+                "Date": d,
+                "Particulars": " ".join(str(r["Particulars"]).split()),
+                "Amount": amt,
+                "Category": cat,
+                "Description": desc,
+                "Transaction_ID": txn_id,
+                "Entry_Date": datetime.now().strftime("%d-%m-%Y %H:%M"),
+                "Member_ID": mid,
+                "Transaction_Type": ttype
+            })
+            next_id += 1
+
+        if new_rows:
+            new_df = pd.DataFrame(new_rows)
+            df_exp = pd.concat([df_exp, new_df], ignore_index=True) if not df_exp.empty else new_df
+            self._write_sheet(df_exp, self.expenses_sheet)
+            return len(new_rows)
+        return 0
 
     # ── Expense Categories ────────────────────────────────────────────────
 
@@ -1039,6 +1184,14 @@ class LocalExcelDataProvider(DataProvider):
             return []
         if df.empty:
             return []
+        if "Source_Member_ID" in df.columns:
+            df = df.dropna(subset=["Source_Member_ID"])
+            df = df[df["Source_Member_ID"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True).str.isdigit()]
+        if "ID" in df.columns:
+            df = df.dropna(subset=["ID"])
+        valid_cols = [c for c in self.SPLIT_RULES_HEADERS if c in df.columns]
+        if valid_cols:
+            df = df[valid_cols]
         return df.to_dict("records")
 
     def add_split_rule(self, source_member_id: int, member_ids: List[int]) -> int:
@@ -1077,10 +1230,16 @@ class LocalExcelDataProvider(DataProvider):
     def get_split_group_for_member(self, member_id: int) -> Optional[List[int]]:
         rules = self.get_split_rules()
         for r in rules:
-            if int(r["Source_Member_ID"]) == member_id:
-                ids_str = str(r.get("Members", ""))
-                if ids_str:
-                    return [int(x.strip()) for x in ids_str.split(",") if x.strip()]
+            src_mid = r.get("Source_Member_ID")
+            if pd.isna(src_mid):
+                continue
+            try:
+                if int(src_mid) == member_id:
+                    ids_str = str(r.get("Members", ""))
+                    if ids_str and ids_str != "nan":
+                        return [int(x.strip()) for x in ids_str.split(",") if x.strip().isdigit()]
+            except (ValueError, TypeError):
+                continue
         return None
 
     # ── Ledger duplicate check ────────────────────────────────────────────
